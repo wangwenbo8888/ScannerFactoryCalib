@@ -88,9 +88,13 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
     // —— 控制按钮 ——
     auto* ctrlRow = new QHBoxLayout;
     openBtn_    = new QPushButton(QStringLiteral("打开设备"));
-    captureBtn_ = new QPushButton(QStringLiteral("📸 采集一帧"));
+    captureBtn_ = new QPushButton(QStringLiteral("⏸ 预览当前帧"));
     captureBtn_->setEnabled(false);
     QFont bf = captureBtn_->font(); bf.setBold(true); captureBtn_->setFont(bf);
+    previewBtn_ = new QPushButton(QStringLiteral("▶ 连续预览"));
+    previewBtn_->setCheckable(true);
+    previewBtn_->setChecked(true);   // 默认连续预览
+    previewBtn_->setEnabled(false);
     saveCameraBtn_ = new QPushButton(QStringLiteral("💾 保存到 data_in/camera"));
     saveLaserBtn_  = new QPushButton(QStringLiteral("💾 保存到 data_in/laser/pose_NN"));
     saveCameraBtn_->setEnabled(false);
@@ -109,6 +113,7 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
     rightRotateChk_->setChecked(true);
     ctrlRow->addWidget(openBtn_);
     ctrlRow->addWidget(captureBtn_);
+    ctrlRow->addWidget(previewBtn_);
     ctrlRow->addWidget(new QLabel(QStringLiteral("曝光:")));
     ctrlRow->addWidget(exposureSpin_);
     ctrlRow->addWidget(new QLabel(QStringLiteral("增益:")));
@@ -205,7 +210,8 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
     // —— 信号 ——
     connect(refreshBtn_,     &QPushButton::clicked,     this, &AcquisitionTab::onRefreshDevices);
     connect(openBtn_,        &QPushButton::clicked,     this, &AcquisitionTab::onOpenClose);
-    connect(captureBtn_,     &QPushButton::clicked,     this, &AcquisitionTab::onCaptureOnce);
+    connect(captureBtn_,     &QPushButton::clicked,     this, &AcquisitionTab::onFreezeFrame);
+    connect(previewBtn_,     &QPushButton::toggled,     this, &AcquisitionTab::onTogglePreview);
     connect(saveCameraBtn_,  &QPushButton::clicked,     this, &AcquisitionTab::onSaveCamera);
     connect(saveLaserBtn_,   &QPushButton::clicked,     this, &AcquisitionTab::onSaveLaser);
     connect(leftBrowseBtn_,  &QPushButton::clicked,     this, &AcquisitionTab::onBrowseLeftFolder);
@@ -347,6 +353,7 @@ void AcquisitionTab::onOpenClose() {
 void AcquisitionTab::setDeviceOpenUI(bool opened) {
     openBtn_->setText(opened ? QStringLiteral("关闭设备") : QStringLiteral("打开设备"));
     captureBtn_->setEnabled(opened);
+    previewBtn_->setEnabled(opened);
     sourceTypeCbx_->setEnabled(!opened);
     leftDevSpin_->setEnabled(!opened);
     rightDevSpin_->setEnabled(!opened);
@@ -359,63 +366,21 @@ void AcquisitionTab::setDeviceOpenUI(bool opened) {
     }
 }
 
-void AcquisitionTab::onCaptureOnce() {
-    if (!rig_ || !rig_->isOpen()) {
-        emit statusMessage(QStringLiteral("请先打开设备"));
-        return;
-    }
+void AcquisitionTab::onFreezeFrame() {
+    // 预览当前帧：界面停在当前帧，后台 lastLeft_/Right 仍持续刷新；「保存图像」存这一帧
+    previewing_ = false;
+    previewBtn_->setChecked(false);
+    emit statusMessage(QStringLiteral("已停在当前帧（后台仍刷新）。点「▶ 连续预览」恢复刷新"));
+}
 
-    const QString src = sourceTypeCbx_->currentText().toLower();
-    if (src == QStringLiteral("galaxy")) {
-        // galaxy：实时预览回调已持续刷新 lastLeft_/lastRight_，采集一帧即落盘当前缓存帧。
-        if (!previewing_ || lastLeft_.empty() || lastRight_.empty()) {
-            emit statusMessage(QStringLiteral("尚无预览帧：请先点「▶ 启动扫描仪」开始预览"));
-            return;
-        }
-    } else {
-        // 其他源（simulated 等）无 SDK 回调，仍走同步抓帧
-        CameraFrame L, R;
-        if (!rig_->isAcquiring()) {
-            if (!rig_->startAcquisition()) {
-                emit statusMessage(QStringLiteral("启动采集失败"));
-                return;
-            }
-        }
-        bool ok = rig_->grabStereo(L, R, 3000);
-        rig_->stopAcquisition();  // 抓完即停
-        if (!ok) {
-            emit statusMessage(QStringLiteral("采集超时/失败"));
-            return;
-        }
-        applyGuiRotation(L.image, R.image);
-        lastLeft_  = L.image;
-        lastRight_ = R.image;
-        leftPreview_->setImage(lastLeft_);
-        rightPreview_->setImage(lastRight_);
-    }
-
-    // 诊断：帧像素统计（max=0 → 全黑 = 无补光；max>0 → 有图像数据）
-    double lmin = 0, lmax = 0, rmin = 0, rmax = 0;
-    if (!lastLeft_.empty()) cv::minMaxLoc(lastLeft_, &lmin, &lmax);
-    if (!lastRight_.empty()) cv::minMaxLoc(lastRight_, &rmin, &rmax);
-    spdlog::info("[capture] L {}x{} pix[{}..{}]  R {}x{} pix[{}..{}]",
-                 lastLeft_.cols, lastLeft_.rows, (int)lmin, (int)lmax,
-                 lastRight_.cols, lastRight_.rows, (int)rmin, (int)rmax);
-
-    saveCameraBtn_->setEnabled(!lastLeft_.empty());
-    saveLaserBtn_->setEnabled(!lastLeft_.empty());
-
-    // 自动保存到 data_in/camera/left,N.png + right,N.png
-    onSaveCamera();
-
-    emit statusMessage(QStringLiteral("已采集 L[max=%1] R[max=%2] (max=0→全黑需开补光)  %3×%4 已存")
-                           .arg((int)lmax).arg((int)rmax)
-                           .arg(lastLeft_.cols).arg(lastLeft_.rows));
+void AcquisitionTab::onTogglePreview(bool on) {
+    previewing_ = on;
+    if (on) emit statusMessage(QStringLiteral("连续预览（界面实时刷新）"));
 }
 
 void AcquisitionTab::onSaveCamera() {
-    if (lastLeft_.empty() || lastRight_.empty()) {
-        emit statusMessage(QStringLiteral("无已采集图像"));
+    if (frozenLeft_.empty() || frozenRight_.empty()) {
+        emit statusMessage(QStringLiteral("尚无显示帧可保存"));
         return;
     }
     QString base = QStringLiteral("data_in/camera");
@@ -424,23 +389,23 @@ void AcquisitionTab::onSaveCamera() {
     QString n = QString::number(cameraSnapshotIdx_).rightJustified(3, '0');
     QString lp = base + "/left/"  + n + ".png";
     QString rp = base + "/right/" + n + ".png";
-    cv::imwrite(lp.toStdString(), lastLeft_);
-    cv::imwrite(rp.toStdString(), lastRight_);
+    cv::imwrite(lp.toStdString(), frozenLeft_);
+    cv::imwrite(rp.toStdString(), frozenRight_);
     ++cameraSnapshotIdx_;
     updateSnapCount();
-    emit statusMessage(QStringLiteral("已保存: ") + lp + " / " + rp);
+    emit statusMessage(QStringLiteral("已保存（当前显示帧）: ") + lp + " / " + rp);
 }
 
 void AcquisitionTab::onSaveLaser() {
-    if (lastLeft_.empty() || lastRight_.empty()) {
-        emit statusMessage(QStringLiteral("无已采集图像"));
+    if (frozenLeft_.empty() || frozenRight_.empty()) {
+        emit statusMessage(QStringLiteral("尚无显示帧可保存"));
         return;
     }
     QString base = QStringLiteral("data_in/laser/pose_") +
         QString::number(laserPoseIdx_).rightJustified(2, '0');
     QDir().mkpath(base);
-    cv::imwrite((base + "/L_tube0.png").toStdString(), lastLeft_);
-    cv::imwrite((base + "/R_tube0.png").toStdString(), lastRight_);
+    cv::imwrite((base + "/L_tube0.png").toStdString(), frozenLeft_);
+    cv::imwrite((base + "/R_tube0.png").toStdString(), frozenRight_);
     QFile f(base + "/temp.txt");
     if (f.open(QIODevice::WriteOnly | QIODevice::Text)) {
         f.write("ref_temp 25.0\n");
@@ -539,7 +504,8 @@ void AcquisitionTab::onStartScanner() {
         if (rig_->isAcquiring()) rig_->stopAcquisition();  // 防重复 StartGrab/Register
         if (rig_->startAcquisition()) {
             previewing_ = true;
-            emit statusMessage(QStringLiteral("实时预览已开启（相机回调驱动刷新）"));
+            previewBtn_->setChecked(true);   // 默认连续预览
+            emit statusMessage(QStringLiteral("实时预览已开启（连续预览，回调驱动刷新）"));
         } else {
             emit statusMessage(QStringLiteral("警告：相机启动采集失败，无法预览"));
         }
@@ -558,6 +524,7 @@ void AcquisitionTab::onStopScanner() {
     if (!scanner_) return;
     // 停相机采集（注销 SDK 回调，停止预览）→ 停扫描仪
     previewing_ = false;
+    previewBtn_->setChecked(false);
     if (rig_ && rig_->isAcquiring()) rig_->stopAcquisition();
     scanner_->stop();
 }
@@ -609,9 +576,16 @@ void AcquisitionTab::setRightImage(cv::Mat& right, uint64_t id) {
 
 // 照搬 LeadScanK2 onUpdateImages（主线程）：setPixmap
 void AcquisitionTab::onUpdateImages(QImage left, QImage right) {
-    if (!previewing_) return;
+    if (!previewing_) return;  // 停在当前帧：不刷新界面，frozen 保持
     leftPreview_->setPixmap(QPixmap::fromImage(left));
     rightPreview_->setPixmap(QPixmap::fromImage(right));
+    // frozen 跟随后台最新帧（=当前显示帧），供「保存图像」存的就是看到的那一帧
+    if (!lastLeft_.empty())  frozenLeft_  = lastLeft_.clone();
+    if (!lastRight_.empty()) frozenRight_ = lastRight_.clone();
+    if (!frozenLeft_.empty()) {
+        saveCameraBtn_->setEnabled(true);   // 有显示帧才能保存
+        saveLaserBtn_->setEnabled(true);
+    }
 }
 
 // ============================================================================

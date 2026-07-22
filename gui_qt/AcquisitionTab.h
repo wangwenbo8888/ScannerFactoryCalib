@@ -37,8 +37,9 @@ signals:
 private slots:
     void onRefreshDevices();
     void onOpenClose();
-    void onCaptureOnce();        // 把当前预览缓存帧落盘（不再触发单独抓帧）
-    void onSaveCamera();         // 把当前显示帧保存到 data_in/camera/left,N.png + right,N.png
+    void onFreezeFrame();        // 预览当前帧：界面停在当前帧（后台 lastLeft_/Right 继续刷新）
+    void onTogglePreview(bool on);  // 连续预览开关（on=刷新界面，off=停在当前帧）
+    void onSaveCamera();         // 把当前【显示】帧保存到 data_in/camera/left,N.png + right,N.png
     void onSaveLaser();          // 保存到 data_in/laser/pose_NN/L_tube*.png + R_tube*.png
     void onBrowseLeftFolder();
     void onBrowseRightFolder();
@@ -79,7 +80,8 @@ private:
 
     // —— 控制 ——
     QPushButton* openBtn_    = nullptr;
-    QPushButton* captureBtn_ = nullptr;
+    QPushButton* captureBtn_ = nullptr;       // 「预览当前帧」：界面停在当前帧
+    QPushButton* previewBtn_ = nullptr;       // 「连续预览」checkable 开关
     QDoubleSpinBox* exposureSpin_ = nullptr;
     QDoubleSpinBox* gainSpin_     = nullptr;
     QCheckBox*  leftRotateChk_    = nullptr;  // 左相机 180° 旋转
@@ -113,8 +115,10 @@ private:
     QLabel*     snapCountLbl_   = nullptr;
 
     std::unique_ptr<StereoCameraRig> rig_;
-    cv::Mat lastLeft_;          // 最近一次抓拍的 L 帧（用户决定是否保存）
-    cv::Mat lastRight_;         // 最近一次抓拍的 R 帧
+    cv::Mat lastLeft_;          // 后台持续刷新的最新帧（相机回调写入）
+    cv::Mat lastRight_;
+    cv::Mat frozenLeft_;        // 当前【显示】帧：连续预览时随 lastLeft_ 更新；点「预览当前帧」后冻结
+    cv::Mat frozenRight_;       // 保存图像存这个，保证存的就是用户看到的那一帧
     int cameraSnapshotIdx_ = 0;
     int laserPoseIdx_ = 0;
 
