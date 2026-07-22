@@ -1,0 +1,12 @@
+# CMake build 目录（约定: build_* 嵌在工程内）
+build_fc*/
+
+# 输入/输出数据目录（运行时数据，不入库）
+data_in/*
+data_out/*
+!data_in/.gitkeep
+!data_out/.gitkeep
+
+# 调试诊断文件（ofstream/spdlog file sink 生成，不入库）
+debug.txt
+factory_calib.log
