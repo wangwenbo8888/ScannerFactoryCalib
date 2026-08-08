@@ -154,7 +154,8 @@ if(FC_HAVE_GALAXY)
 endif()
 
 if(MSVC)
-    target_compile_options(factory_calib_gui PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/utf-8 /bigobj>)
+    target_compile_options(factory_calib_gui PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/utf-8 /bigobj /Zi>)
+    target_link_options(factory_calib_gui PRIVATE /DEBUG)
 endif()
 
 # 拷贝 Qt5 DLL 到 exe 同目录（WINDEPLOYQT）
