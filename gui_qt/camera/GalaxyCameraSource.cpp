@@ -21,6 +21,7 @@
 #include <cstring>
 #include <fstream>
 #include <mutex>
+#include <thread>
 
 namespace fc::gui {
 
@@ -248,6 +249,13 @@ void GalaxyCameraSource::stopAcquisition() {
         try { (*fp)->GetCommandFeature("AcquisitionStop")->Execute(); } catch (...) {}
         try { (*sp)->StopGrab(); } catch (...) {}
         try { (*sp)->UnregisterCaptureCallback(); } catch (...) {}
+        // UnregisterCaptureCallback 不保证已进入的 DoOnImageCaptured 退出；
+        // 等待 SDK 线程上所有 in-flight dispatchFrame 完成，否则析构期间回调仍可能
+        // 访问已释放的 GUI 对象（Qt5Widgets 0xC0000005 读 0x8 崩溃根因）。
+        for (int i = 0; i < 200; ++i) {
+            if (cbInFlight_.load(std::memory_order_acquire) == 0) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
         delete static_cast<GalaxyCaptureHandler*>(captureHandler_);
         captureHandler_ = nullptr;
         try { (*sp)->Close(); } catch (...) {}
@@ -359,6 +367,12 @@ void GalaxyCameraSource::setFrameCallback(FrameCallback cb) {
 
 void GalaxyCameraSource::dispatchFrame(const CameraFrame& f) {
     // 在 SDK 采集线程上被调用：先在锁内拷贝出回调对象，再无锁调用（避免持锁回调死锁）
+    // cbInFlight_ 计数让 stopAcquisition 能等待本调用退出，杜绝析构 race。
+    cbInFlight_.fetch_add(1, std::memory_order_acq_rel);
+    struct Guard {
+        std::atomic<int>& c;
+        ~Guard() { c.fetch_sub(1, std::memory_order_acq_rel); }
+    } guard{cbInFlight_};
     std::function<void(const CameraFrame&)> cb;
     {
         std::lock_guard<std::mutex> lk(cbMutex_);

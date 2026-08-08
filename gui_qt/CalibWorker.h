@@ -23,6 +23,9 @@ public:
 
     bool isRunning() const;
 
+    // 阻塞等待当前任务完成（GUI 关闭前调用，避免析构期间标定线程访问已析构对象）
+    void wait();
+
 signals:
     // 来自业务库的进度回调
     void progress(int step, int totalSteps, QString msg);

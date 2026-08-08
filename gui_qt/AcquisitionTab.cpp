@@ -257,9 +257,19 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
 
 AcquisitionTab::~AcquisitionTab() {
     if (rig_) {
-        if (rig_->isAcquiring()) rig_->stopAcquisition();  // 先停采集、注销回调，避免析构期间回调访问悬空对象
+        // 顺序关键（修复关闭 GUI 时 Qt5Widgets 0xC0000005 读 0x8 崩溃）：
+        //   1. 先清回调 → 新 dispatchFrame 拷贝到空 cb，不再执行捕获 this 的 lambda
+        //   2. stopAcquisition → 内部等待 in-flight dispatchFrame 退出（见 GalaxyCameraSource）
+        //   3. disconnect → 断开 updateImages，杜绝残留 QueuedConnection 事件
+        //   4. close → 释放 SDK 资源
+        rig_->setLeftFrameCallback(nullptr);
+        rig_->setRightFrameCallback(nullptr);
+        if (rig_->isAcquiring()) rig_->stopAcquisition();
+        disconnect(this, &AcquisitionTab::updateImages, this, &AcquisitionTab::onUpdateImages);
         rig_->close();
     }
+    delete m_pLeft;  m_pLeft = nullptr;   // 修复原裸指针泄漏
+    delete m_pRight; m_pRight = nullptr;
 }
 
 void AcquisitionTab::onSourceTypeChanged() {

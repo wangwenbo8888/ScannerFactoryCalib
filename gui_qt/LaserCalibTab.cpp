@@ -90,6 +90,8 @@ LaserCalibTab::LaserCalibTab(QWidget* parent) : QWidget(parent) {
 }
 
 LaserCalibTab::~LaserCalibTab() {
+    // 先等待标定线程完成，避免析构期间标定线程的 spdlog/回调访问已析构对象
+    if (worker_) worker_->wait();
     QSettings s;
     s.beginGroup("laser_calib_tab");
     s.setValue("input_dir", inputEdit_->text());

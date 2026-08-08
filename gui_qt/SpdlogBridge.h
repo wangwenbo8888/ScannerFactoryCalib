@@ -5,6 +5,7 @@
 
 #include <QObject>
 #include <QString>
+#include <atomic>
 #include <memory>
 #include <vector>
 
@@ -48,6 +49,12 @@ private slots:
 protected:
     void sink_it_(const spdlog::details::log_msg& msg) override;
     void flush_() override;
+private:
+    // 析构防护：uninstall 先标记 destroyed_，并等待 in-flight sink_it_ 退出，
+    // 避免析构期间标定线程的 sink_it_ 调 invokeMethod(this) 访问悬空对象
+    // （关闭 GUI 时 0xC0000005 读 0x8 崩溃根因）。
+    std::atomic<bool> destroyed_{false};
+    std::atomic<int>  sinkInFlight_{0};
 };
 
 }  // namespace fc::gui

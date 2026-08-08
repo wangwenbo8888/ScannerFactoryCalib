@@ -32,6 +32,12 @@ void CalibWorker::startLaser(const QString& inputDir, const QString& outputPath)
 
 bool CalibWorker::isRunning() const { return watcher_->isRunning(); }
 
+void CalibWorker::wait() {
+    if (watcher_ && watcher_->isRunning()) {
+        watcher_->waitForFinished();
+    }
+}
+
 void CalibWorker::run_(Mode mode, const QString& inputDir, const QString& outputPath) {
     if (watcher_->isRunning()) {
         emit logLine(QStringLiteral("[warn] 已有任务在跑，忽略新请求"));

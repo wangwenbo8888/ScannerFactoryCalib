@@ -10,6 +10,7 @@
 // =============================================================================
 
 #include "ICameraSource.h"
+#include <atomic>
 #include <mutex>
 #include <string>
 
@@ -71,6 +72,9 @@ private:
 
     FrameCallback frameCb_;
     std::mutex cbMutex_;
+    // SDK 采集线程上正在执行的 dispatchFrame 计数；stopAcquisition 用它等待
+    // in-flight 回调退出，避免析构期间回调访问已释放的 GUI 对象。
+    std::atomic<int> cbInFlight_{0};
 };
 
 }  // namespace fc::gui

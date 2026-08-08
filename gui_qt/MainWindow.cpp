@@ -6,6 +6,7 @@
 
 #include <QApplication>
 #include <QDockWidget>
+#include <QPointer>
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QPlainTextEdit>
@@ -35,6 +36,11 @@ MainWindow::~MainWindow() {
     // logger 摘除。否则其它线程的 spdlog 日志会在析构期间继续投递到即将失效的
     // globalLog_，引发 Qt5Widgets 内读空 d_ptr 的崩溃。
     if (spdlogBridge_) spdlogBridge_->uninstall();
+    // 断开各 tab→MainWindow 的 statusMessage 连接，避免 ~QMainWindow 删除
+    // 子 tab 时残留信号触发 fwd 访问已析构的 statusBar()（0xC0000005 读 0x8 根因）。
+    if (acquisitionTab_) acquisitionTab_->disconnect(this);
+    if (cameraTab_)      cameraTab_->disconnect(this);
+    if (laserTab_)       laserTab_->disconnect(this);
 }
 
 void MainWindow::buildCentral() {
@@ -48,7 +54,11 @@ void MainWindow::buildCentral() {
     tabs_->addTab(laserTab_,       QStringLiteral("③ 激光线标定"));
     setCentralWidget(tabs_);
 
-    auto fwd = [this](QString m) { statusBar()->showMessage(m, 5000); };
+    // 用 QPointer 捕获 this：MainWindow 析构后 QPointer 自动置 null，
+    // 避免析构期间残留的 statusMessage 事件触发 fwd 访问已析构的 statusBar()。
+    auto fwd = [self = QPointer<MainWindow>(this)](QString m) {
+        if (self) self->statusBar()->showMessage(m, 5000);
+    };
     connect(acquisitionTab_, &AcquisitionTab::statusMessage, this, fwd);
     connect(cameraTab_,      &CameraCalibTab::statusMessage, this, fwd);
     connect(laserTab_,       &LaserCalibTab::statusMessage, this, fwd);
