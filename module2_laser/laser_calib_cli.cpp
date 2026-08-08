@@ -20,6 +20,7 @@
 #include "endpoint_extract_cuda.h"
 #include "virtual_camera_pose_cuda.h"
 #include "pose_optimize_cuda.h"
+#include "projector_joint_calib.h"
 #include "laser_extrinsic_compensate_cpu.h"
 #include "plane_map_cuda.h"        // LineMapStats 完整定义, plane_map_temp_table.h 仅前向声明
 #include "plane_map_temp_table.h"
@@ -158,11 +159,12 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
     VirtualCameraPoseCuda vcpOp(vcpParams);
     spdlog::info("4-10 VirtualCameraPoseCuda constructed");
 
-    // ----- 4-11 PoseOptimize -----
-    PoseOptimizeParams poParams;
-    poParams.deviceId = cfg.deviceId;
-    PoseOptimizeCuda poseOptOp(poParams);
-    spdlog::info("4-11 PoseOptimizeCuda constructed");
+    // ----- 4-11 ProjectorJointCalib（新算法，取代 PoseOptimize）-----
+    // 投影仪光心 t + CMOS 发射曲线联合标定；K/R 不由此算子优化，
+    // 由 4-10 VirtualCameraPose 提供，喂给下游 5-3/4-13。
+    ProjectorJointCalibParams pjcParams;
+    ProjectorJointCalib projectorOp(pjcParams);
+    spdlog::info("4-11 ProjectorJointCalib constructed (replaces PoseOptimize)");
 
     // stereoK / stereoR 用 StereoCalibration helper (Step 0 决定 2):
     // stereoK = P1 左上 3×3; stereoR = R (left<-right)
@@ -191,6 +193,9 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
     // ------------------------------------------------------------------
     std::vector<cv::Vec3f> host_points3d;
     std::vector<int>       host_line_ids;
+    // per-pose 累积：ProjectorJointCalib 需按姿态分组（每姿态一块平板）
+    std::vector<std::vector<cv::Vec3f>> posePoints(input->poseFrames.size());
+    std::vector<std::vector<int>>       poseLineIds(input->poseFrames.size());
 
     size_t framesOk = 0;
     size_t framesSkip = 0;
@@ -368,6 +373,13 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
                 host_line_ids.insert(host_line_ids.end(),
                                      h_ids.begin<int>(),
                                      h_ids.end<int>());
+                // per-pose 累积（按当前 pi 分组，供 ProjectorJointCalib）
+                posePoints[pi].insert(posePoints[pi].end(),
+                                      h_pts.begin<cv::Vec3f>(),
+                                      h_pts.end<cv::Vec3f>());
+                poseLineIds[pi].insert(poseLineIds[pi].end(),
+                                       h_ids.begin<int>(),
+                                       h_ids.end<int>());
             }
 
             ++framesOk;
@@ -399,10 +411,10 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
     // 3c. 4-9 / 4-10 / 4-11 一次性执行（无 pose×tube 循环）
     //     暂存 finalVirtualK/R/T 供 6.2-e 的 5-3 / 4-13 使用
     // ------------------------------------------------------------------
-    cv::Matx33d finalVirtualK = cv::Matx33d::eye();
-    cv::Matx33d finalVirtualR = cv::Matx33d::eye();
-    cv::Vec3d   finalVirtualT(0, 0, 0);
-    std::vector<calib::LaserLineCurve> finalLineCurves;  // 4-11 输出, 用于反推 lineIds
+    cv::Matx33d finalVirtualK = cv::Matx33d::eye();   // 来自 4-10（新算法不优化 K）
+    cv::Matx33d finalVirtualR = cv::Matx33d::eye();   // 来自 4-10（新算法不优化 R）
+    cv::Vec3d   finalVirtualT(0, 0, 0);               // 来自 ProjectorJointCalib
+    calib::ProjectorJointCalibResult projectorRes;    // 4-11 新算法结果
     bool haveVirtualPose = false;
 
     if (host_points3d.empty()) {
@@ -433,23 +445,43 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
                                  vcpRes.virtualT[0], vcpRes.virtualT[1], vcpRes.virtualT[2],
                                  vcpRes.numLines, vcpRes.avgLineFittingError);
 
-                    // ----- 4-11 pose_optimize -----
-                    // 决定 4: initialT 直接用 vcpRes.virtualT
-                    auto poseRes = poseOptOp.Execute(d_all_pts3d, d_all_lids,
-                                                     vcpRes.virtualK, vcpRes.virtualR,
-                                                     vcpRes.virtualT, stream);
-                    if (!poseRes.success) {
-                        spdlog::error("4-11 pose_optimize failed: {}", poseRes.message);
+                    // ----- 4-11 ProjectorJointCalib（新算法，取代 PoseOptimize）-----
+                    // 输入: per-pose 点云 + f/主点(从 virtualK) + initialT(从 virtualT)
+                    // 输出: projectorT(投影仪光心) + emissionCurve(CMOS 发射曲线)
+                    // K/R 不由此算子优化 → finalVirtualK/R 沿用 4-10 结果
+                    calib::ProjectorJointCalibInput pjcInput;
+                    for (size_t ppi = 0; ppi < posePoints.size(); ++ppi) {
+                        if (posePoints[ppi].size() >= 10) {
+                            calib::PosePointSet pset;
+                            pset.points3d = posePoints[ppi];
+                            pset.lineIds  = poseLineIds[ppi];
+                            pjcInput.poses.push_back(std::move(pset));
+                        }
+                    }
+                    pjcInput.f              = vcpRes.virtualK(0, 0);
+                    pjcInput.principalPoint = cv::Point2d(vcpRes.virtualK(0, 2),
+                                                          vcpRes.virtualK(1, 2));
+                    pjcInput.initialT       = vcpRes.virtualT;
+                    projectorRes = projectorOp.Execute(pjcInput);
+                    if (!projectorRes.success) {
+                        spdlog::error("4-11 ProjectorJointCalib failed: {}",
+                                      projectorRes.message);
                     } else {
-                        spdlog::info("4-11 OK: totalReprojErr={:.4f} "
-                                     "(initial={:.4f}), {} line curves",
-                                     poseRes.totalReprojectionError,
-                                     poseRes.initialReprojectionError,
-                                     poseRes.lineCurves.size());
-                        finalVirtualK = poseRes.virtualK;
-                        finalVirtualR = poseRes.virtualR;
-                        finalVirtualT = poseRes.virtualT;
-                        finalLineCurves = poseRes.lineCurves;  // 4-13 反推 lineIds 用
+                        spdlog::info("4-11 OK: projectorT=({:.3f},{:.3f},{:.3f}) "
+                                     "sampsonRms={:.4f}(init={:.4f}) cond={:.3e} "
+                                     "poses={}/{}pts flag={}",
+                                     projectorRes.projectorT[0],
+                                     projectorRes.projectorT[1],
+                                     projectorRes.projectorT[2],
+                                     projectorRes.finalSampsonRms,
+                                     projectorRes.initialSampsonRms,
+                                     projectorRes.jacobianConditionNumber,
+                                     projectorRes.poseCount,
+                                     projectorRes.totalPointCount,
+                                     static_cast<int>(projectorRes.qualityFlag));
+                        finalVirtualK = vcpRes.virtualK;         // K 沿用 4-10
+                        finalVirtualR = vcpRes.virtualR;         // R 沿用 4-10
+                        finalVirtualT = projectorRes.projectorT; // T 用新算法
                         haveVirtualPose = true;
                     }
                 }
@@ -516,11 +548,11 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
         //   3. 都没有 → 跳过 4-13 (避免 PlaneMapTempTable 构造抛异常崩溃)
         std::vector<int> effectiveLineIds = cfg.lineIds;
         if (effectiveLineIds.empty()) {
-            std::set<int> seen;
-            for (const auto& lc : finalLineCurves) seen.insert(lc.lineId);
+            // 新算法不输出 lineCurves，从累积的实际线号推断
+            std::set<int> seen(host_line_ids.begin(), host_line_ids.end());
             effectiveLineIds.assign(seen.begin(), seen.end());
             if (!effectiveLineIds.empty()) {
-                spdlog::info("4-13 lineIds inferred from pose_optimize: {} lines",
+                spdlog::info("4-13 lineIds inferred from accumulated line_ids: {} lines",
                              effectiveLineIds.size());
             }
         }
@@ -574,7 +606,7 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
     reconOp.Destroy();
     endpointOp.Destroy();
     vcpOp.Destroy();
-    poseOptOp.Destroy();
+    // ProjectorJointCalib 为纯 CPU，Destroy() 空实现，无需调用
     lecompOp.Destroy();
 
     // ------------------------------------------------------------------
@@ -602,6 +634,25 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
         j["virtualT"] = std::vector<double>{finalVirtualT[0],
                                             finalVirtualT[1],
                                             finalVirtualT[2]};
+        // 新算法输出：投影仪光心 + CMOS 发射曲线
+        j["projectorT"] = std::vector<double>{projectorRes.projectorT[0],
+                                              projectorRes.projectorT[1],
+                                              projectorRes.projectorT[2]};
+        j["emissionCurve"] = {
+            {"coeffs", std::vector<double>{
+                projectorRes.emissionCurve.coeffs[0],
+                projectorRes.emissionCurve.coeffs[1],
+                projectorRes.emissionCurve.coeffs[2],
+                projectorRes.emissionCurve.coeffs[3],
+                projectorRes.emissionCurve.coeffs[4],
+                projectorRes.emissionCurve.coeffs[5]}},
+            {"discriminant", projectorRes.emissionCurve.discriminant},
+            {"sampsonRms", projectorRes.emissionCurve.sampsonRms},
+            {"pointCount", projectorRes.emissionCurve.pointCount}
+        };
+        j["projectorQualityFlag"] = static_cast<int>(projectorRes.qualityFlag);
+        j["projectorCondNumber"]  = projectorRes.jacobianConditionNumber;
+        j["projectorSampsonRms"]  = projectorRes.finalSampsonRms;
     }
     if (haveLaserExtrin) {
         j["laserExtrinsicTempTable"] = laserExtrinTable.toJson();
