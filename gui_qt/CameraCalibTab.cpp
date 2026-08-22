@@ -15,6 +15,7 @@
 #include <QDir>
 #include <QSettings>
 #include <QFutureWatcher>
+#include <QMessageBox>
 #include <QtConcurrent>
 #include <QDateTime>
 #include <QImage>
@@ -266,12 +267,15 @@ void CameraCalibTab::onRunStep(int step) {
                 }
                 auto tabs = buildTempTables(input_->config, *intrin_, *extrin_, cb);
                 if (!tabs.success) return false;
-                // 写 JSON
+                // 写 JSON（结果 + 过程分开）
                 auto j = buildCameraCalibJson(input_->config, *intrin_, *extrin_, *rectify_,
                                                tabs.intrinL, tabs.intrinR, tabs.extrin, tabs.rectify);
                 std::string outPath = outputEdit_->text().trimmed().toStdString();
                 if (outPath.empty()) outPath = "camera_calib.json";
                 if (!writeJson(outPath, j)) return false;
+                std::string processPath = fc::deriveProcessPath(outPath);
+                writeJson(processPath,
+                          fc::buildCameraCalibProcessJson(input_->config, *intrin_, *extrin_));
             }
             return true;
         } catch (const std::exception& e) {
@@ -286,6 +290,66 @@ void CameraCalibTab::onRunStep(int step) {
         QString summary = ok ? QStringLiteral("步骤 %1 成功").arg(step)
                               : QStringLiteral("步骤 %1 失败").arg(step);
         appendLog(summary, ok ? "#27ae60" : "#c0392b");
+        if (ok && step >= 4) {
+            // 明确提示输出文件位置（writeJson 成功后 GUI 此前无任何路径反馈，易被误认为未保存）
+            QString out = outputEdit_->text().trimmed();
+            if (out.isEmpty()) out = QStringLiteral("camera_calib.json");
+            QString abs = QFileInfo(out).absoluteFilePath();
+            appendLog(QStringLiteral("结果已保存: %1").arg(abs), "#27ae60");
+            emit statusMessage(QStringLiteral("标定结果已保存: %1").arg(abs));
+
+            // 弹窗汇报标定精度（含阈值判定）
+            if (intrin_ && extrin_) {
+                const double reprojThr = input_ ? input_->config.reprojErrorThreshold : 0.0;
+                const double stereoThr = reprojThr * 100.0;   // 与算子侧 maxReprojError 同式
+                const double epipolarThr = 0.05;              // ExtrinsicCalibCpu 默认 maxEpipolarError
+
+                auto item = [](double v, double thr) -> QString {
+                    if (thr <= 0) return QStringLiteral("%1").arg(v, 0, 'f', 4);
+                    bool good = v <= thr;
+                    return QStringLiteral("%1 %2 (阈值 %3)")
+                        .arg(v, 0, 'f', 4)
+                        .arg(good ? QStringLiteral("✓达标")
+                                  : QStringLiteral("⚠超限"))
+                        .arg(thr, 0, 'f', 3);
+                };
+
+                bool reprojOk = intrin_->reproj_error_mean <= reprojThr;
+                bool stereoOk = extrin_->stereoReprojError <= stereoThr;
+                bool epipOk = extrin_->epipolarErrorMean <= epipolarThr;
+                bool allOk = reprojOk && stereoOk && epipOk;
+
+                QString html = QStringLiteral(
+                    "<table cellpadding=3>"
+                    "<tr><td>有效帧数</td><td>%1 / %2</td></tr>"
+                    "<tr><td>内参重投影均值</td><td>%3</td></tr>"
+                    "<tr><td>左相机 RMS</td><td>%4</td></tr>"
+                    "<tr><td>右相机 RMS</td><td>%5</td></tr>"
+                    "<tr><td>立体标定 RMS</td><td>%6</td></tr>"
+                    "<tr><td>极线误差均值</td><td>%7</td></tr>"
+                    "</table><br>%8")
+                    .arg(intrin_->valid_frames_count)
+                    .arg(intrin_->total_frames_input)
+                    .arg(item(intrin_->reproj_error_mean, reprojThr))
+                    .arg(intrin_->left.rms_error, 0, 'f', 4)
+                    .arg(intrin_->right.rms_error, 0, 'f', 4)
+                    .arg(item(extrin_->stereoReprojError, stereoThr))
+                    .arg(item(extrin_->epipolarErrorMean, epipolarThr))
+                    .arg(allOk ? QStringLiteral("<b>标定精度达标</b>")
+                               : QStringLiteral("<b style='color:#c0392b;'>部分指标超限，"
+                                  "结果已保存但质量降级，建议改善采集条件后重新标定</b>"));
+
+                QMessageBox box(this);
+                box.setWindowTitle(allOk ? QStringLiteral("相机标定完成 —— 精度达标")
+                                         : QStringLiteral("相机标定完成 —— 部分指标超限"));
+                box.setIcon(allOk ? QMessageBox::Information : QMessageBox::Warning);
+                box.setTextFormat(Qt::RichText);
+                box.setText(html);
+                box.setInformativeText(QStringLiteral("结果已保存:\n%1").arg(abs));
+                box.setStandardButtons(QMessageBox::Ok);
+                box.exec();
+            }
+        }
         refreshStepLabels();
         setRunningUI(false);
         emit statusMessage(summary);

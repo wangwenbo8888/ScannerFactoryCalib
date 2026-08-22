@@ -49,6 +49,16 @@ calib::ExtrinsicCalibCpuParams makeExtrinParams(const CameraCalibConfig& c,
     calib::ExtrinsicCalibCpuParams p;
     p.leftPointsPerView = lpts;
     p.rightPointsPerView = rpts;
+    // 物点：与 IntrinsicCalibCPU::generateObjectPoints 同一约定（行主序 + 温度膨胀修正），
+    // 保证内/外参尺度一致。validate() 要求 objectPoints 数 == 每视角角点数。
+    double actualSize = c.squareSizeMm * (1.0 + c.plateTempCoeff * (c.plateTemp - 20.0));
+    p.objectPoints.reserve(static_cast<size_t>(c.chessWidth) * c.chessHeight);
+    for (int i = 0; i < c.chessHeight; ++i)
+        for (int j = 0; j < c.chessWidth; ++j)
+            p.objectPoints.emplace_back(
+                static_cast<float>(j * actualSize),
+                static_cast<float>(i * actualSize),
+                0.0f);
     p.imageSize = cv::Size(c.imageWidth, c.imageHeight);
     p.patternSize = cv::Size(c.chessWidth, c.chessHeight);
     p.squareSize = static_cast<float>(c.squareSizeMm);
@@ -281,6 +291,13 @@ bool runCameraCalib(const std::string& inputDir,
         return false;
     }
     log(cb, std::string("--- camera_calib done -> ") + outputPath);
+
+    std::string processPath = deriveProcessPath(outputPath);
+    if (writeJson(processPath, buildCameraCalibProcessJson(cfg, intrin, extrin))) {
+        log(cb, std::string("--- process data -> ") + processPath);
+    } else {
+        log(cb, std::string("[warn] process json write failed: ") + processPath);
+    }
     return true;
 }
 

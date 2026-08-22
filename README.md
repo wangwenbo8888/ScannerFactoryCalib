@@ -80,13 +80,21 @@ camera/
     └── 001.png  002.png ...
 ```
 
-### 模块1 输出（`data_out/camera_calib.json`）
+### 模块1 输出（`data_out/camera_calib.json` + `data_out/camera_calib_process.json`）
+
+结果文件 `camera_calib.json`（下游交接用，模块2 只读这个）：
 
 字段：`schema / imageSize / referenceTemp / cte / tempRange{Min/Max/Step}`
-+ `intrinsic` (left/right K/D + rvecs/tvecs + rms)
-+ `extrinsic` (R/T/E/F + 可选 K_L/R)
++ `intrinsic` (left/right K/D + rms)
++ `extrinsic` (R/T/E/F + 立体 RMS/epipolar 汇总指标)
 + `rectify` (R1/R2/P1/P2/Q + validRoi{L/R})
 + 4 张温度表（intrinsicTempTableL/R, extrinsicTempTable, stereoRectifyTempTable）
+
+过程文件 `camera_calib_process.json`（诊断/追溯用，下游不消费）：
+
+字段：`schema (…_process.v1) / config`（运行配置复述：板规格/阈值/温度区间）
++ `intrinsic.left/right` 逐视角 `rvecs / tvecs / per_view_errors`
++ `extrinsic` 逐视角 `perViewErrors / perViewEpipolarErrors` + 重复 K/D 副本 + message
 
 ### 模块2 输入（`data_in/laser/`）
 

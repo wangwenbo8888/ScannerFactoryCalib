@@ -43,6 +43,16 @@ ExtrinsicCalibCpuParams makeExtrinParams(const CameraCalibConfig& c,
     ExtrinsicCalibCpuParams p;
     p.leftPointsPerView = lpts;
     p.rightPointsPerView = rpts;
+    // 物点：与 IntrinsicCalibCPU::generateObjectPoints 同一约定（行主序 + 温度膨胀修正），
+    // 保证内/外参尺度一致。validate() 要求 objectPoints 数 == 每视角角点数。
+    double actualSize = c.squareSizeMm * (1.0 + c.plateTempCoeff * (c.plateTemp - 20.0));
+    p.objectPoints.reserve(static_cast<size_t>(c.chessWidth) * c.chessHeight);
+    for (int i = 0; i < c.chessHeight; ++i)
+        for (int j = 0; j < c.chessWidth; ++j)
+            p.objectPoints.emplace_back(
+                static_cast<float>(j * actualSize),
+                static_cast<float>(i * actualSize),
+                0.0f);
     p.imageSize = cv::Size(c.imageWidth, c.imageHeight);
     p.patternSize = cv::Size(c.chessWidth, c.chessHeight);
     p.squareSize = static_cast<float>(c.squareSizeMm);
@@ -101,6 +111,7 @@ int main(int argc, char** argv) {
     if (!extrinRes.success) { spdlog::error("extrinsic failed: {}", extrinRes.message); return 1; }
 
     // 4. 立体矫正
+    spdlog::info("[step 4/5] stereo rectify...");
     StereoRectifyCpuParams rp;
     rp.cameraMatrixL = intrinRes.left.camera_matrix;
     rp.distCoeffsL   = intrinRes.left.dist_coeffs;
@@ -109,11 +120,19 @@ int main(int argc, char** argv) {
     rp.imageSize     = cv::Size(cfg.imageWidth, cfg.imageHeight);
     rp.R = extrinRes.R; rp.T = extrinRes.T;
     rp.alpha = cfg.rectifyAlpha; rp.flags = cfg.rectifyFlags;
-    StereoRectifyCpu rectify(rp);
-    StereoRectifyCpuResult rectifyRes = rectify.Execute();
+    StereoRectifyCpuResult rectifyRes;
+    try {
+        StereoRectifyCpu rectify(rp);
+        rectifyRes = rectify.Execute();
+    } catch (const std::exception& e) {
+        spdlog::error("step 4 exception: {}", e.what());
+        return 1;
+    }
     if (!rectifyRes.success) { spdlog::error("rectify failed: {}", rectifyRes.message); return 1; }
+    spdlog::info("[step 4/5] rectify OK");
 
     // 5. 三张温度表
+    spdlog::info("[step 5/5] temp tables...");
     CameraIntrinsics cL{intrinRes.left.camera_matrix.at<double>(0,0),
                         intrinRes.left.camera_matrix.at<double>(1,1),
                         intrinRes.left.camera_matrix.at<double>(0,2),
@@ -147,11 +166,19 @@ int main(int argc, char** argv) {
     strp.alpha=cfg.rectifyAlpha; strp.flags=cfg.rectifyFlags;
     StereoRectifyTempTableCpu strtab(strp);
     auto tableR2 = strtab.Execute();
+    spdlog::info("[step 5/5] temp tables OK");
 
-    // 6. 写交接文件
+    // 6. 写交接文件（结果 + 过程分开）
+    spdlog::info("writing json -> {}", outPath);
     auto j = buildCameraCalibJson(cfg, intrinRes, extrinRes, rectifyRes,
                                   tableL, tableR, tableE, tableR2);
     if (!writeJson(outPath, j)) return 1;
     spdlog::info("camera_calib done -> {}", outPath);
+    std::string processPath = deriveProcessPath(outPath);
+    if (writeJson(processPath, buildCameraCalibProcessJson(cfg, intrinRes, extrinRes))) {
+        spdlog::info("process data -> {}", processPath);
+    } else {
+        spdlog::warn("process json write failed: {} (结果文件不受影响)", processPath);
+    }
     return 0;
 }

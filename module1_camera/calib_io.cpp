@@ -91,7 +91,10 @@ std::optional<CameraInput> loadCameraInput(const std::string& dir) {
     return in;
 }
 
-nlohmann::json fc::buildCameraCalibJson(
+namespace {
+
+// 完整组装（含过程数据）——两个公开 build*Json 的单一数据源
+nlohmann::json assembleFull(
     const CameraCalibConfig& cfg,
     const calib::IntrinsicCalibResult& intrin,
     const calib::ExtrinsicCalibCpuResult& extrin,
@@ -117,6 +120,97 @@ nlohmann::json fc::buildCameraCalibJson(
     j["extrinsicTempTable"] = extrinTable.toJson();
     j["stereoRectifyTempTable"] = rectifyTable.toJson();
     return j;
+}
+
+// intrinsic.left/right 里属于过程数据的键
+constexpr const char* kIntrinsicProcessKeys[] = {"rvecs", "tvecs", "per_view_errors"};
+// extrinsic 里属于过程数据的键（K/D 副本与 intrinsic 节重复）
+constexpr const char* kExtrinsicProcessKeys[] = {
+    "perViewErrors", "perViewEpipolarErrors", "message",
+    "camera_matrix_l", "dist_coeffs_l", "camera_matrix_r", "dist_coeffs_r"};
+
+} // namespace
+
+nlohmann::json fc::buildCameraCalibJson(
+    const CameraCalibConfig& cfg,
+    const calib::IntrinsicCalibResult& intrin,
+    const calib::ExtrinsicCalibCpuResult& extrin,
+    const calib::StereoRectifyCpuResult& rectify,
+    const calib::IntrinsicCompensateCPUResult& intrinTableL,
+    const calib::IntrinsicCompensateCPUResult& intrinTableR,
+    const calib::ExtrinsicCompensateCPUResult& extrinTable,
+    const calib::StereoRectifyTempTableResult& rectifyTable)
+{
+    nlohmann::json j = assembleFull(cfg, intrin, extrin, rectify,
+                                    intrinTableL, intrinTableR, extrinTable, rectifyTable);
+    // 结果文件只留下游需要的矩阵 + 汇总指标，剔除过程/诊断数据
+    if (j.contains("intrinsic") && j["intrinsic"].is_object()) {
+        for (const char* side : {"left", "right"}) {
+            if (j["intrinsic"].contains(side) && j["intrinsic"][side].is_object()) {
+                for (const char* k : kIntrinsicProcessKeys)
+                    j["intrinsic"][side].erase(k);
+            }
+        }
+    }
+    if (j.contains("extrinsic") && j["extrinsic"].is_object()) {
+        for (const char* k : kExtrinsicProcessKeys)
+            j["extrinsic"].erase(k);
+    }
+    return j;
+}
+
+nlohmann::json fc::buildCameraCalibProcessJson(
+    const CameraCalibConfig& cfg,
+    const calib::IntrinsicCalibResult& intrin,
+    const calib::ExtrinsicCalibCpuResult& extrin)
+{
+    nlohmann::json p;
+    p["schema"] = "factory_calib.camera_calib_process.v1";
+
+    // 运行配置复述（问题追溯用）
+    p["config"] = {
+        {"chessboard", {{"width", cfg.chessWidth},
+                        {"height", cfg.chessHeight},
+                        {"square_size_mm", cfg.squareSizeMm}}},
+        {"image_size", {cfg.imageWidth, cfg.imageHeight}},
+        {"intrinsic", {{"flags", cfg.intrinsicFlags},
+                       {"use_calibrateCameraRO", cfg.useCalibrateCameraRO},
+                       {"reproj_error_threshold", cfg.reprojErrorThreshold}}},
+        {"plate", {{"tempCoeff", cfg.plateTempCoeff}, {"temp", cfg.plateTemp}}},
+        {"temperature", {{"referenceTemp", cfg.referenceTemp},
+                         {"cte", cfg.cte},
+                         {"tempRangeMin", cfg.tempRangeMin},
+                         {"tempRangeMax", cfg.tempRangeMax},
+                         {"tempStep", cfg.tempStep}}},
+        {"rectify", {{"alpha", cfg.rectifyAlpha},
+                     {"flags", cfg.rectifyFlags}}},
+    };
+
+    // 逐视角过程数据
+    nlohmann::json intr = intrin.toJson();
+    for (const char* side : {"left", "right"}) {
+        if (intr.contains(side) && intr[side].is_object()) {
+            nlohmann::json ps = nlohmann::json::object();
+            for (const char* k : kIntrinsicProcessKeys) {
+                if (intr[side].contains(k))
+                    ps[k] = std::move(intr[side][k]);
+            }
+            if (!ps.empty()) p["intrinsic"][side] = std::move(ps);
+        }
+    }
+    nlohmann::json ext = extrin.toJson();
+    nlohmann::json pe = nlohmann::json::object();
+    for (const char* k : kExtrinsicProcessKeys) {
+        if (ext.contains(k))
+            pe[k] = std::move(ext[k]);
+    }
+    if (!pe.empty()) p["extrinsic"] = std::move(pe);
+    return p;
+}
+
+std::string fc::deriveProcessPath(const std::string& outputPath) {
+    fs::path p(outputPath);
+    return (p.parent_path() / (p.stem().string() + "_process.json")).string();
 }
 
 bool fc::writeJson(const std::string& path, const nlohmann::json& j) {

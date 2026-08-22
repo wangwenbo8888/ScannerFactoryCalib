@@ -28,6 +28,13 @@ bool extractChessboardCorners(const cv::Mat& gray,
     std::vector<cv::Point2f> coarse;
     bool found = cv::findChessboardCornersSB(gray8, params.patternSize, coarse, params.sbFlags);
     if (!found || static_cast<int>(coarse.size()) != params.patternSize.area()) {
+        // SB 兜底：OpenCV 4.13 的 findChessboardCornersSB 对「欠曝光 + 板上带圆形标记点」
+        // 的实拍图会整体检不出（OpenCV 5.0 可检，版本行为差异）；经典检测器实测可检出。
+        // SB 失败时退回经典检测器，亚像素精化仍走下方统一的 cornerSubPix。
+        found = cv::findChessboardCorners(gray8, params.patternSize, coarse,
+                                          cv::CALIB_CB_ADAPTIVE_THRESH | cv::CALIB_CB_NORMALIZE_IMAGE);
+    }
+    if (!found || static_cast<int>(coarse.size()) != params.patternSize.area()) {
         spdlog::debug("[chessboard_corner] not found or count mismatch");
         return false;
     }
