@@ -63,6 +63,8 @@ public:
 private:
     void appendLog(const QString& msg);
     void updateSnapCount();
+    // 启动时扫描已有数据目录，采集计数从最大编号续起（防跨会话覆盖旧图）
+    void initSnapCounters();
     void setDeviceOpenUI(bool opened);
     // 按用户勾选的「左/右 180°」复选框旋转图像（GUI 层处理，与 deviceId 解耦）
     void applyGuiRotation(cv::Mat& leftImg, cv::Mat& rightImg);
@@ -124,7 +126,7 @@ private:
     cv::Mat frozenLeft_;        // 当前【显示】帧：连续预览时随 lastLeft_ 更新；点「预览当前帧」后冻结
     cv::Mat frozenRight_;       // 保存图像存这个，保证存的就是用户看到的那一帧
     int cameraSnapshotIdx_ = 0;
-    int laserPoseIdx_ = 0;
+    int laserPoseIdx_[4] = {0, 0, 0, 0};   // 四种激光线类型各自独立的 pose 计数
 
     // 照搬 LeadScanK2：左右帧配对用
     cv::Mat* m_pLeft = nullptr;

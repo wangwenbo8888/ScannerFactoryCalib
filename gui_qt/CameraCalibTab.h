@@ -13,6 +13,7 @@ class QProgressBar;
 class QPlainTextEdit;
 class QLabel;
 class QComboBox;
+class QCheckBox;
 
 namespace fc::gui {
 
@@ -20,6 +21,7 @@ class PreviewWidget;
 class CalibWorker;
 
 // 相机标定 tab：含 4 个独立步骤 + 全流程，保留中间结果供下一步用。
+// 「使用旧数据」勾选框：不勾＝本次采集（data_in/camera），勾＝手动选旧数据文件夹。
 class CameraCalibTab : public QWidget {
     Q_OBJECT
 public:
@@ -33,6 +35,8 @@ signals:
 private slots:
     void onBrowseInput();
     void onBrowseOutput();
+    void onToggleOldData(bool on);   // 勾选「使用旧数据」→ 启用手动选目录
+    void onPickOldDataDir();         // 选择旧数据文件夹（应含 left/ right/ 子目录）
     void onRunStep(int step);     // step ∈ {1,2,3,4} 对应 内参/外参/立体/温度表
     void onRunAll();              // 全流程
     void onPreviewFirstPair();    // 把首帧棋盘叠加显示
@@ -50,6 +54,10 @@ private:
     QLineEdit* outputEdit_ = nullptr;
     QPushButton* inBtn_  = nullptr;
     QPushButton* outBtn_ = nullptr;
+
+    // —— 旧数据选择（不勾＝本次采集 data_in/camera，勾＝手动选文件夹）——
+    QCheckBox*    oldDataChk_ = nullptr;
+    QPushButton*  oldDataBtn_ = nullptr;
 
     // —— 步骤按钮 + 状态 ——
     QPushButton* step1Btn_ = nullptr;   // 棋盘格

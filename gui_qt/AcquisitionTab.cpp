@@ -1,5 +1,6 @@
 #include "AcquisitionTab.h"
 #include "PreviewWidget.h"
+#include "gui_common.h"
 #include "camera/ICameraSource.h"
 #include "camera/StereoCameraRig.h"
 #include "camera/GalaxyCameraSource.h"
@@ -134,9 +135,12 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
     scanRow1->addWidget(scannerOpenBtn_);
     scanRow1->addWidget(new QLabel(QStringLiteral("模式:")));
     scannerModeCbx_ = new QComboBox;
-    scannerModeCbx_->addItem(QStringLiteral("仅补光（相机标定）"), 0);
-    scannerModeCbx_->addItem(QStringLiteral("激光+补光（激光标定）"), 1);
-    scannerModeCbx_->setCurrentIndex(1);  // 默认激光+补光：实时预览看激光线变换
+    scannerModeCbx_->addItem(QStringLiteral("仅标志点（相机标定）"), 0);
+    scannerModeCbx_->addItem(QStringLiteral("标志点+左斜激光线"), 1);
+    scannerModeCbx_->addItem(QStringLiteral("标志点+右斜激光线"), 2);
+    scannerModeCbx_->addItem(QStringLiteral("标志点+精细激光线"), 3);
+    scannerModeCbx_->addItem(QStringLiteral("标志点+深孔激光线"), 4);
+    scannerModeCbx_->setCurrentIndex(1);  // 默认激光模式：实时预览看激光线变换
     scanRow1->addWidget(scannerModeCbx_);
     scannerStartBtn_ = new QPushButton(QStringLiteral("▶ 启动扫描仪"));
     scannerStartBtn_->setEnabled(false);
@@ -235,6 +239,25 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
     connect(laserSlider_,     &QSlider::valueChanged, this, [this](int v){
         laserValLbl_->setText(QString::number(v));
     });
+    // 模式切换 → 激光保存按钮按类型更新文案/可用性（相机标定模式下禁用）
+    connect(scannerModeCbx_, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [this](int) {
+        int mode = scannerModeCbx_->currentData().toInt();
+        if (mode >= 1 && mode <= kLaserTypeCount) {
+            saveLaserBtn_->setEnabled(true);
+            saveLaserBtn_->setText(QStringLiteral("💾 保存到 data_in/laser/%1/pose_NN")
+                                       .arg(QString::fromLatin1(kLaserTypes[mode - 1].key)));
+        } else {
+            saveLaserBtn_->setEnabled(false);
+            saveLaserBtn_->setText(QStringLiteral("💾 保存激光帧（请先选激光线类型）"));
+        }
+    });
+    // 初始化按钮文案（不触发上面的信号）
+    if (scannerModeCbx_->currentData().toInt() >= 1) {
+        saveLaserBtn_->setText(QStringLiteral("💾 保存到 data_in/laser/%1/pose_NN")
+                                   .arg(QString::fromLatin1(
+                                       kLaserTypes[scannerModeCbx_->currentData().toInt() - 1].key)));
+    }
 
     rig_ = std::make_unique<StereoCameraRig>();
     scanner_ = std::make_unique<ScannerControl>();
@@ -248,6 +271,8 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
 
     onRefreshDevices();
     onRefreshComPorts();
+    initSnapCounters();
+    updateSnapCount();
 
     // 开机自动：开串口 → 开设备（注册帧回调）。
     // 扫描仪启动留给用户点（onStartScanner 里发 N10 + 自动进预览）。
@@ -256,6 +281,12 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
 }
 
 AcquisitionTab::~AcquisitionTab() {
+    // 退出前先停扫描仪（电机/激光）——无论哪种退出路径（关闭窗口/菜单退出/quit），
+    // Qt 对象树析构都会走到这里；串口未开或未启动则静默跳过，不发多余 N11
+    if (scanner_ && scanner_->isOpen() && scannerRunning_) {
+        scanner_->stop();
+        scannerRunning_ = false;
+    }
     if (rig_) {
         // 顺序关键（修复关闭 GUI 时 Qt5Widgets 0xC0000005 读 0x8 崩溃）：
         //   1. 先清回调 → 新 dispatchFrame 拷贝到空 cb，不再执行捕获 this 的 lambda
@@ -411,8 +442,14 @@ void AcquisitionTab::onSaveLaser() {
         emit statusMessage(QStringLiteral("尚无显示帧可保存"));
         return;
     }
-    QString base = QStringLiteral("data_in/laser/pose_") +
-        QString::number(laserPoseIdx_).rightJustified(2, '0');
+    int mode = scannerModeCbx_->currentData().toInt();
+    if (mode < 1 || mode > kLaserTypeCount) {
+        emit statusMessage(QStringLiteral("当前是相机标定模式：请先在「模式」中选择激光线类型"));
+        return;
+    }
+    const int ti = mode - 1;
+    QString base = laserTypeDir(ti) + QStringLiteral("/pose_") +
+        QString::number(laserPoseIdx_[ti]).rightJustified(2, '0');
     QDir().mkpath(base);
     cv::imwrite((base + "/L_tube0.png").toStdString(), frozenLeft_);
     cv::imwrite((base + "/R_tube0.png").toStdString(), frozenRight_);
@@ -420,14 +457,36 @@ void AcquisitionTab::onSaveLaser() {
     if (f.open(QIODevice::WriteOnly | QIODevice::Text)) {
         f.write("ref_temp 25.0\n");
     }
-    ++laserPoseIdx_;
+    ++laserPoseIdx_[ti];
     updateSnapCount();
-    emit statusMessage(QStringLiteral("已保存: ") + base);
+    emit statusMessage(QStringLiteral("[%1] 已保存: ").arg(laserTypeName(ti)) + base);
+}
+
+void AcquisitionTab::initSnapCounters() {
+    // 相机：data_in/camera/left/NNN.png 取最大编号+1
+    QDir camDir(QStringLiteral("data_in/camera/left"));
+    for (const QString& fn : camDir.entryList({QStringLiteral("*.png")}, QDir::Files)) {
+        bool ok = false;
+        int n = QFileInfo(fn).completeBaseName().toInt(&ok);
+        if (ok && n + 1 > cameraSnapshotIdx_) cameraSnapshotIdx_ = n + 1;
+    }
+    // 四类激光：data_in/laser/<key>/pose_NN 取最大编号+1
+    for (int i = 0; i < kLaserTypeCount; ++i) {
+        QDir d(laserTypeDir(i));
+        for (const QString& dn :
+             d.entryList({QStringLiteral("pose_*")}, QDir::Dirs | QDir::NoDotAndDotDot)) {
+            bool ok = false;
+            int n = dn.mid(QString("pose_").size()).toInt(&ok);
+            if (ok && n + 1 > laserPoseIdx_[i]) laserPoseIdx_[i] = n + 1;
+        }
+    }
 }
 
 void AcquisitionTab::updateSnapCount() {
-    snapCountLbl_->setText(QString(QStringLiteral("相机: %1 张    激光: %2 pose"))
-                              .arg(cameraSnapshotIdx_).arg(laserPoseIdx_));
+    snapCountLbl_->setText(QString(QStringLiteral("相机: %1 张    激光pose — 左斜:%2 右斜:%3 精细:%4 深孔:%5"))
+                              .arg(cameraSnapshotIdx_)
+                              .arg(laserPoseIdx_[0]).arg(laserPoseIdx_[1])
+                              .arg(laserPoseIdx_[2]).arg(laserPoseIdx_[3]));
 }
 
 void AcquisitionTab::appendLog(const QString&) {
@@ -505,7 +564,7 @@ void AcquisitionTab::onStartScanner() {
     // 模式 0 = 仅补光（相机标定）→ 激光关（laser=0）
     // 模式 1 = 激光+补光（激光标定）→ 用滑块值
     int mode = scannerModeCbx_->currentData().toInt();
-    p.laser = (mode == 1) ? laserSlider_->value() : 0;
+    p.laser = (mode >= 1) ? laserSlider_->value() : 0;   // 四类激光模式协议暂同（下位机未区分）
     scanner_->start(p);
     scannerRunning_ = true;
 
@@ -523,11 +582,11 @@ void AcquisitionTab::onStartScanner() {
     }
 
     if (mode == 0) {
-        emit statusMessage(QStringLiteral("[相机标定模式] 仅补光 L=0 (激光关)"));
+        emit statusMessage(QStringLiteral("[相机标定模式] 仅标志点 L=0 (激光关)"));
     } else {
-        emit statusMessage(QStringLiteral("[激光标定模式] 激光 L=%1 + 补光 B=%2 "
+        emit statusMessage(QStringLiteral("[%1激光线模式] 激光 L=%2 + 补光 B=%3 "
                                           "(若看不到激光线：调高激光滑块/降背光/增曝光)")
-                              .arg(p.laser).arg(p.background));
+                              .arg(laserTypeName(mode - 1)).arg(p.laser).arg(p.background));
     }
 }
 

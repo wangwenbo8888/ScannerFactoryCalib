@@ -14,6 +14,7 @@
 #include <QFileInfo>
 #include <QDir>
 #include <QSettings>
+#include <QCheckBox>
 #include <QFutureWatcher>
 #include <QMessageBox>
 #include <QtConcurrent>
@@ -68,6 +69,16 @@ CameraCalibTab::CameraCalibTab(QWidget* parent) : QWidget(parent) {
     outBtn_ = new QPushButton(QStringLiteral("浏览..."));
     outRow->addWidget(outBtn_);
     root->addLayout(outRow);
+
+    // —— 旧数据选择：不勾＝用本次采集（data_in/camera），勾上＝手动选旧数据文件夹 ——
+    auto* oldRow = new QHBoxLayout;
+    oldDataChk_ = new QCheckBox(QStringLiteral("使用旧数据标定（手动选择文件夹）"));
+    oldDataBtn_ = new QPushButton(QStringLiteral("选择旧数据文件夹…"));
+    oldDataBtn_->setEnabled(false);   // 未勾选时不可点
+    oldRow->addWidget(oldDataChk_);
+    oldRow->addWidget(oldDataBtn_);
+    oldRow->addStretch(1);
+    root->addLayout(oldRow);
 
     // —— 步骤按钮（左竖排）——
     auto* stepsRow = new QHBoxLayout;
@@ -129,6 +140,8 @@ CameraCalibTab::CameraCalibTab(QWidget* parent) : QWidget(parent) {
     // —— 信号 ——
     connect(inBtn_, &QPushButton::clicked, this, &CameraCalibTab::onBrowseInput);
     connect(outBtn_, &QPushButton::clicked, this, &CameraCalibTab::onBrowseOutput);
+    connect(oldDataChk_, &QCheckBox::toggled, this, &CameraCalibTab::onToggleOldData);
+    connect(oldDataBtn_, &QPushButton::clicked, this, &CameraCalibTab::onPickOldDataDir);
     connect(step1Btn_, &QPushButton::clicked, this, [this]() { onRunStep(1); });
     connect(step2Btn_, &QPushButton::clicked, this, [this]() { onRunStep(2); });
     connect(step3Btn_, &QPushButton::clicked, this, [this]() { onRunStep(3); });
@@ -165,6 +178,46 @@ void CameraCalibTab::onBrowseOutput() {
     if (!p.isEmpty()) outputEdit_->setText(p);
 }
 
+void CameraCalibTab::onToggleOldData(bool on) {
+    oldDataBtn_->setEnabled(on);
+    if (on) {
+        onPickOldDataDir();   // 勾上直接弹文件夹选择
+    } else {
+        // 取消勾选 → 恢复本次采集默认路径
+        inputEdit_->setText(QStringLiteral("data_in/camera"));
+    }
+}
+
+void CameraCalibTab::onPickOldDataDir() {
+    // 用户可选到任意一级：备份根（含 camera/）、camera 一级、或精确相机数据目录
+    // （含 left/right），软件自动定位
+    QString d = QFileDialog::getExistingDirectory(this,
+        QStringLiteral("选择旧数据文件夹（可选备份根或 camera 目录，软件自动定位相机数据）"),
+        QStringLiteral("data_bak"));
+    if (d.isEmpty()) return;
+
+    auto hasStereo = [](const QString& p) {
+        QDir dir(p);
+        return dir.exists(QStringLiteral("left")) && dir.exists(QStringLiteral("right"));
+    };
+    QString camDir;
+    if (hasStereo(d)) {
+        camDir = d;                                          // 选的就是 camera 级（或备份根即 camera）
+    } else if (hasStereo(QDir(d).filePath(QStringLiteral("camera")))) {
+        camDir = QDir(d).filePath(QStringLiteral("camera"));  // 选的是备份根
+    } else {
+        QMessageBox::warning(this, QStringLiteral("未找到相机数据"),
+            QStringLiteral("在以下位置均未找到含 left/ right/ 的相机数据:\n%1\n%2")
+                .arg(QDir::toNativeSeparators(d),
+                     QDir::toNativeSeparators(
+                         QDir(d).filePath(QStringLiteral("camera")))));
+        return;
+    }
+    inputEdit_->setText(camDir);
+    appendLog(QStringLiteral("使用旧数据[相机]: %1").arg(
+                  QDir::toNativeSeparators(camDir)), "#f39c12");
+}
+
 void CameraCalibTab::appendLog(const QString& msg, const QString& color) {
     QString html = QStringLiteral("<span style='color:%1;'>&gt; %2</span>")
                        .arg(color, msg.toHtmlEscaped());
@@ -190,11 +243,21 @@ void CameraCalibTab::setRunningUI(bool running) {
     runAllBtn_->setEnabled(!running);
     inputEdit_->setEnabled(!running);
     outputEdit_->setEnabled(!running);
+    oldDataChk_->setEnabled(!running);
+    oldDataBtn_->setEnabled(!running && oldDataChk_->isChecked());
     progress_->setValue(running ? 5 : 0);
 }
 
 void CameraCalibTab::onRunStep(int step) {
-    QString inDir = inputEdit_->text().trimmed();
+    // 数据源由勾选框决定：未勾＝本次采集（固定 data_in/camera），勾＝旧数据（已手选）
+    QString inDir;
+    if (oldDataChk_->isChecked()) {
+        inDir = inputEdit_->text().trimmed();
+        appendLog(QStringLiteral("旧数据模式: %1").arg(inDir), "#f39c12");
+    } else {
+        inDir = QStringLiteral("data_in/camera");   // 强制本次采集路径，防手动改错
+        inputEdit_->setText(inDir);
+    }
     if (inDir.isEmpty()) { appendLog(QStringLiteral("输入目录为空"), "#c0392b"); return; }
     if (!QFileInfo::exists(inDir)) { appendLog(QStringLiteral("输入目录不存在"), "#c0392b"); return; }
 
