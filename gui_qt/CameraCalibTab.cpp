@@ -207,6 +207,7 @@ void CameraCalibTab::onRunStep(int step) {
 
     setRunningUI(true);
     appendLog(QStringLiteral("启动步骤 %1...").arg(step));
+    emit calibrationStarted();   // 通知 MainWindow：标定开始，必要时自动停止扫描仪
 
     // 闭包里捕获需要的值，工作线程内同步执行；GUI 信号走 worker_ 转发
     CalibCallbacks cb;

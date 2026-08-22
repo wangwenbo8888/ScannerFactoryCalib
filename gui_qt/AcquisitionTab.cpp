@@ -507,6 +507,7 @@ void AcquisitionTab::onStartScanner() {
     int mode = scannerModeCbx_->currentData().toInt();
     p.laser = (mode == 1) ? laserSlider_->value() : 0;
     scanner_->start(p);
+    scannerRunning_ = true;
 
     // 启动相机采集：注册 SDK 回调，Line2 硬件触发脉冲来即出帧 → 自动进入实时预览。
     // 回调在 SDK 线程 emit frameArrived，queued 投递到主线程 onFrameArrived 刷新。
@@ -537,6 +538,14 @@ void AcquisitionTab::onStopScanner() {
     previewBtn_->setChecked(false);
     if (rig_ && rig_->isAcquiring()) rig_->stopAcquisition();
     scanner_->stop();
+    scannerRunning_ = false;
+}
+
+void AcquisitionTab::stopScannerIfRunning() {
+    // 标定启动时调用：未启动/串口未开则什么都不做（避免对未启动的扫描仪盲发 N11）
+    if (!scanner_ || !scanner_->isOpen() || !scannerRunning_) return;
+    onStopScanner();
+    emit statusMessage(QStringLiteral("检测到标定启动，已自动停止扫描仪"));
 }
 
 // 照搬 LeadScanK2 convertMattoQImage：Format_Indexed8 + 逐行 memcpy 到 scanLine + 256 灰度颜色表

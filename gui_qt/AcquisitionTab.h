@@ -57,6 +57,9 @@ public:
     void setLeftImage(cv::Mat& left, uint64_t id);
     void setRightImage(cv::Mat& right, uint64_t id);
 
+    // 标定启动时由 MainWindow 调用：扫描仪在运行则自动停止（N11 + 停预览/采集）
+    void stopScannerIfRunning();
+
 private:
     void appendLog(const QString& msg);
     void updateSnapCount();
@@ -87,6 +90,7 @@ private:
     QCheckBox*  leftRotateChk_    = nullptr;  // 左相机 180° 旋转
     QCheckBox*  rightRotateChk_   = nullptr;  // 右相机 180° 旋转
     bool        previewing_       = false;   // 扫描仪启动后自动进入预览态
+    bool        scannerRunning_   = false;   // 扫描仪电机/激光是否已启动（N10 已发）
 
     // —— 扫描仪硬件控制（串口）——
     QComboBox*   comPortCbx_       = nullptr;

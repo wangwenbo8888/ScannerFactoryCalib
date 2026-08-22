@@ -28,6 +28,7 @@ public:
 
 signals:
     void statusMessage(QString msg);
+    void calibrationStarted();   // 标定启动（MainWindow 接线→自动停止扫描仪）
 
 private slots:
     void onBrowseInput();

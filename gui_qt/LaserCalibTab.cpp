@@ -153,6 +153,7 @@ void LaserCalibTab::onRunAll() {
     setRunningUI(true);
     progress_->setValue(5);
     log_->clear();
+    emit calibrationStarted();   // 通知 MainWindow：标定开始，必要时自动停止扫描仪
     worker_->startLaser(inDir, outPath);
 }
 
