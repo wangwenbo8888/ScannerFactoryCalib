@@ -7,6 +7,9 @@ data_out/*
 !data_in/.gitkeep
 !data_out/.gitkeep
 
+# 关闭 GUI 时自动备份的标定图像（运行时数据，不入库）
+data_bak/
+
 # 调试诊断文件（ofstream/spdlog file sink 生成，不入库）
 debug.txt
 factory_calib.log

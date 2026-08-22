@@ -7,6 +7,7 @@ class QTabWidget;
 class QStatusBar;
 class QPlainTextEdit;
 class QDockWidget;
+class QCloseEvent;
 
 namespace fc::gui {
 
@@ -21,6 +22,9 @@ public:
     explicit MainWindow(QWidget* parent = nullptr);
     ~MainWindow() override;  // 先卸载 spdlog sink，再让子控件析构
 
+protected:
+    void closeEvent(QCloseEvent* event) override;
+
 private slots:
     void onAbout();
 
@@ -29,6 +33,7 @@ private:
     void buildCentral();
     void buildLogDock();
     void installSpdlogBridge();
+    void backupDataIn();  // 关闭时备份 data_in 图像到 data_bak/<时间戳>/，成功后清除
 
     QTabWidget* tabs_ = nullptr;
     AcquisitionTab*  acquisitionTab_ = nullptr;

@@ -5,7 +5,13 @@
 #include "SpdlogBridge.h"
 
 #include <QApplication>
+#include <QCloseEvent>
+#include <QDateTime>
+#include <QDir>
+#include <QDirIterator>
 #include <QDockWidget>
+#include <QFile>
+#include <QFileInfo>
 #include <QPointer>
 #include <QMenuBar>
 #include <QMessageBox>
@@ -62,6 +68,12 @@ void MainWindow::buildCentral() {
     connect(acquisitionTab_, &AcquisitionTab::statusMessage, this, fwd);
     connect(cameraTab_,      &CameraCalibTab::statusMessage, this, fwd);
     connect(laserTab_,       &LaserCalibTab::statusMessage, this, fwd);
+
+    // 标定启动 → 自动停止扫描仪（电机/激光/预览），避免标定期间设备继续运转
+    connect(cameraTab_, &CameraCalibTab::calibrationStarted,
+            acquisitionTab_, &AcquisitionTab::stopScannerIfRunning);
+    connect(laserTab_,  &LaserCalibTab::calibrationStarted,
+            acquisitionTab_, &AcquisitionTab::stopScannerIfRunning);
 }
 
 void MainWindow::buildLogDock() {
@@ -90,9 +102,73 @@ void MainWindow::installSpdlogBridge() {
             globalLog_, &QPlainTextEdit::appendPlainText);
 }
 
+void MainWindow::closeEvent(QCloseEvent* event) {
+    // 关闭窗口时备份并清理 data_in 图像（QApplication::quit 不经过这里，
+    // 菜单退出已改为 close() 以保证走本钩子）
+    backupDataIn();
+    QMainWindow::closeEvent(event);
+}
+
+void MainWindow::backupDataIn() {
+    // data_bak 与 data_in 同级（main() 已把 cwd 设为工程根）
+    const QString dataIn = QDir::current().filePath(QStringLiteral("data_in"));
+    if (!QDir(dataIn).exists()) return;
+
+    // 只备份 camera/ 与 laser/ 下的图像文件（png/jpg/bmp），保留相对路径结构
+    const QStringList imgFilters = { QStringLiteral("*.png"),
+                                     QStringLiteral("*.jpg"),
+                                     QStringLiteral("*.bmp") };
+    struct Item { QString abs; QString rel; };
+    QVector<Item> items;
+    QDirIterator it(dataIn, imgFilters, QDir::Files, QDirIterator::Subdirectories);
+    const QDir inDir(dataIn);
+    while (it.hasNext()) {
+        it.next();
+        const QString rel = inDir.relativeFilePath(it.filePath());
+        if (!rel.startsWith(QStringLiteral("camera/"))
+            && !rel.startsWith(QStringLiteral("laser/"))) {
+            continue;
+        }
+        items.append({ it.filePath(), rel });
+    }
+    if (items.isEmpty()) return;  // 无图像 → 不建空备份、不清除、不打扰
+
+    const QString stamp = QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss"));
+    const QString destRoot = QDir::current().filePath(
+        QStringLiteral("data_bak/") + stamp);
+
+    // 逐个复制；任何失败 → 中止且绝不清除 data_in（保数据优先）
+    for (const auto& im : items) {
+        const QString dest = destRoot + QLatin1Char('/') + im.rel;
+        QDir().mkpath(QFileInfo(dest).absolutePath());
+        if (!QFile::copy(im.abs, dest)
+            || QFileInfo(dest).size() != QFileInfo(im.abs).size()) {
+            spdlog::error("[backup] copy failed: {} -> {}",
+                          im.abs.toStdString(), dest.toStdString());
+            QMessageBox::warning(
+                this, QStringLiteral("备份失败"),
+                QStringLiteral("备份失败，data_in 原始数据已保留。\n文件: %1").arg(im.rel));
+            return;
+        }
+    }
+
+    // 备份全部成功 → 删除 data_in 中图像，目录结构原样保留
+    for (const auto& im : items) QFile::remove(im.abs);
+
+    spdlog::info("[backup] {} images -> {} ; data_in images cleared",
+                 items.size(), destRoot.toStdString());
+    QMessageBox::information(
+        this, QStringLiteral("备份完成"),
+        QStringLiteral("已备份 %1 张图像到\n%2\n\ndata_in 中的图像已清除（目录结构保留）。")
+            .arg(items.size())
+            .arg(QDir::toNativeSeparators(destRoot)));
+}
+
 void MainWindow::buildMenu() {
     auto* fileMenu = menuBar()->addMenu(QStringLiteral("文件(&F)"));
-    fileMenu->addAction(QStringLiteral("退出(&X)"), qApp, &QApplication::quit,
+    // 用 close() 而非 QApplication::quit()：close 会触发 closeEvent，
+    // 从而执行关闭时的 data_in 备份清理（quit 直接退出事件循环，绕过 closeEvent）
+    fileMenu->addAction(QStringLiteral("退出(&X)"), this, &MainWindow::close,
                         QKeySequence(QStringLiteral("Ctrl+Q")));
 
     auto* viewMenu = menuBar()->addMenu(QStringLiteral("视图(&V)"));
