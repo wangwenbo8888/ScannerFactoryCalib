@@ -70,13 +70,17 @@ __global__ void UndistortRectifyKernel(
     }
 
     // Step 3: 旋转矫正
-    // [x'', y''] = R * [xu, yu, 1]^T (取前两行)
+    // [xr, yr, zr] = R * [xu, yu, 1]^T —— R 是一般 3D 旋转，zr != 1
     float xr = d_R[0] * xu + d_R[1] * yu + d_R[2];
     float yr = d_R[3] * xu + d_R[4] * yu + d_R[5];
+    float zr = d_R[6] * xu + d_R[7] * yu + d_R[8];
 
-    // Step 4: 投影到矫正后像素坐标
-    float u_out = fx_p * xr + cx_p + tx_p;
-    float v_out = fy_p * yr + cy_p;
+    // Step 4: 投影到矫正后像素坐标（含透视除法 xr/zr；
+    // 原实现漏除 zr，把 3D 旋转当 2D 仿射 → 视场边缘 ~30px 系统偏差，
+    // 即激光重建平面碗状翘曲的根因，实测与 cv::undistortPoints 差 33px）
+    float invz = 1.0f / zr;
+    float u_out = fx_p * xr * invz + cx_p + tx_p;
+    float v_out = fy_p * yr * invz + cy_p;
 
     d_dst[tid] = make_float2(u_out, v_out);
 }

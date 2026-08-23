@@ -536,6 +536,55 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
             auto undistResR = undistROp.Execute(*stegerResR.d_centerPoints,
                                                 *stegerResR.d_line_ids, stream);
             // if (pi == 0) { cudaError_t e_ = cudaGetLastError(); if (e_ != cudaSuccess) spdlog::error("[probe] after 4-5 R: {{}}", cudaGetErrorString(e_)); }
+
+            // [verify] OpenCV cv::undistortPoints 参照：逐点比对 kernel 输出
+            static int n0dump_ = 0;
+            {
+                auto verify = [&](const cv::cuda::GpuMat& dsrc,
+                                  const cv::cuda::GpuMat& dkernelOut,
+                                  const cv::Mat& K, const cv::Mat& D,
+                                  const cv::Mat& Rm, const cv::Mat& Pk,
+                                  const char* side) {
+                    if (!undistResL.success) return;
+                    cv::Mat src, kern;
+                    dsrc.download(src, stream);
+                    dkernelOut.download(kern, stream);
+                    cudaStreamSynchronize(cv::cuda::StreamAccessor::getStream(stream));
+                    if (src.empty() || kern.empty()) return;
+                    cv::Mat ref;
+                    cv::undistortPoints(src, ref, K, D, Rm, Pk);   // OpenCV 全参数形态
+                    if (pi == 0 && n0dump_ < 3) {
+                        const cv::Vec2f* ps = src.ptr<cv::Vec2f>();
+                        const cv::Vec2f* pr2 = ref.ptr<cv::Vec2f>();
+                        const cv::Vec2f* pk2 = kern.ptr<cv::Vec2f>();
+                        spdlog::info("[verify 4-5 dump] in=({:.3f},{:.3f}) ref=({:.3f},{:.3f}) kern=({:.3f},{:.3f})",
+                                     ps[0][0], ps[0][1], pr2[0][0], pr2[0][1], pk2[0][0], pk2[0][1]);
+                        ++n0dump_;
+                    }
+                    std::vector<double> dd;
+                    dd.reserve(ref.total());
+                    int n = (int)ref.total();
+                    const cv::Vec2f* pr = ref.ptr<cv::Vec2f>();
+                    const cv::Vec2f* pk = kern.ptr<cv::Vec2f>();
+                    int bad = 0;
+                    for (int k = 0; k < n; ++k) {
+                        double d = std::hypot((double)pr[k][0] - pk[k][0],
+                                              (double)pr[k][1] - pk[k][1]);
+                        dd.push_back(d);
+                        if (d > 0.01) ++bad;
+                    }
+                    std::sort(dd.begin(), dd.end());
+                    auto q = [&](double p) { return dd.empty() ? 0.0 : dd[(size_t)(p * (dd.size() - 1))]; };
+                    spdlog::info("[verify 4-5] pose {} {} {}: n={} median={:.4f} p99={:.4f} "
+                                 "p99.99={:.4f} max={:.4f}px  (>0.01px: {} 个 = {:.4f}%)",
+                                 pi, ti, side, n, q(0.5), q(0.99), q(0.9999), dd.back(),
+                                 bad, 100.0 * bad / std::max(n, 1));
+                };
+                verify(*stegerResL.d_centerPoints, *undistResL.d_rectifiedPoints,
+                       h.cameraMatrixL, h.distCoeffsL, h.R1, P1k, "L");
+                verify(*stegerResR.d_centerPoints, *undistResR.d_rectifiedPoints,
+                       h.cameraMatrixR, h.distCoeffsR, h.R2, P2k, "R");
+            }
             if (!undistResL.success || !undistResR.success) {
                 spdlog::warn("pose {} tube {}: 4-5 undistort failed (L={}, R={}), skip",
                              pi, ti, undistResL.success, undistResR.success);
