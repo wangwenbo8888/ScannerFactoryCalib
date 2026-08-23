@@ -26,12 +26,22 @@
 #include "plane_map_temp_table.h"
 
 #include <opencv2/core/cuda.hpp>
+#include <opencv2/core/cuda_stream_accessor.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/calib3d.hpp>
+#include <cstdio>
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
 
 #include <iostream>
+#include <iomanip>
+#include <fstream>
+#include <filesystem>
 #include <string>
 #include <set>
+#include <unordered_set>
+#include <unordered_map>
 #include <map>
 #include <algorithm>
 #include <cmath>
@@ -83,11 +93,15 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
     maskParams.laserDilateSize = cfg.maskDilateSize;
     maskParams.minArea        = cfg.maskMinArea;
     maskParams.maxArea        = cfg.maskMaxArea;
+    // config.lineIds 数量 = 产线条数：4-1 按面积留前 K 条（4-3 expectedLineCount 校验）
+    if (!cfg.lineIds.empty()) maskParams.keepTopK = (int)cfg.lineIds.size();
     MaskExtractCUDA maskL(maskParams);
     MaskExtractCUDA maskR(maskParams);
-    spdlog::info("4-1 MaskExtractCUDA x2 constructed (threshold={}, erode={}, dilate={}, area=[{},{})",
+    spdlog::info("4-1 MaskExtractCUDA x2 constructed (threshold={}, erode={}, dilate={}, "
+                 "area=[{},{}){}, keepTopK from lineIds)",
                  maskParams.threshold, maskParams.erodeSize, maskParams.laserDilateSize,
-                 maskParams.minArea, maskParams.maxArea);
+                 maskParams.minArea, maskParams.maxArea,
+                 maskParams.keepTopK > 0 ? " enabled" : "");
 
     RegionAnalyzerParams cclParams;
     cclParams.deviceId = cfg.deviceId;
@@ -99,9 +113,14 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
 
     LaserLabelParams labelParams;
     labelParams.deviceId = cfg.deviceId;
+    // config.lineIds 数量 = 产线规格条数，喂 4-3 做编号后校验（不符仅告警不拒帧）
+    if (!cfg.lineIds.empty()) labelParams.expectedLineCount = (int)cfg.lineIds.size();
     LaserLabelerCUDA labelL(labelParams);
     LaserLabelerCUDA labelR(labelParams);
-    spdlog::info("4-3 LaserLabelerCUDA x2 (L/R) constructed");
+    spdlog::info("4-3 LaserLabelerCUDA x2 constructed{}",
+                 labelParams.expectedLineCount > 0
+                     ? " (expectedLineCount=" + std::to_string(labelParams.expectedLineCount) + ")"
+                     : "");
 
     // ----- 4-4 Steger -----
     // 参数: sigma/threshold 用默认; deviceId 从 cfg
@@ -235,6 +254,7 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
     for (size_t pi = 0; pi < input->poseFrames.size(); ++pi) {
         const auto& tubes = input->poseFrames[pi];
         for (size_t ti = 0; ti < tubes.size(); ++ti) {
+          try {
             const auto& f = tubes[ti];
 
             // ----- 4-1 mask_extract (L + R) -----
@@ -242,8 +262,11 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
             auto maskResL = maskL.Execute(f.leftGray, stream);
             auto maskResR = maskR.Execute(f.rightGray, stream);
             if (!maskResL.success || !maskResR.success) {
-                spdlog::warn("pose {} tube {}: 4-1 mask failed (L={}, R={}), skip",
-                             pi, ti, maskResL.success, maskResR.success);
+                cudaError_t sticky = cudaGetLastError();   // [dbg] 诊断残留 CUDA 错误
+                spdlog::warn("pose {} tube {}: 4-1 mask failed (L={}, R={}) msg='{}' sticky_cuda={}",
+                             pi, ti, maskResL.success, maskResR.success,
+                             maskResL.success ? maskResR.message : maskResL.message,
+                             cudaGetErrorString(sticky));
                 ++framesSkip;
                 continue;
             }
@@ -254,15 +277,74 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
                 continue;
             }
 
+            // [debug] 逐 pose 导出 4-1 清洗后的二值掩膜（L/R 各一张，0/255）
+            {
+                std::error_code ec;
+                std::filesystem::path dbgDir =
+                    std::filesystem::path(outPath).parent_path() / "debug_masks";
+                std::filesystem::create_directories(dbgDir, ec);
+                auto saveMask = [&](const cv::cuda::GpuMat& dm, const char* side) {
+                    cv::Mat hm;
+                    dm.download(hm, stream);
+                    cudaStreamSynchronize(cv::cuda::StreamAccessor::getStream(stream));
+                    if (hm.empty()) return;
+                    cv::Mat vis;
+                    hm.convertTo(vis, CV_8UC1, 255.0);   // 0/1 → 0/255
+                    char name[64];
+                    std::snprintf(name, sizeof(name), "pose_%02llu_t%llu_%s_mask.png",
+                                  (unsigned long long)pi, (unsigned long long)ti, side);
+                    cv::imwrite((dbgDir / name).string(), vis);
+                };
+                saveMask(*maskResL.d_cleanedMask, "L");
+                saveMask(*maskResR.d_cleanedMask, "R");
+            }
+
             // ----- 4-2 region_analyze (L + R) -----
             // Execute(const shared_ptr<GpuMat>& d_mask, Stream&) → RegionAnalysisResult{d_labeledMask CV_32SC1, components}
             auto cclResL = cclL.Execute(maskResL.d_cleanedMask, stream);
+            // if (pi == 0) { cudaError_t e_ = cudaGetLastError(); if (e_ != cudaSuccess) spdlog::error("[probe] after 4-2 L: {}", cudaGetErrorString(e_)); }
             auto cclResR = cclR.Execute(maskResR.d_cleanedMask, stream);
+            // if (pi == 0) { cudaError_t e_ = cudaGetLastError(); if (e_ != cudaSuccess) spdlog::error("[probe] after 4-2 R: {}", cudaGetErrorString(e_)); }
             if (!cclResL.success || !cclResR.success) {
                 spdlog::warn("pose {} tube {}: 4-2 ccl failed (L={}, R={}), skip",
                              pi, ti, cclResL.success, cclResR.success);
                 ++framesSkip;
                 continue;
+            }
+
+            // [debug] 逐 pose 导出 4-2 连通域标记图（每连通域一种伪彩色）
+            if (cclResL.d_labeledMask && cclResR.d_labeledMask) {
+                std::error_code ec;
+                std::filesystem::path dbgDir =
+                    std::filesystem::path(outPath).parent_path() / "debug_ccl";
+                std::filesystem::create_directories(dbgDir, ec);
+                auto saveCcl = [&](const cv::cuda::GpuMat& dm, const char* side) {
+                    cv::Mat hm;
+                    dm.download(hm, stream);
+                    cudaStreamSynchronize(cv::cuda::StreamAccessor::getStream(stream));
+                    if (hm.empty()) return;
+                    cv::Mat labels;
+                    hm.reshape(1, hm.rows).convertTo(labels, CV_32SC1);
+                    double dmax;
+                    cv::minMaxIdx(labels, nullptr, &dmax);
+                    const int nlab = (int)dmax + 1;
+                    // 8 位伪彩色调色板（label 0=背景黑，其余循环取色）
+                    cv::Mat vis(hm.rows, hm.cols, CV_8UC3, cv::Scalar(0, 0, 0));
+                    for (int lb = 1; lb < nlab; ++lb) {
+                        cv::Scalar color((lb * 61) & 255, (lb * 127 + 40) & 255,
+                                         (lb * 251 + 80) & 255);
+                        cv::Mat bin = (labels == lb);
+                        vis.setTo(color, bin);
+                    }
+                    char name[64];
+                    std::snprintf(name, sizeof(name), "pose_%02llu_t%llu_%s_ccl.png",
+                                  (unsigned long long)pi, (unsigned long long)ti, side);
+                    cv::imwrite((dbgDir / name).string(), vis);
+                    spdlog::info("[debug] pose {} tube {} {}: {} components",
+                                 pi, ti, side, nlab - 1);
+                };
+                saveCcl(*cclResL.d_labeledMask, "L");
+                saveCcl(*cclResR.d_labeledMask, "R");
             }
 
             // ----- 4-3 laser_label (L + R) -----
@@ -274,12 +356,78 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
                 continue;
             }
             auto labelResL = labelL.Execute(*cclResL.d_labeledMask, stream);
+            // if (pi == 0) { cudaError_t e_ = cudaGetLastError(); if (e_ != cudaSuccess) spdlog::error("[probe] after 4-3 L: {}", cudaGetErrorString(e_)); }
             auto labelResR = labelR.Execute(*cclResR.d_labeledMask, stream);
+            // if (pi == 0) { cudaError_t e_ = cudaGetLastError(); if (e_ != cudaSuccess) spdlog::error("[probe] after 4-3 R: {}", cudaGetErrorString(e_)); }
             if (!labelResL.success || !labelResR.success) {
                 spdlog::warn("pose {} tube {}: 4-3 label failed (L={}, R={}), skip",
                              pi, ti, labelResL.success, labelResR.success);
                 ++framesSkip;
                 continue;
+            }
+
+            // [debug] 逐 pose 导出 4-3 重编号后的激光线图
+            // （伪彩色区分线号 + 顶端数字标注，与 4-2 的 CCL 原始编号对照）
+            if (labelResL.d_labeledMask && labelResR.d_labeledMask) {
+                std::error_code ec;
+                std::filesystem::path dbgDir =
+                    std::filesystem::path(outPath).parent_path() / "debug_labels";
+                std::filesystem::create_directories(dbgDir, ec);
+                auto saveLabels = [&](const cv::cuda::GpuMat& dm,
+                                      const cv::cuda::GpuMat& dgray,
+                                      const char* side) {
+                    cv::Mat hm, hgray;
+                    dm.download(hm, stream);
+                    dgray.download(hgray, stream);
+                    cudaStreamSynchronize(cv::cuda::StreamAccessor::getStream(stream));
+                    if (hm.empty()) return;
+                    cv::Mat labels;
+                    hm.reshape(1, hm.rows).convertTo(labels, CV_32SC1);
+                    double dmax;
+                    cv::minMaxIdx(labels, nullptr, &dmax);
+                    const int nlab = (int)dmax + 1;
+
+                    // 灰度底图提亮 + 每条线伪彩色 + 线号标注
+                    cv::Mat vis;
+                    cv::cvtColor(hgray, vis, cv::COLOR_GRAY2BGR);
+                    double mn, mx;
+                    cv::minMaxIdx(hgray, &mn, &mx);
+                    vis.convertTo(vis, -1, 255.0 / (mx - mn + 1), -mn * 255.0 / (mx - mn + 1));
+                    int maxId = 0;
+                    for (int lb = 1; lb < nlab; ++lb) {
+                        cv::Mat bin = (labels == lb);
+                        if (cv::countNonZero(bin) == 0) continue;
+                        cv::Scalar color((lb * 61) & 255, (lb * 127 + 40) & 255,
+                                         (lb * 251 + 80) & 255);
+                        vis.setTo(color, bin);
+                        // 标注位置：该线最上像素处
+                        cv::Mat points;
+                        cv::findNonZero(bin, points);
+                        int topY = points.rows, topX = 0;
+                        for (int k = 0; k < points.rows; ++k) {
+                            if (points.at<cv::Point>(k).y < topY) {
+                                topY = points.at<cv::Point>(k).y;
+                                topX = points.at<cv::Point>(k).x;
+                            }
+                        }
+                        char idTxt[8];
+                        std::snprintf(idTxt, sizeof(idTxt), "%d", lb);
+                        cv::putText(vis, idTxt, cv::Point(topX, std::max(18, topY - 4)),
+                                    cv::FONT_HERSHEY_SIMPLEX, 0.55,
+                                    cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+                        cv::putText(vis, idTxt, cv::Point(topX - 1, std::max(19, topY - 5)),
+                                    cv::FONT_HERSHEY_SIMPLEX, 0.55,
+                                    cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
+                        maxId = std::max(maxId, lb);
+                    }
+                    char name[64];
+                    std::snprintf(name, sizeof(name), "pose_%02llu_t%llu_%s_label.png",
+                                  (unsigned long long)pi, (unsigned long long)ti, side);
+                    cv::imwrite((dbgDir / name).string(), vis);
+                    spdlog::info("[debug] pose {} tube {} {}: max line id = {}", pi, ti, side, maxId);
+                };
+                saveLabels(*labelResL.d_labeledMask, *maskResL.d_grayImage, "L");
+                saveLabels(*labelResR.d_labeledMask, *maskResR.d_grayImage, "R");
             }
 
             // ----- 4-4 steger (L + R) -----
@@ -298,11 +446,79 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
             auto stegerResR = stegerR.Execute(*maskResR.d_grayImage,
                                               *labelResR.d_labeledMask,
                                               stream, GroupMode::ByLabel);
+            // if (pi == 0) { cudaError_t e_ = cudaGetLastError(); if (e_ != cudaSuccess) spdlog::error("[probe] after 4-4 R: {}", cudaGetErrorString(e_)); }
             if (!stegerResL.success || !stegerResR.success) {
                 spdlog::warn("pose {} tube {}: 4-4 steger failed (L={}, R={}), skip",
                              pi, ti, stegerResL.success, stegerResR.success);
                 ++framesSkip;
                 continue;
+            }
+
+            // [debug] 逐 pose 导出 4-4 steger 亚像素中心点图
+            // （灰度底 + 按线号伪彩画亚像素点；点跨行画 1px 方块，放大可见连续折线）
+            {
+                std::error_code ec;
+                std::filesystem::path dbgDir =
+                    std::filesystem::path(outPath).parent_path() / "debug_steger";
+                std::filesystem::create_directories(dbgDir, ec);
+                auto saveSteger = [&](const cv::cuda::GpuMat& dpts,
+                                      const cv::cuda::GpuMat& dids,
+                                      const cv::cuda::GpuMat& dgray,
+                                      const char* side) {
+                    cv::Mat pts, ids, hgray;
+                    dpts.download(pts, stream);
+                    dids.download(ids, stream);
+                    dgray.download(hgray, stream);
+                    cudaStreamSynchronize(cv::cuda::StreamAccessor::getStream(stream));
+                    if (pts.empty() || hgray.empty()) return;
+                    // 灰度底图压暗（÷3）：彩点夹在亮线里不可见，压暗后对比立现
+                    cv::Mat vis;
+                    cv::cvtColor(hgray, vis, cv::COLOR_GRAY2BGR);
+                    vis.convertTo(vis, -1, 1.0 / 3.0);
+                    const cv::Vec2f* p = pts.ptr<cv::Vec2f>();
+                    const int* lid = ids.ptr<int>();
+                    const int n = (int)pts.total();
+                    // steger 逐像素响应：每行多个候选都落在中心附近（线宽 4~6px），
+                    // 全画会覆盖整条线带。按 (line, row) 聚合取 x 均值，
+                    // 还原单像素中心轨迹（下游 4-6 极线重采样同样按行归一）。
+                    std::unordered_map<long long, std::pair<double, int>> rowAcc;
+                    for (int k = 0; k < n; ++k) {
+                        int ry = (int)std::lround(p[k][1]);
+                        long long key = (static_cast<long long>(lid[k]) << 32)
+                                      | (unsigned int)ry;
+                        auto& acc = rowAcc[key];
+                        acc.first += p[k][0];
+                        acc.second += 1;
+                    }
+                    int drawn = 0;
+                    for (const auto& [key, acc] : rowAcc) {
+                        int lb = (int)(key >> 32);
+                        int ry = (int)(key & 0xFFFFFFFF);
+                        double fx = acc.first / acc.second;
+                        cv::Scalar color((lb * 61) & 255, (lb * 127 + 40) & 255,
+                                         (lb * 251 + 80) & 255);
+                        cv::Point c((int)std::lround(fx), ry);
+                        if (c.x < 0 || c.x >= vis.cols) continue;
+                        cv::rectangle(vis, c, c, color);   // 1px 亚像素中心点
+                        if (ry % 25 == 0 && c.x >= 2 && c.x + 2 < vis.cols) {
+                            cv::line(vis, cv::Point(c.x - 2, ry), cv::Point(c.x + 2, ry), color);
+                            cv::line(vis, cv::Point(c.x, ry - 2), cv::Point(c.x, ry + 2), color);
+                        }
+                        ++drawn;
+                    }
+                    char name[64];
+                    std::snprintf(name, sizeof(name), "pose_%02llu_t%llu_%s_steger.png",
+                                  (unsigned long long)pi, (unsigned long long)ti, side);
+                    cv::imwrite((dbgDir / name).string(), vis);
+                    spdlog::info("[debug] pose {} tube {} {}: {} subpixel points",
+                                 pi, ti, side, n);
+                };
+                if (stegerResL.d_centerPoints && stegerResL.d_line_ids)
+                    saveSteger(*stegerResL.d_centerPoints, *stegerResL.d_line_ids,
+                               *maskResL.d_grayImage, "L");
+                if (stegerResR.d_centerPoints && stegerResR.d_line_ids)
+                    saveSteger(*stegerResR.d_centerPoints, *stegerResR.d_line_ids,
+                               *maskResR.d_grayImage, "R");
             }
 
             // ----- 4-5 undistort (L + R) -----
@@ -319,11 +535,73 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
                                                 *stegerResL.d_line_ids, stream);
             auto undistResR = undistROp.Execute(*stegerResR.d_centerPoints,
                                                 *stegerResR.d_line_ids, stream);
+            // if (pi == 0) { cudaError_t e_ = cudaGetLastError(); if (e_ != cudaSuccess) spdlog::error("[probe] after 4-5 R: {{}}", cudaGetErrorString(e_)); }
             if (!undistResL.success || !undistResR.success) {
                 spdlog::warn("pose {} tube {}: 4-5 undistort failed (L={}, R={}), skip",
                              pi, ti, undistResL.success, undistResR.success);
                 ++framesSkip;
                 continue;
+            }
+
+            // [debug] 逐 pose 导出 4-5 去畸变+矫正后的点（画在立体矫正图上）
+            if (undistResL.d_rectifiedPoints && undistResR.d_rectifiedPoints) {
+                std::error_code ec;
+                auto dbgDir = std::filesystem::path(outPath).parent_path() / "debug_undist";
+                std::filesystem::create_directories(dbgDir, ec);
+                // 立体矫正底图（handoff K/D/R1|2/P1|2；map 与 P 平移列无关）
+                cv::Mat mapXL, mapYL, mapXR, mapYR, rectL, rectR;
+                cv::initUndistortRectifyMap(h.cameraMatrixL, h.distCoeffsL, h.R1, h.P1,
+                                            h.imageSize, CV_32FC1, mapXL, mapYL);
+                cv::initUndistortRectifyMap(h.cameraMatrixR, h.distCoeffsR, h.R2, h.P2,
+                                            h.imageSize, CV_32FC1, mapXR, mapYR);
+                cv::remap(f.leftGray, rectL, mapXL, mapYL, cv::INTER_LINEAR);
+                cv::remap(f.rightGray, rectR, mapXR, mapYR, cv::INTER_LINEAR);
+                auto savePts = [&](const cv::cuda::GpuMat& dpts, const cv::cuda::GpuMat& dids,
+                                   const cv::Mat& rect, const char* side, const char* tag) {
+                    cv::Mat pts, ids;
+                    dpts.download(pts, stream);
+                    dids.download(ids, stream);
+                    cudaStreamSynchronize(cv::cuda::StreamAccessor::getStream(stream));
+                    if (pts.empty()) return;
+                    // 与 debug_steger 同款呈现：底图压暗 + (线号,行) 聚合取 x 均值
+                    // + 每 25 行十字刻度（全点直画会覆盖整条线带）
+                    cv::Mat vis;
+                    cv::cvtColor(rect, vis, cv::COLOR_GRAY2BGR);
+                    vis.convertTo(vis, -1, 1.0 / 3.0);
+                    const cv::Vec2f* p = pts.ptr<cv::Vec2f>();
+                    const int* lid = ids.ptr<int>();
+                    std::unordered_map<long long, std::pair<double, int>> acc2;
+                    for (size_t k = 0; k < pts.total(); ++k) {
+                        int ry = (int)std::lround(p[k][1]);
+                        if (ry < 0) continue;
+                        long long key = (static_cast<long long>(lid[k]) << 32)
+                                      | (unsigned int)ry;
+                        auto& a = acc2[key];
+                        a.first += p[k][0];
+                        a.second += 1;
+                    }
+                    for (const auto& [key, a] : acc2) {
+                        int lb = (int)(key >> 32);
+                        int ry = (int)(key & 0xFFFFFFFF);
+                        cv::Point q((int)std::lround(a.first / a.second), ry);
+                        if (q.x < 0 || q.x >= vis.cols || ry >= vis.rows) continue;
+                        cv::Scalar c((lb * 61) & 255, (lb * 127 + 40) & 255,
+                                     (lb * 251 + 80) & 255);
+                        cv::rectangle(vis, q, q, c);
+                        if (ry % 25 == 0 && q.x >= 2 && q.x + 2 < vis.cols) {
+                            cv::line(vis, cv::Point(q.x - 2, ry), cv::Point(q.x + 2, ry), c);
+                            cv::line(vis, cv::Point(q.x, ry - 2), cv::Point(q.x, ry + 2), c);
+                        }
+                    }
+                    char name[64];
+                    std::snprintf(name, sizeof(name), "pose_%02llu_t%llu_%s_%s.png",
+                                  (unsigned long long)pi, (unsigned long long)ti, side, tag);
+                    cv::imwrite((dbgDir / name).string(), vis);
+                };
+                if (undistResL.d_line_ids)
+                    savePts(*undistResL.d_rectifiedPoints, *undistResL.d_line_ids, rectL, "L", "undist");
+                if (undistResR.d_line_ids)
+                    savePts(*undistResR.d_rectifiedPoints, *undistResR.d_line_ids, rectR, "R", "undist");
             }
 
             // ----- 4-6 epipolar_interp (L + R) -----
@@ -340,11 +618,72 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
                                                   *undistResL.d_line_ids, stream);
             auto epipolarResR = epipolarR.Execute(*undistResR.d_rectifiedPoints,
                                                   *undistResR.d_line_ids, stream);
+            // if (pi == 0) { cudaError_t e_ = cudaGetLastError(); if (e_ != cudaSuccess) spdlog::error("[probe] after 4-6 R: {{}}", cudaGetErrorString(e_)); }
             if (!epipolarResL.success || !epipolarResR.success) {
                 spdlog::warn("pose {} tube {}: 4-6 epipolar failed (L={}, R={}), skip",
                              pi, ti, epipolarResL.success, epipolarResR.success);
                 ++framesSkip;
                 continue;
+            }
+
+            // [debug] 逐 pose 导出 4-6 极线重采样点（规则 0.5px 行，画在矫正图上）
+            if (epipolarResL.d_interpPoints && epipolarResR.d_interpPoints) {
+                std::error_code ec;
+                auto dbgDir = std::filesystem::path(outPath).parent_path() / "debug_interp";
+                std::filesystem::create_directories(dbgDir, ec);
+                cv::Mat mapXL, mapYL, mapXR, mapYR, rectL, rectR;
+                cv::initUndistortRectifyMap(h.cameraMatrixL, h.distCoeffsL, h.R1, h.P1,
+                                            h.imageSize, CV_32FC1, mapXL, mapYL);
+                cv::initUndistortRectifyMap(h.cameraMatrixR, h.distCoeffsR, h.R2, h.P2,
+                                            h.imageSize, CV_32FC1, mapXR, mapYR);
+                cv::remap(f.leftGray, rectL, mapXL, mapYL, cv::INTER_LINEAR);
+                cv::remap(f.rightGray, rectR, mapXR, mapYR, cv::INTER_LINEAR);
+                auto savePts = [&](const cv::cuda::GpuMat& dpts, const cv::cuda::GpuMat& dids,
+                                   const cv::Mat& rect, const char* side) {
+                    cv::Mat pts, ids;
+                    dpts.download(pts, stream);
+                    dids.download(ids, stream);
+                    cudaStreamSynchronize(cv::cuda::StreamAccessor::getStream(stream));
+                    if (pts.empty()) return;
+                    // 与 debug_steger 同款呈现（压暗底图 + 行聚合 + 十字刻度）
+                    cv::Mat vis;
+                    cv::cvtColor(rect, vis, cv::COLOR_GRAY2BGR);
+                    vis.convertTo(vis, -1, 1.0 / 3.0);
+                    const cv::Vec2f* p = pts.ptr<cv::Vec2f>();
+                    const int* lid = ids.ptr<int>();
+                    std::unordered_map<long long, std::pair<double, int>> acc3;
+                    for (size_t k = 0; k < pts.total(); ++k) {
+                        int ry = (int)std::lround(p[k][1]);
+                        if (ry < 0) continue;
+                        long long key = (static_cast<long long>(lid[k]) << 32)
+                                      | (unsigned int)ry;
+                        auto& a = acc3[key];
+                        a.first += p[k][0];
+                        a.second += 1;
+                    }
+                    for (const auto& [key, a] : acc3) {
+                        int lb = (int)(key >> 32);
+                        int ry = (int)(key & 0xFFFFFFFF);
+                        cv::Point q((int)std::lround(a.first / a.second), ry);
+                        if (q.x < 0 || q.x >= vis.cols || ry >= vis.rows) continue;
+                        cv::Scalar c((lb * 61) & 255, (lb * 127 + 40) & 255,
+                                     (lb * 251 + 80) & 255);
+                        cv::rectangle(vis, q, q, c);
+                        if (ry % 25 == 0 && q.x >= 2 && q.x + 2 < vis.cols) {
+                            cv::line(vis, cv::Point(q.x - 2, ry), cv::Point(q.x + 2, ry), c);
+                            cv::line(vis, cv::Point(q.x, ry - 2), cv::Point(q.x, ry + 2), c);
+                        }
+                    }
+                    char name[64];
+                    std::snprintf(name, sizeof(name), "pose_%02llu_t%llu_%s_interp.png",
+                                  (unsigned long long)pi, (unsigned long long)ti, side);
+                    cv::imwrite((dbgDir / name).string(), vis);
+                    spdlog::info("[debug] pose {} tube {} {}: {} interp points", pi, ti, side, pts.total());
+                };
+                if (epipolarResL.d_interp_line_ids)
+                    savePts(*epipolarResL.d_interpPoints, *epipolarResL.d_interp_line_ids, rectL, "L");
+                if (epipolarResR.d_interp_line_ids)
+                    savePts(*epipolarResR.d_interpPoints, *epipolarResR.d_interp_line_ids, rectR, "R");
             }
 
             // ----- 4-7 laser_match -----
@@ -362,11 +701,144 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
                                             *epipolarResR.d_interpPoints,
                                             *epipolarResR.d_interp_line_ids,
                                             stream);
+            // if (pi == 0) { cudaError_t e_ = cudaGetLastError(); if (e_ != cudaSuccess) spdlog::error("[probe] after 4-7: {}", cudaGetErrorString(e_)); }
             if (!matchRes.success) {
                 spdlog::warn("pose {} tube {}: 4-7 match failed ({}), skip",
                              pi, ti, matchRes.message);
                 ++framesSkip;
                 continue;
+            }
+
+            // [debug] 逐 pose 导出 4-7 匹配点对（L/R 矫正图同色同线号，视差肉眼可见）
+            if (matchRes.d_matched_left && matchRes.d_matched_right && matchRes.d_matched_line_ids) {
+                std::error_code ec;
+                auto dbgDir = std::filesystem::path(outPath).parent_path() / "debug_match";
+                std::filesystem::create_directories(dbgDir, ec);
+                cv::Mat mapXL, mapYL, mapXR, mapYR, rectL, rectR;
+                cv::initUndistortRectifyMap(h.cameraMatrixL, h.distCoeffsL, h.R1, h.P1,
+                                            h.imageSize, CV_32FC1, mapXL, mapYL);
+                cv::initUndistortRectifyMap(h.cameraMatrixR, h.distCoeffsR, h.R2, h.P2,
+                                            h.imageSize, CV_32FC1, mapXR, mapYR);
+                cv::remap(f.leftGray, rectL, mapXL, mapYL, cv::INTER_LINEAR);
+                cv::remap(f.rightGray, rectR, mapXR, mapYR, cv::INTER_LINEAR);
+                cv::Mat ptsL, ptsR, mids;
+                matchRes.d_matched_left->download(ptsL, stream);
+                matchRes.d_matched_right->download(ptsR, stream);
+                matchRes.d_matched_line_ids->download(mids, stream);
+                cudaStreamSynchronize(cv::cuda::StreamAccessor::getStream(stream));
+                cv::Mat visL, visR;
+                cv::cvtColor(rectL, visL, cv::COLOR_GRAY2BGR);
+                cv::cvtColor(rectR, visR, cv::COLOR_GRAY2BGR);
+                const cv::Vec2f* pl = ptsL.ptr<cv::Vec2f>();
+                const cv::Vec2f* pr = ptsR.ptr<cv::Vec2f>();
+                const int* lid = mids.ptr<int>();
+                // 逐线号统计匹配数 ＋ 记录每线在 L/R 图的代表点（用于标注编号）
+                std::map<int, int> lineCount;                    // lineId → 匹配点数
+                std::map<int, cv::Point> lineTopL, lineTopR;     // lineId → 标注位置
+                for (size_t k = 0; k < mids.total(); ++k) {
+                    cv::Scalar c((lid[k] * 61) & 255, (lid[k] * 127 + 40) & 255,
+                                 (lid[k] * 251 + 80) & 255);
+                    cv::Point ql((int)std::lround(pl[k][0]), (int)std::lround(pl[k][1]));
+                    cv::Point qr((int)std::lround(pr[k][0]), (int)std::lround(pr[k][1]));
+                    ++lineCount[lid[k]];
+                    if (ql.x >= 0 && ql.x < visL.cols && ql.y >= 0 && ql.y < visL.rows) {
+                        cv::rectangle(visL, ql, ql, c);
+                        auto it = lineTopL.find(lid[k]);
+                        if (it == lineTopL.end() || ql.y < it->second.y)
+                            lineTopL[lid[k]] = ql;
+                    }
+                    if (qr.x >= 0 && qr.x < visR.cols && qr.y >= 0 && qr.y < visR.rows) {
+                        cv::rectangle(visR, qr, qr, c);
+                        auto it = lineTopR.find(lid[k]);
+                        if (it == lineTopR.end() || qr.y < it->second.y)
+                            lineTopR[lid[k]] = qr;
+                    }
+                }
+                // L/R 图上标注线号数字（黑白双描边保证可读）
+                auto tagLines = [](cv::Mat& vis, const std::map<int, cv::Point>& tops) {
+                    for (const auto& [lb, p] : tops) {
+                        cv::Point tp(std::max(2, p.x - 8), std::max(18, p.y - 6));
+                        char t[8];
+                        std::snprintf(t, sizeof(t), "%d", lb);
+                        cv::putText(vis, t, tp + cv::Point(-1, -1), cv::FONT_HERSHEY_SIMPLEX,
+                                    0.6, cv::Scalar(0, 0, 0), 2, cv::LINE_AA);
+                        cv::putText(vis, t, tp, cv::FONT_HERSHEY_SIMPLEX,
+                                    0.6, cv::Scalar(80, 255, 255), 1, cv::LINE_AA);
+                    }
+                };
+                tagLines(visL, lineTopL);
+                tagLines(visR, lineTopR);
+                // 日志输出逐线匹配计数（L/R 对应关系一眼可见）
+                {
+                    std::string tbl = "[debug] pose " + std::to_string(pi) + " tube "
+                                    + std::to_string(ti) + " matched lines: ";
+                    for (const auto& [lb, cnt] : lineCount)
+                        tbl += std::to_string(lb) + ":" + std::to_string(cnt) + " ";
+                    spdlog::info("{}  (total {} lines / {} pairs)",
+                                 tbl, lineCount.size(), mids.total());
+                }
+                char nl[64], nr[64];
+                std::snprintf(nl, sizeof(nl), "pose_%02llu_t%llu_L_match.png",
+                              (unsigned long long)pi, (unsigned long long)ti);
+                std::snprintf(nr, sizeof(nr), "pose_%02llu_t%llu_R_match.png",
+                              (unsigned long long)pi, (unsigned long long)ti);
+                cv::imwrite((dbgDir / nl).string(), visL);
+                cv::imwrite((dbgDir / nr).string(), visR);
+                spdlog::info("[debug] pose {} tube {}: {} matched pairs -> debug_match",
+                             pi, ti, mids.total());
+
+                // [debug] 导出匹配对视差 CSV（4-7 之后、4-8 之前）
+                // 列: pose,side 即 L 坐标系, index, xL, yL, xR, yR, disparity, lineId
+                {
+                    std::error_code ec;
+                    auto dbgDir2 = std::filesystem::path(outPath).parent_path() / "debug_match";
+                    std::filesystem::create_directories(dbgDir2, ec);
+                    static std::ofstream dcsv(dbgDir2 / "disparity_all.csv", std::ios::trunc);
+                    if (pi == 0 && ti == 0)
+                        dcsv << "pose,xL,yL,xR,yR,disparity,lineId\n";
+                    for (size_t k = 0; k < mids.total(); ++k) {
+                        dcsv << std::fixed << std::setprecision(3)
+                             << pi << ','
+                             << pl[k][0] << ',' << pl[k][1] << ','
+                             << pr[k][0] << ',' << pr[k][1] << ','
+                             << (pl[k][0] - pr[k][0]) << ','
+                             << lid[k] << '\n';
+                    }
+                }
+
+                // 极线匹配总览图：L/R 上下拼接，匹配对同色连线＋y 差标注
+                // （矫正正确时连线水平；y 差≠0 的连线直接暴露极线误差）
+                {
+                    const int H = visL.rows, W = visL.cols;
+                    cv::Mat canvas(2 * H + 8, W, CV_8UC3, cv::Scalar(30, 30, 30));
+                    visL.copyTo(canvas(cv::Rect(0, 0, W, H)));
+                    visR.copyTo(canvas(cv::Rect(0, H + 8, W, H)));
+                    // 抽稀连线（全画会糊）：每隔 stride 取一对，共 ~800 对
+                    const size_t n = mids.total();
+                    const size_t stride = std::max<size_t>(1, n / 800);
+                    double dySum = 0; size_t dyN = 0;
+                    for (size_t k = 0; k < n; k += stride) {
+                        cv::Scalar c((lid[k] * 61) & 255, (lid[k] * 127 + 40) & 255,
+                                     (lid[k] * 251 + 80) & 255);
+                        cv::Point ql((int)std::lround(pl[k][0]), (int)std::lround(pl[k][1]));
+                        cv::Point qr((int)std::lround(pr[k][0]), (int)std::lround(pr[k][1]));
+                        if (qr.y >= 0 && qr.y < H) {
+                            double dy = double(ql.y) - qr.y;
+                            dySum += dy; ++dyN;
+                            cv::line(canvas, ql, qr + cv::Point(0, H + 8), c, 1, cv::LINE_AA);
+                        }
+                    }
+                    char txt[96];
+                    std::snprintf(txt, sizeof(txt), "pairs=%zu  mean|dy|=%.2f px (epipolar residual)",
+                                  n, dyN ? dySum / dyN : 0.0);
+                    cv::putText(canvas, txt, cv::Point(20, H + 8 - 6),
+                                cv::FONT_HERSHEY_SIMPLEX, 0.7,
+                                cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+                    char nm[64];
+                    std::snprintf(nm, sizeof(nm), "pose_%02llu_t%llu_match_pairs.png",
+                                  (unsigned long long)pi, (unsigned long long)ti);
+                    cv::imwrite((dbgDir / nm).string(), canvas);
+                }
             }
 
             // ----- 4-8 laser_reconstruct -----
@@ -383,6 +855,7 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
                                             *matchRes.d_matched_right,
                                             *matchRes.d_matched_line_ids,
                                             h.Q, stream);
+            // if (pi == 0) { cudaError_t e_ = cudaGetLastError(); if (e_ != cudaSuccess) spdlog::error("[probe] after 4-8: {}", cudaGetErrorString(e_)); }
             if (!reconRes.success) {
                 spdlog::warn("pose {} tube {}: 4-8 reconstruct failed ({}), skip",
                              pi, ti, reconRes.message);
@@ -428,6 +901,26 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
                 host_line_ids.insert(host_line_ids.end(),
                                      h_ids.begin<int>(),
                                      h_ids.end<int>());
+
+                // [debug] 逐 pose 导出 4-8 重建 3D 点（ASC，X Y Z lineId）
+                {
+                    std::error_code ec;
+                    auto dbgDir = std::filesystem::path(outPath).parent_path() / "debug_recon";
+                    std::filesystem::create_directories(dbgDir, ec);
+                    char name[64];
+                    std::snprintf(name, sizeof(name), "pose_%02llu_t%llu_points3d.asc",
+                                  (unsigned long long)pi, (unsigned long long)ti);
+                    std::ofstream asc(dbgDir / name);
+                    if (asc.is_open()) {
+                        asc << "X Y Z lineId\n";
+                        for (int k = 0; k < (int)h_pts.total(); ++k) {
+                            const cv::Vec3f& p = h_pts.ptr<cv::Vec3f>()[k];
+                            asc << std::fixed << std::setprecision(4)
+                                << p[0] << ' ' << p[1] << ' ' << p[2] << ' '
+                                << h_ids.ptr<int>()[k] << '\n';
+                        }
+                    }
+                }
                 // per-pose 累积（按当前 pi 分组，供 ProjectorJointCalib）
                 posePoints[pi].insert(posePoints[pi].end(),
                                       h_pts.begin<cv::Vec3f>(),
@@ -435,6 +928,27 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
                 poseLineIds[pi].insert(poseLineIds[pi].end(),
                                        h_ids.begin<int>(),
                                        h_ids.end<int>());
+
+                // 导出首 pose 重建点云（ASC：X Y Z 每行一点，CloudCompare 可直接打开）
+                if (pi == 0 && h_pts.total() > 0) {
+                    std::error_code ec;
+                    std::filesystem::path ascPath = std::filesystem::path(outPath);
+                    ascPath.replace_filename(
+                        ascPath.stem().string() + "_pose0_points3d.asc");
+                    std::ofstream asc(ascPath);
+                    if (asc.is_open()) {
+                        asc << "X Y Z\n";
+                        for (int k = 0; k < (int)h_pts.total(); ++k) {
+                            const cv::Vec3f& p = h_pts.ptr<cv::Vec3f>()[k];
+                            asc << std::fixed << std::setprecision(4)
+                                << p[0] << ' ' << p[1] << ' ' << p[2] << '\n';
+                        }
+                        spdlog::info("pose 0 point cloud -> {} ({} pts)",
+                                     ascPath.string(), h_pts.total());
+                    } else {
+                        spdlog::warn("cannot write pose0 ASC: {}", ascPath.string());
+                    }
+                }
 
                 // ----- 4-9 endpoint_extract（逐 pose 执行）-----
                 // 同一物理线号在不同 pose 是不同 3D 线段（板位姿不同）；
@@ -456,6 +970,27 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
                     epRes.d_endpoints->download(he);
                     epRes.d_endpoint_ids->download(hid);
                     if (!he.empty() && !hid.empty()) {
+                        // [debug] 逐 pose 导出 4-9 端点（ASC，X Y Z lineId）
+                        {
+                            std::error_code ec;
+                            auto dbgDir = std::filesystem::path(outPath).parent_path() / "debug_ep";
+                            std::filesystem::create_directories(dbgDir, ec);
+                            char name[64];
+                            std::snprintf(name, sizeof(name), "pose_%02llu_t%llu_endpoints.asc",
+                                          (unsigned long long)pi, (unsigned long long)ti);
+                            std::ofstream asc(dbgDir / name);
+                            if (asc.is_open()) {
+                                asc << "X Y Z lineId\n";
+                                for (int k = 0; k < (int)he.total(); ++k) {
+                                    const cv::Vec3f& p = he.ptr<cv::Vec3f>()[k];
+                                    asc << std::fixed << std::setprecision(4)
+                                        << p[0] << ' ' << p[1] << ' ' << p[2] << ' '
+                                        << hid.ptr<int>()[k] << '\n';
+                                }
+                                spdlog::info("[debug] pose {} tube {}: {} endpoints -> debug_ep",
+                                             pi, ti, he.total());
+                            }
+                        }
                         const int idOffset = static_cast<int>(pi) * 256;  // maxLabels=256
                         hostEndpoints.insert(hostEndpoints.end(),
                                              he.begin<cv::Vec3f>(),
@@ -473,6 +1008,14 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
             spdlog::info("pose {} tube {}: OK (matched={}, reconstructed={}, total_accum={})",
                          pi, ti, matchRes.matchCount, reconRes.validCount,
                          host_points3d.size());
+          } catch (const std::exception& e) {
+              // 单 pose 异常不再带崩全流程（GUI 内曾因栈展开中二次抛出 terminate）
+              spdlog::error("pose {} tube {}: EXCEPTION {} — skip this pose", pi, ti, e.what());
+              ++framesSkip;
+          } catch (...) {
+              spdlog::error("pose {} tube {}: UNKNOWN EXCEPTION — skip this pose", pi, ti);
+              ++framesSkip;
+          }
         }
     }
 

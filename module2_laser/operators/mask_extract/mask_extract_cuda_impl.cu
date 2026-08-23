@@ -13,7 +13,11 @@
 #include <opencv2/cudafilters.hpp>
 #include <opencv2/cudaarithm.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/core/cuda_stream_accessor.hpp>
 #include <chrono>
+#include <algorithm>
+#include <utility>
+#include <vector>
 #include <stdexcept>
 #include <memory>
 
@@ -90,11 +94,40 @@ void MaskExtractCUDA::Impl::executePipeline(
     // Step 4: GPU 膨胀（恢复激光形状）
     filter_dilate_->apply(d_eroded, d_laserMask, stream);
 
-    // Step 5: 面积过滤（可选，TODO）
+    // Step 5: 面积过滤
+    // （原为 TODO：碎块（如 5px 噪声）进入下游，恰好穿过 4-3 中心行的碎块会被
+    //  编号成假激光线——实测 pose_10 R 出 26 条。按 minArea/maxArea 过滤：
+    //  GPU mask 下载→CCLWithStats→LUT 重建掩膜→回写成员缓冲。每帧 ~5ms，标定场景可接受。）
     if (params_.minArea > 0 || params_.maxArea < 1000000) {
-        // TODO: 实现基于 CUDA 的连通域面积过滤
-        // 当前版本直接复制结果
-        d_laserMask.copyTo(d_cleanedMask, stream);
+        cv::Mat h_mask;
+        d_laserMask.download(h_mask, stream);
+        cudaStreamSynchronize(cv::cuda::StreamAccessor::getStream(stream));
+        if (!h_mask.empty()) {
+            cv::Mat labels, stats, centroids;
+            int nlab = cv::connectedComponentsWithStats(
+                h_mask > 0, labels, stats, centroids, CV_32SC1);
+            // 候选 label：面积在 [minArea, maxArea]
+            std::vector<std::pair<int, int>> cands;   // (area, label)
+            for (int i = 1; i < nlab; ++i) {
+                int area = stats.at<int>(i, cv::CC_STAT_AREA);
+                if (area >= params_.minArea && area <= params_.maxArea)
+                    cands.emplace_back(area, i);
+            }
+            // keepTopK>0：只保留面积前 K 大（产线规格固定条数；断线段面积
+            // 通常小于完整线，Top-K 天然丢弃断头/边缘截段的冗余）
+            if (params_.keepTopK > 0 && (int)cands.size() > params_.keepTopK) {
+                std::sort(cands.begin(), cands.end(),
+                          [](const auto& a, const auto& b) { return a.first > b.first; });
+                cands.resize(params_.keepTopK);
+            }
+            cv::Mat kept(h_mask.size(), CV_8UC1, cv::Scalar(0));
+            for (const auto& [area, lb] : cands)
+                kept.setTo(255, labels == lb);
+            d_kept_tmp.upload(kept, stream);     // 专用暂存，不动成员缓冲布局
+            d_kept_tmp.copyTo(d_cleanedMask, stream);
+        } else {
+            d_laserMask.copyTo(d_cleanedMask, stream);
+        }
     } else {
         d_laserMask.copyTo(d_cleanedMask, stream);
     }

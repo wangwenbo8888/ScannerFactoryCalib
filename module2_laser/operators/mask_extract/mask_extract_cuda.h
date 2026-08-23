@@ -33,6 +33,10 @@ struct MaskExtractParams {
     int laserDilateSize = 3;     ///< 激光膨胀核大小（奇数，恢复形状）
     int minArea = 100;           ///< 最小区域面积阈值
     int maxArea = 100000;        ///< 最大区域面积阈值
+    // 保留面积前 K 大的连通域（0=不启用）。产线规格激光线固定条数
+    //（左斜25/右斜25/精细7/深孔1）：面积过滤先清碎块，再按面积排序
+    // 只留前 K 条，杜绝断线/粘连导致的条数超标。
+    int keepTopK = 0;
     /**
     * @brief 参数合法性校�? 
     * @throws std::invalid_argument 参数不合�?     */
@@ -47,6 +51,8 @@ struct MaskExtractParams {
             throw std::invalid_argument("MaskExtractParams::minArea must be >= 0");
         if (maxArea <= minArea)
             throw std::invalid_argument("MaskExtractParams::maxArea must be > minArea");
+        if (keepTopK < 0)
+            throw std::invalid_argument("MaskExtractParams::keepTopK must be >= 0");
     }
 
     /**
@@ -58,7 +64,8 @@ struct MaskExtractParams {
             {"erodeSize", erodeSize},
             {"laserDilateSize", laserDilateSize},
             {"minArea", minArea},
-            {"maxArea", maxArea}
+            {"maxArea", maxArea},
+            {"keepTopK", keepTopK}
         };
     }
 
@@ -71,6 +78,7 @@ struct MaskExtractParams {
         if (j.contains("erodeSize")) p.erodeSize = j.at("erodeSize").get<int>();
         if (j.contains("laserDilateSize")) p.laserDilateSize = j.at("laserDilateSize").get<int>();
         if (j.contains("minArea")) p.minArea = j.at("minArea").get<int>();
+        if (j.contains("keepTopK")) p.keepTopK = j.at("keepTopK").get<int>();
         if (j.contains("maxArea")) p.maxArea = j.at("maxArea").get<int>();
         p.validate();
         return p;

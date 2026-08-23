@@ -43,6 +43,8 @@ struct LaserMatchCuda::Impl {
     void* d_cub_temp_ = nullptr;
     size_t cub_temp_size_ = 0;
     int last_max_count_ = 0;
+    int left_capacity_ = 0;    // d_left_rowidx_/d_temp_ 系实际分配容量（L/R 数量
+    int right_capacity_ = 0;   // 逐帧互换时防复用不足的越界写）
 
     bool warmed_up_ = false;
     int warmup_left_ = 0;

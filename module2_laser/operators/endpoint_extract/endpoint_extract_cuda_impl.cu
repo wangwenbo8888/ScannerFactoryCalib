@@ -120,11 +120,14 @@ __global__ void __launch_bounds__(256, 4) kernelGatherRef(
     const float3* __restrict__ d_points,
     const int* __restrict__ d_indices,
     int numLines,
+    int count,                       // 点数上界（索引合法性防御）
     float3* __restrict__ d_ref)
 {
     const int lid = blockIdx.x * blockDim.x + threadIdx.x;
     if (lid >= numLines) return;
-    d_ref[lid] = d_points[d_indices[lid]];
+    int idx = d_indices[lid];
+    if (idx < 0 || idx >= count) idx = 0;   // 垃圾索引防御：钳到 0（空线不消费该值）
+    d_ref[lid] = d_points[idx];
 }
 
 __global__ void __launch_bounds__(256, 4) kernelCollectEndpoints(
@@ -435,6 +438,12 @@ EndpointExtractResult EndpointExtractCuda::Impl::Execute(
         if (doTiming) cudaEventRecord(ev[4], cuda_stream);
 
         // Step 5: Find endpoint A index
+        // 索引缓冲必须清零：kernelFindMaxDistIdx 仅对"有点的线"写入，
+        // 空线的槽位保留旧值/未初始化值 → kernelGatherRef 用垃圾索引读
+        // d_points → illegal memory access（compute-sanitizer 实锤，逐 pose
+        // 复用缓冲时必现）。清零后 idx=0 恒在界内，空线由 line_counts 过滤。
+        cudaMemsetAsync(d_ep_a_idx_.data, 0, numPossibleLines * sizeof(int), cuda_stream);
+        cudaMemsetAsync(d_ep_b_idx_.data, 0, numPossibleLines * sizeof(int), cuda_stream);
         kernelFindMaxDistIdx<<<grid, BLOCK_SIZE, 0, cuda_stream>>>(
             d_points3d.ptr<float3>(),
             d_line_ids.ptr<int>(),
@@ -459,6 +468,7 @@ EndpointExtractResult EndpointExtractCuda::Impl::Execute(
             d_points3d.ptr<float3>(),
             d_ep_a_idx_.ptr<int>(),
             numPossibleLines,
+            count,
             d_endpoint_a_.ptr<float3>());
 
         if (doTiming) cudaEventRecord(ev[6], cuda_stream);

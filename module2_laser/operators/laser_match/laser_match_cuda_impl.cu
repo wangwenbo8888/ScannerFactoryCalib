@@ -229,6 +229,8 @@ bool LaserMatchCuda::Impl::allocateBuffers(int leftCount, int rightCount) {
     }
 
     if (maxCount <= last_max_count_ &&
+        leftCount <= left_capacity_ &&
+        rightCount <= right_capacity_ &&
         !d_hash_keys_.empty() &&
         !d_flags_.empty()) {
         return true;
@@ -246,6 +248,9 @@ bool LaserMatchCuda::Impl::allocateBuffers(int leftCount, int rightCount) {
 
     d_left_rowidx_.create(1, leftCount, CV_32SC1);
     d_right_rowidx_.create(1, rightCount, CV_32SC1);
+    left_capacity_ = leftCount;    // GpuMat::create 只扩不缩：容量按实际分配记录，
+    right_capacity_ = rightCount;  // 复用条件必须比对容量而非 last_max_count_（L/R
+                                   // 数量逐帧互换时右缓冲可能不足 → 越界写）
 
     d_flags_.create(1, rightCount, CV_32SC1);
     d_temp_left_.create(1, rightCount, CV_32FC2);

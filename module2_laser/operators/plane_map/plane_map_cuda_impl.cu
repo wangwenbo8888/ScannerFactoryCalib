@@ -610,6 +610,29 @@ PlaneMapResult PlaneMapCuda::Impl::Execute(
         const int width = imageSize.width;
         const int height = imageSize.height;
 
+        // 分配守卫：候选缓冲 = N × depthSamples × 4 float。gridStep 过小（如默认
+        // 0.5 → 每线 1260 万像素）会算出数百 GB 需求，GpuMat int 列数溢出后
+        // 分配出小缓冲，kernel 按大索引写 → illegal memory access。
+        // 超限直接抛带参数提示的异常（调用方可改 config 的 gridStep/depthSamples）。
+        {
+            double candGB = params_.estimateCandidateBufferGB(width, height, N);
+            if (candGB > PlaneMapParams::kMaxCandidateBufferGB) {
+                throw std::invalid_argument(
+                    "[12-PlaneMapCuda] candidate buffer ~" +
+                    std::to_string((long long)(candGB)) + "GB exceeds guard " +
+                    std::to_string((long long)PlaneMapParams::kMaxCandidateBufferGB) +
+                    "GB (N=" + std::to_string(N) +
+                    ", gridStep=" + std::to_string(params_.gridStep) +
+                    ", depthSamples=" + std::to_string(params_.depthSamples) +
+                    "); increase plane_map.gridStep or reduce depthSamples in config.json");
+            }
+            if ((double)N * params_.depthSamples > 2.1e9) {
+                throw std::invalid_argument(
+                    "[12-PlaneMapCuda] totalSlots overflows GpuMat int columns; "
+                    "increase plane_map.gridStep or reduce depthSamples");
+            }
+        }
+
         cv::Matx33d virtualK_inv = virtualK.inv();
         cv::Matx33d Rvt = virtualR.t();
 

@@ -4,6 +4,7 @@
 #include <opencv2/core.hpp>
 #include <opencv2/core/cuda.hpp>
 #include <nlohmann/json.hpp>
+#include <cmath>
 #include <string>
 #include <memory>
 #include <stdexcept>
@@ -33,6 +34,16 @@ struct PlaneMapParams {
     int depthSamples = 200;
     float epipolarStep = 0.5f;
     bool enableTiming = false;
+
+    // 分配守卫上限：N×depthSamples×4float 的候选缓冲必须落在 GPU 可分配范围。
+    // 12GB 卡按 4GB 保守上限（int 列数也须不溢出）。
+    static constexpr double kMaxCandidateBufferGB = 4.0;
+
+    // 候选缓冲 GB 数（N = 已含全部线的虚拟像素总数，调用方传入）
+    double estimateCandidateBufferGB(int width, int height, int64_t N) const {
+        (void)width; (void)height;   // 尺寸已体现在 N 中
+        return (double)N * depthSamples * 4.0 * sizeof(float) / 1e9;
+    }
 
     void validate() const {
         if (deviceId < 0)

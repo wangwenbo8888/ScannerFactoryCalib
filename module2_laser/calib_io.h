@@ -15,10 +15,12 @@ namespace fc {
 // ============================================================================
 struct LaserCalibConfig {
     // plane_map 网格/深度
-    float gridStep     = 0.5f;
-    float depthMin     = 100.0f;
-    float depthMax     = 5000.0f;
-    int   depthSamples = 200;
+    // gridStep 默认 8：0.5 会使候选缓冲达数百 GB（GPU 越界崩溃，见守卫）；
+    //   8px 网格 + 64 深度采样 ≈ 每线 5 万像素，14 线约 0.7GB，安全且满足映射表分辨率
+    float gridStep     = 8.0f;
+    float depthMin     = 20.0f;
+    float depthMax     = 500.0f;
+    int   depthSamples = 64;
     float epipolarStep = 0.5f;
 
     // 通用 GPU 设备

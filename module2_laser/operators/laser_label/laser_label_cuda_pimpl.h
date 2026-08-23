@@ -30,7 +30,7 @@ struct LaserLabelerCUDA::Impl {
     cv::cuda::GpuMat d_labels_buf_;
     cv::cuda::GpuMat d_output_buf_;
 
-    thrust::device_vector<int> d_min_y_coords_;
+    thrust::device_vector<int> d_min_x_coords_;   // 每条线在中心行的最小 X（按 X 排序编号）
     thrust::device_vector<int> d_label_ids_;
     thrust::device_vector<int> d_map_table_;
 

@@ -33,6 +33,10 @@ struct LaserLabelParams {
     int maxLabels = 256;
     int centerColOffset = 0;
     int deviceId = 0;
+    // 期望激光线条数（产线规格：左斜25/右斜25/精细7/深孔1）。
+    // 0=不校验（默认，兼容旧行为）；>0=编号后比对实际条数，不符→Warning 降质
+    //（不拒帧——断线时段数可能 > 物理条数，由下游 RANSAC 容错消化）。
+    int expectedLineCount = 0;
 
     void validate() const {
         if (maxLabels < 1 || maxLabels > 4096)
@@ -41,13 +45,16 @@ struct LaserLabelParams {
             throw std::invalid_argument("LaserLabelParams::centerColOffset must be [-500, 500]");
         if (deviceId < 0)
             throw std::invalid_argument("LaserLabelParams::deviceId must be >= 0");
+        if (expectedLineCount < 0 || expectedLineCount > maxLabels)
+            throw std::invalid_argument("LaserLabelParams::expectedLineCount must be [0, maxLabels]");
     }
 
     nlohmann::json toJson() const {
         return {
             {"maxLabels", maxLabels},
             {"centerColOffset", centerColOffset},
-            {"deviceId", deviceId}
+            {"deviceId", deviceId},
+            {"expectedLineCount", expectedLineCount}
         };
     }
 
@@ -56,6 +63,7 @@ struct LaserLabelParams {
         if (j.contains("maxLabels")) p.maxLabels = j.at("maxLabels").get<int>();
         if (j.contains("centerColOffset")) p.centerColOffset = j.at("centerColOffset").get<int>();
         if (j.contains("deviceId")) p.deviceId = j.at("deviceId").get<int>();
+        if (j.contains("expectedLineCount")) p.expectedLineCount = j.at("expectedLineCount").get<int>();
         p.validate();
         return p;
     }

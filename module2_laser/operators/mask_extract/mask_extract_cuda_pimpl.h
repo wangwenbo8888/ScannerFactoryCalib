@@ -35,6 +35,7 @@ struct MaskExtractCUDA::Impl {
     cv::cuda::GpuMat d_eroded;            ///< 腐蚀结果
     cv::cuda::GpuMat d_laserMask;         ///< 激光掩膜（膨胀后）
     cv::cuda::GpuMat d_cleanedMask;       ///< 面积过滤后的掩膜
+    cv::cuda::GpuMat d_kept_tmp;          ///< 面积过滤暂存（CCL 重建掩膜上传用）
 
     // 形态学核（CPU 端创建，GPU 端使用）
     cv::Mat kernel_erode_;
