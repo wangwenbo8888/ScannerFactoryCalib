@@ -178,6 +178,7 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
     matchParams.deviceId = cfg.deviceId;
     matchParams.min_disparity = cfg.matchMinDisparity;
     matchParams.max_disparity = cfg.matchMaxDisparity;
+    matchParams.epipolar_row_step = cfg.interpStep;
     LaserMatchCuda matchOp(matchParams);
     spdlog::info("4-7 LaserMatchCuda constructed (single instance, L+R input, "
                  "disparity=[%.0f,%.0f])",
@@ -673,66 +674,6 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
                              pi, ti, epipolarResL.success, epipolarResR.success);
                 ++framesSkip;
                 continue;
-            }
-
-            // [debug] 逐 pose 导出 4-6 极线重采样点（规则 0.5px 行，画在矫正图上）
-            if (epipolarResL.d_interpPoints && epipolarResR.d_interpPoints) {
-                std::error_code ec;
-                auto dbgDir = std::filesystem::path(outPath).parent_path() / "debug_interp";
-                std::filesystem::create_directories(dbgDir, ec);
-                cv::Mat mapXL, mapYL, mapXR, mapYR, rectL, rectR;
-                cv::initUndistortRectifyMap(h.cameraMatrixL, h.distCoeffsL, h.R1, h.P1,
-                                            h.imageSize, CV_32FC1, mapXL, mapYL);
-                cv::initUndistortRectifyMap(h.cameraMatrixR, h.distCoeffsR, h.R2, h.P2,
-                                            h.imageSize, CV_32FC1, mapXR, mapYR);
-                cv::remap(f.leftGray, rectL, mapXL, mapYL, cv::INTER_LINEAR);
-                cv::remap(f.rightGray, rectR, mapXR, mapYR, cv::INTER_LINEAR);
-                auto savePts = [&](const cv::cuda::GpuMat& dpts, const cv::cuda::GpuMat& dids,
-                                   const cv::Mat& rect, const char* side) {
-                    cv::Mat pts, ids;
-                    dpts.download(pts, stream);
-                    dids.download(ids, stream);
-                    cudaStreamSynchronize(cv::cuda::StreamAccessor::getStream(stream));
-                    if (pts.empty()) return;
-                    // 与 debug_steger 同款呈现（压暗底图 + 行聚合 + 十字刻度）
-                    cv::Mat vis;
-                    cv::cvtColor(rect, vis, cv::COLOR_GRAY2BGR);
-                    vis.convertTo(vis, -1, 1.0 / 3.0);
-                    const cv::Vec2f* p = pts.ptr<cv::Vec2f>();
-                    const int* lid = ids.ptr<int>();
-                    std::unordered_map<long long, std::pair<double, int>> acc3;
-                    for (size_t k = 0; k < pts.total(); ++k) {
-                        int ry = (int)std::lround(p[k][1]);
-                        if (ry < 0) continue;
-                        long long key = (static_cast<long long>(lid[k]) << 32)
-                                      | (unsigned int)ry;
-                        auto& a = acc3[key];
-                        a.first += p[k][0];
-                        a.second += 1;
-                    }
-                    for (const auto& [key, a] : acc3) {
-                        int lb = (int)(key >> 32);
-                        int ry = (int)(key & 0xFFFFFFFF);
-                        cv::Point q((int)std::lround(a.first / a.second), ry);
-                        if (q.x < 0 || q.x >= vis.cols || ry >= vis.rows) continue;
-                        cv::Scalar c((lb * 61) & 255, (lb * 127 + 40) & 255,
-                                     (lb * 251 + 80) & 255);
-                        cv::rectangle(vis, q, q, c);
-                        if (ry % 25 == 0 && q.x >= 2 && q.x + 2 < vis.cols) {
-                            cv::line(vis, cv::Point(q.x - 2, ry), cv::Point(q.x + 2, ry), c);
-                            cv::line(vis, cv::Point(q.x, ry - 2), cv::Point(q.x, ry + 2), c);
-                        }
-                    }
-                    char name[64];
-                    std::snprintf(name, sizeof(name), "pose_%02llu_t%llu_%s_interp.png",
-                                  (unsigned long long)pi, (unsigned long long)ti, side);
-                    cv::imwrite((dbgDir / name).string(), vis);
-                    spdlog::info("[debug] pose {} tube {} {}: {} interp points", pi, ti, side, pts.total());
-                };
-                if (epipolarResL.d_interp_line_ids)
-                    savePts(*epipolarResL.d_interpPoints, *epipolarResL.d_interp_line_ids, rectL, "L");
-                if (epipolarResR.d_interp_line_ids)
-                    savePts(*epipolarResR.d_interpPoints, *epipolarResR.d_interp_line_ids, rectR, "R");
             }
 
             // ----- 4-7 laser_match -----

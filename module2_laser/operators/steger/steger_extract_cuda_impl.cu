@@ -33,8 +33,12 @@ using namespace calib;
 CALIB_DEFINE_LOG_TAG(10, StegerExtractorCUDA);
 
 struct SubpixelPointLabelComp {
+    // 主键 label、次键 y：4-6 epipolar_interp 按 (p[i], p[i+1]) 相邻对做行插值，
+    // 要求同线内点按 y 有序。原实现只按 label 排（线内乱序），
+    // "相邻"两点可能是线两端任意点 → 插值点 x 剧烈跳变（实测二阶差分 RMS 增大 5 倍）。
     __host__ __device__ bool operator()(const SubpixelPoint& a, const SubpixelPoint& b) const {
-        return a.label < b.label;
+        if (a.label != b.label) return a.label < b.label;
+        return a.py < b.py;
     }
 };
 
@@ -637,6 +641,7 @@ StegerResult StegerExtractorCUDA::Impl::Execute(
             d_valid_points.begin(), d_valid_points.end(),
             SubpixelPointLabelComp());
 
+        // (pixel-dedup removed: keep per-response candidates; 4-6 interp does row-wise merge)
         cudaEventRecord(ev_s5, cuda_stream);
 
         // === Step 5.5: Build GPU output arrays (d_centerPoints + d_line_ids) ===
