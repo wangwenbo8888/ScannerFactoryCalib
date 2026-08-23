@@ -48,6 +48,38 @@ LaserCalibConfig LaserCalibConfig::fromJson(const std::string& path) {
 
     if (j.contains("deviceId")) c.deviceId = j["deviceId"].get<int>();
 
+    // mask_extract 前端参数（嵌套 mask 或顶层平铺均可）
+    if (j.contains("mask") && j["mask"].is_object()) {
+        const auto& mk = j["mask"];
+        if (mk.contains("threshold"))      c.maskThreshold  = mk["threshold"].get<int>();
+        if (mk.contains("erodeSize"))      c.maskErodeSize  = mk["erodeSize"].get<int>();
+        if (mk.contains("laserDilateSize")) c.maskDilateSize = mk["laserDilateSize"].get<int>();
+        if (mk.contains("minArea"))        c.maskMinArea    = mk["minArea"].get<int>();
+        if (mk.contains("maxArea"))        c.maskMaxArea    = mk["maxArea"].get<int>();
+    }
+    if (j.contains("maskThreshold")) c.maskThreshold = j["maskThreshold"].get<int>();
+    if (j.contains("maskErodeSize")) c.maskErodeSize = j["maskErodeSize"].get<int>();
+
+    // laser_match 视差范围（嵌套 match 或顶层平铺均可）
+    if (j.contains("match") && j["match"].is_object()) {
+        const auto& mk = j["match"];
+        if (mk.contains("minDisparity")) c.matchMinDisparity = mk["minDisparity"].get<float>();
+        if (mk.contains("maxDisparity")) c.matchMaxDisparity = mk["maxDisparity"].get<float>();
+    }
+    if (j.contains("matchMinDisparity")) c.matchMinDisparity = j["matchMinDisparity"].get<float>();
+    if (j.contains("matchMaxDisparity")) c.matchMaxDisparity = j["matchMaxDisparity"].get<float>();
+
+    // epipolar_interp 相邻点对约束（嵌套 interp 或顶层平铺均可）
+    if (j.contains("interp") && j["interp"].is_object()) {
+        const auto& ic = j["interp"];
+        if (ic.contains("step"))      c.interpStep     = ic["step"].get<float>();
+        if (ic.contains("maxXDiff"))  c.interpMaxXDiff = ic["maxXDiff"].get<float>();
+        if (ic.contains("maxYSpan"))  c.interpMaxYSpan = ic["maxYSpan"].get<float>();
+    }
+    if (j.contains("interpStep"))     c.interpStep     = j["interpStep"].get<float>();
+    if (j.contains("interpMaxXDiff")) c.interpMaxXDiff = j["interpMaxXDiff"].get<float>();
+    if (j.contains("interpMaxYSpan")) c.interpMaxYSpan = j["interpMaxYSpan"].get<float>();
+
     if (j.contains("lineIds") && j["lineIds"].is_array()) {
         c.lineIds = j["lineIds"].get<std::vector<int>>();
     }

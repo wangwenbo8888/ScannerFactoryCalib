@@ -149,8 +149,10 @@ __global__ void __launch_bounds__(256, 4) kernelCollectEndpoints(
     d_endpoints[epBase]     = d_points[d_ep_a_idx[lid]];
     d_endpoints[epBase + 1] = d_points[d_ep_b_idx[lid]];
 
-    d_endpoint_ids[epBase]     = epBase;
-    d_endpoint_ids[epBase + 1] = epBase + 1;
+    // 端点归属线号（下游 4-10 按 line_id 分组拟合，需要每端点带所属线号；
+    // 原实现写顺序索引 0,1,2.. 会使分组全成单点 → Insufficient valid lines）
+    d_endpoint_ids[epBase]     = lid;
+    d_endpoint_ids[epBase + 1] = lid;
 
     d_line_ids[outLineIdx] = lid;
 }

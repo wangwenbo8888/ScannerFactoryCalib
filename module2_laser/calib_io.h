@@ -24,6 +24,25 @@ struct LaserCalibConfig {
     // 通用 GPU 设备
     int deviceId = 0;
 
+    // mask_extract 前端参数（喂 4-1；实拍激光线宽仅 2~6px，
+    // 默认 erodeSize=5 会把线整条腐蚀掉，必须按 config.json 配置）
+    int maskThreshold    = 60;
+    int maskErodeSize    = 1;
+    int maskDilateSize   = 3;
+    int maskMinArea      = 100;
+    int maskMaxArea      = 100000;
+
+    // laser_match 视差范围（喂 4-7；近距目标实际视差可达 600~1400px，
+    // 默认 max_disparity=500 会拒掉全部匹配 → matched=0）
+    float matchMinDisparity = 0.0f;
+    float matchMaxDisparity = 2000.0f;
+
+    // epipolar_interp 相邻点对约束（喂 4-6；默认 max_x_diff=1/max_y_span=2
+    // 是为垂直激光线设计的，左斜/右斜 45° 线相邻行 dx≈1 会全被拒）
+    float interpStep      = 0.5f;
+    float interpMaxXDiff  = 10.0f;
+    float interpMaxYSpan  = 6.0f;
+
     // 激光线编号（喂 VirtualPixelGenerator/plane_map）
     // 缺省空：运行期由 pose_optimize 后实际出现的线号决定
     std::vector<int> lineIds;

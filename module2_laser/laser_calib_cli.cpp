@@ -32,6 +32,9 @@
 #include <iostream>
 #include <string>
 #include <set>
+#include <map>
+#include <algorithm>
+#include <cmath>
 #include <exception>
 
 using namespace fc;
@@ -69,22 +72,30 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
 
     // ------------------------------------------------------------------
     // 2. 构造 4-1/4-2/4-3 算子 (L 和 R 各一独立实例)
-    //    参数: 当前用默认值或从 cfg 取 deviceId
-    //    TODO 6.2-b: 从 config.json 扩展 mask threshold/erodeSize 等可配项
+    //    mask 前端参数从 config.json 读取（TODO 6.2-b 落地）：
+    //    实拍激光线宽仅 2~6px，默认 erodeSize=5 会把线整条腐蚀掉（连通域=0）
     // ------------------------------------------------------------------
     cv::cuda::Stream stream;
 
     MaskExtractParams maskParams;
-    // maskParams.threshold / erodeSize / ... 用默认值 (Task 6.2-a)
+    maskParams.threshold      = cfg.maskThreshold;
+    maskParams.erodeSize      = cfg.maskErodeSize;
+    maskParams.laserDilateSize = cfg.maskDilateSize;
+    maskParams.minArea        = cfg.maskMinArea;
+    maskParams.maxArea        = cfg.maskMaxArea;
     MaskExtractCUDA maskL(maskParams);
     MaskExtractCUDA maskR(maskParams);
-    spdlog::info("4-1 MaskExtractCUDA x2 (L/R) constructed");
+    spdlog::info("4-1 MaskExtractCUDA x2 constructed (threshold={}, erode={}, dilate={}, area=[{},{})",
+                 maskParams.threshold, maskParams.erodeSize, maskParams.laserDilateSize,
+                 maskParams.minArea, maskParams.maxArea);
 
     RegionAnalyzerParams cclParams;
     cclParams.deviceId = cfg.deviceId;
+    cclParams.minArea  = cfg.maskMinArea;
+    cclParams.maxArea  = cfg.maskMaxArea;
     RegionAnalyzerCUDA cclL(cclParams);
     RegionAnalyzerCUDA cclR(cclParams);
-    spdlog::info("4-2 RegionAnalyzerCUDA x2 (L/R) constructed");
+    spdlog::info("4-2 RegionAnalyzerCUDA x2 constructed");
 
     LaserLabelParams labelParams;
     labelParams.deviceId = cfg.deviceId;
@@ -104,39 +115,54 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
     // 参数 K/D/R/P 来自 handoff（模块1 输出的内参 + 立体矫正）。
     // L 路: K=K_L, D=D_L, R=R1, P=P1
     // R 路: K=K_R, D=D_R, R=R2, P=P2
+    // 注意: 算子把 P[0][3] 当作加性常量并入 x（把归一化点当 Z=1），而 P2[0][3]=-fx·B
+    // 是基线项——直接传会把 R 路整体平移 -53142px（视差虚增至 54000+，match 全拒）。
+    // 正确的矫正坐标只需 P 的 K 部分（与 cv::undistortPoints 行为一致），
+    // 物理视差由左右光线 B/Z 自然形成 → 这里把 P 的平移列清零。
+    cv::Mat P1k = h.P1.clone(), P2k = h.P2.clone();
+    if (P1k.cols > 3) P1k.at<double>(0, 3) = 0.0;
+    if (P2k.cols > 3) P2k.at<double>(0, 3) = 0.0;
     UndistortPointsParams undistL;
     undistL.cameraMatrix = h.cameraMatrixL;
     undistL.distCoeffs   = h.distCoeffsL;
     undistL.R            = h.R1;
-    undistL.P            = h.P1;
+    undistL.P            = P1k;
     undistL.deviceId     = cfg.deviceId;
     undistL.validate();
     UndistortPointsParams undistR;
     undistR.cameraMatrix = h.cameraMatrixR;
     undistR.distCoeffs   = h.distCoeffsR;
     undistR.R            = h.R2;
-    undistR.P            = h.P2;
+    undistR.P            = P2k;
     undistR.deviceId     = cfg.deviceId;
     undistR.validate();
     UndistortPointsCuda undistLOp(undistL);
     UndistortPointsCuda undistROp(undistR);
-    spdlog::info("4-5 UndistortPointsCuda x2 (L/R) constructed (R1/P1, R2/P2 from handoff)");
+    spdlog::info("4-5 UndistortPointsCuda x2 (R1/P1, R2/P2 from handoff, baseline column zeroed)");
 
     // ----- 4-6 EpipolarInterp -----
     // lineIdCheck=true 标定模式（按 line_id 同线插值；扫描模式才用 false）
     EpipolarInterpParams epipolarParams;
     epipolarParams.deviceId   = cfg.deviceId;
     epipolarParams.lineIdCheck = true;
+    epipolarParams.epipolar_row_step = cfg.interpStep;
+    epipolarParams.max_x_diff       = cfg.interpMaxXDiff;
+    epipolarParams.max_y_span       = cfg.interpMaxYSpan;
     EpipolarInterpCuda epipolarL(epipolarParams);
     EpipolarInterpCuda epipolarR(epipolarParams);
-    spdlog::info("4-6 EpipolarInterpCuda x2 (L/R) constructed (lineIdCheck=true)");
+    spdlog::info("4-6 EpipolarInterpCuda x2 (lineIdCheck=true, step={}, max_x_diff={}, max_y_span={})",
+                 cfg.interpStep, cfg.interpMaxXDiff, cfg.interpMaxYSpan);
 
     // ----- 4-7 LaserMatch -----
-    // 单实例（吃 L+R 两路）。
+    // 单实例吃 L+R 两路输入
     LaserMatchParams matchParams;
     matchParams.deviceId = cfg.deviceId;
+    matchParams.min_disparity = cfg.matchMinDisparity;
+    matchParams.max_disparity = cfg.matchMaxDisparity;
     LaserMatchCuda matchOp(matchParams);
-    spdlog::info("4-7 LaserMatchCuda constructed (single instance, L+R input)");
+    spdlog::info("4-7 LaserMatchCuda constructed (single instance, L+R input, "
+                 "disparity=[%.0f,%.0f])",
+                 matchParams.min_disparity, matchParams.max_disparity);
 
     // ----- 4-8 LaserReconstruct -----
     // 单实例，Q 矩阵按调用传入（头文件设计如此，避免跨调用累积）。
@@ -156,6 +182,8 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
     // ----- 4-10 VirtualCameraPose -----
     VirtualCameraPoseParams vcpParams;
     vcpParams.deviceId = cfg.deviceId;
+    // 每 (pose,line) 线段只有 2 个端点（两点定线），默认 minPointsPerLine=3 会全拒
+    vcpParams.minPointsPerLine = 2;
     VirtualCameraPoseCuda vcpOp(vcpParams);
     spdlog::info("4-10 VirtualCameraPoseCuda constructed");
 
@@ -193,6 +221,10 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
     // ------------------------------------------------------------------
     std::vector<cv::Vec3f> host_points3d;
     std::vector<int>       host_line_ids;
+    // 4-9 逐 pose 执行后的端点累积（线号已按 pose 偏移），喂 4-10
+    std::vector<cv::Vec3f> hostEndpoints;
+    std::vector<int>       hostEndpointIds;
+    int totalEndpoints = 0, totalEpLines = 0;
     // per-pose 累积：ProjectorJointCalib 需按姿态分组（每姿态一块平板）
     std::vector<std::vector<cv::Vec3f>> posePoints(input->poseFrames.size());
     std::vector<std::vector<int>>       poseLineIds(input->poseFrames.size());
@@ -367,6 +399,29 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
                 reconRes.d_valid_line_ids->download(h_ids);
                 h_pts = h_pts.reshape(3, 1);   // 强制 1×N CV_32FC3
                 h_ids = h_ids.reshape(1, 1);   // 强制 1×N CV_32SC1
+                {   // 线号净化：LaserLabelerCUDA 的物理线号必在 [0, maxLabels=256)。
+                    // 实测序列运行中 match/reconstruct 的 fid 通道偶发读到
+                    // 未初始化显存（float 位型，见 开发记录 2026-08-23）——
+                    // 越界 id 一律丢弃，对应 3D 点不同步累积。
+                    const int kMaxPhysLineId = 255;
+                    int dropped = 0;
+                    size_t w = 0;
+                    for (size_t r = 0; r < h_ids.total(); ++r) {
+                        int id = h_ids.ptr<int>()[r];
+                        if (id < 0 || id > kMaxPhysLineId) { ++dropped; continue; }
+                        if (w != r) {
+                            h_ids.ptr<int>()[w] = id;
+                            h_pts.ptr<cv::Vec3f>()[w] = h_pts.ptr<cv::Vec3f>()[r];
+                        }
+                        ++w;
+                    }
+                    if (dropped > 0) {
+                        spdlog::warn("pose {} tube {}: dropped {} pts with corrupt line ids "
+                                     "(kept {}/{})", pi, ti, dropped, w, h_ids.total());
+                        h_ids = h_ids.colRange(0, (int)w);
+                        h_pts = h_pts.colRange(0, (int)w);
+                    }
+                }
                 host_points3d.insert(host_points3d.end(),
                                      h_pts.begin<cv::Vec3f>(),
                                      h_pts.end<cv::Vec3f>());
@@ -380,6 +435,38 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
                 poseLineIds[pi].insert(poseLineIds[pi].end(),
                                        h_ids.begin<int>(),
                                        h_ids.end<int>());
+
+                // ----- 4-9 endpoint_extract（逐 pose 执行）-----
+                // 同一物理线号在不同 pose 是不同 3D 线段（板位姿不同）；
+                // 扁平累积后统一提端点会把多段散点并成一条"线"，RANSAC 拟合必败
+                //（实测 Insufficient valid lines: 0）。逐 pose 提端点，
+                // 线号按 pose 偏移防跨 pose 碰撞，4-10 按 (pose,line) 拟合。
+                cv::cuda::GpuMat d_pts3d, d_lids;
+                cv::Mat m3d(1, (int)h_pts.total(), CV_32FC3, h_pts.ptr<cv::Vec3f>());
+                cv::Mat mid(1, (int)h_ids.total(), CV_32SC1, h_ids.ptr<int>());
+                d_pts3d.upload(m3d);
+                d_lids.upload(mid);
+                auto epRes = endpointOp.Execute(d_pts3d, d_lids, stream);
+                if (!epRes.success) {
+                    spdlog::warn("pose {} tube {}: 4-9 endpoint_extract failed ({}), "
+                                 "该 pose 不参与虚拟光心求解",
+                                 pi, ti, epRes.message);
+                } else if (epRes.d_endpoints && epRes.d_endpoint_ids) {
+                    cv::Mat he, hid;
+                    epRes.d_endpoints->download(he);
+                    epRes.d_endpoint_ids->download(hid);
+                    if (!he.empty() && !hid.empty()) {
+                        const int idOffset = static_cast<int>(pi) * 256;  // maxLabels=256
+                        hostEndpoints.insert(hostEndpoints.end(),
+                                             he.begin<cv::Vec3f>(),
+                                             he.end<cv::Vec3f>());
+                        const int* p = hid.ptr<int>();
+                        for (size_t k = 0; k < hid.total(); ++k)
+                            hostEndpointIds.push_back(p[k] + idOffset);
+                        totalEndpoints += (int)he.total();
+                        totalEpLines += epRes.numLines;
+                    }
+                }
             }
 
             ++framesOk;
@@ -389,26 +476,16 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
         }
     }
 
-    spdlog::info("loop done: {} ok, {} skipped", framesOk, framesSkip);
+    // ------------------------------------------------------------------
+    // 3b. 循环结束: 汇报累积（3D 点供 JSON 诊断/4-11；端点喂 4-10）
+    // ------------------------------------------------------------------
+    spdlog::info("loop done: {} ok, {} skipped | accumulated {} 3D pts, "
+                 "{} endpoints / {} lines (per-pose 4-9)",
+                 framesOk, framesSkip, host_points3d.size(),
+                 totalEndpoints, totalEpLines);
 
     // ------------------------------------------------------------------
-    // 3b. 循环结束: 统一 upload 累积的 3D 点（决定 1 后半）
-    //     d_all_pts3d, d_all_lids 在 6.2-d 被喂给 4-9/4-11
-    // ------------------------------------------------------------------
-    cv::cuda::GpuMat d_all_pts3d, d_all_lids;
-    if (!host_points3d.empty()) {
-        cv::Mat d3d(1, (int)host_points3d.size(), CV_32FC3, host_points3d.data());
-        cv::Mat lids(1, (int)host_line_ids.size(), CV_32SC1, host_line_ids.data());
-        d_all_pts3d.upload(d3d);
-        d_all_lids.upload(lids);
-        spdlog::info("accumulated {} 3D points / {} line ids → uploaded",
-                     host_points3d.size(), host_line_ids.size());
-    } else {
-        spdlog::warn("no 3D points accumulated; downstream (4-9+) will be skipped");
-    }
-
-    // ------------------------------------------------------------------
-    // 3c. 4-9 / 4-10 / 4-11 一次性执行（无 pose×tube 循环）
+    // 3c. 4-10 / 4-11 一次性执行（4-9 已在循环内逐 pose 完成）
     //     暂存 finalVirtualK/R/T 供 6.2-e 的 5-3 / 4-13 使用
     // ------------------------------------------------------------------
     cv::Matx33d finalVirtualK = cv::Matx33d::eye();   // 来自 4-10（新算法不优化 K）
@@ -417,29 +494,25 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
     calib::ProjectorJointCalibResult projectorRes;    // 4-11 新算法结果
     bool haveVirtualPose = false;
 
-    if (host_points3d.empty()) {
-        spdlog::error("no accumulated 3D points; skip 4-9~4-13");
+    if (hostEndpoints.empty()) {
+        spdlog::error("no endpoints accumulated; skip 4-10~4-13");
     } else {
-        // ----- 4-9 endpoint_extract -----
-        // Execute(d_points3d, d_line_ids, stream) → d_endpoints, d_endpoint_ids, d_line_ids
-        auto endpointRes = endpointOp.Execute(d_all_pts3d, d_all_lids, stream);
-        if (!endpointRes.success) {
-            spdlog::error("4-9 endpoint_extract failed: {}", endpointRes.message);
-        } else {
-            spdlog::info("4-9 OK: {} endpoints, {} lines",
-                         endpointRes.numEndpoints, endpointRes.numLines);
-
+        // 上传逐 pose 累积的端点（线号已按 pose 偏移）
+        cv::cuda::GpuMat d_allEndpoints, d_allEndpointIds;
+        cv::Mat me(1, (int)hostEndpoints.size(), CV_32FC3, hostEndpoints.data());
+        cv::Mat mei(1, (int)hostEndpointIds.size(), CV_32SC1, hostEndpointIds.data());
+        d_allEndpoints.upload(me);
+        d_allEndpointIds.upload(mei);
+        {
             // ----- 4-10 virtual_camera_pose -----
-            // Execute(d_endpoints, d_line_ids, Matx33d& stereoK, Matx33d& stereoR, stream)
-            if (!endpointRes.d_endpoints || !endpointRes.d_line_ids) {
-                spdlog::error("4-10 input null (endpoint d_endpoints/d_line_ids)");
+            // Execute(d_endpoints, d_endpoint_ids, Matx33d& stereoK, Matx33d& stereoR, stream)
+            // 注意: d_endpoints 是 2N（每线两端点），配对的是 d_endpoint_ids（2N），
+            // 不是 d_line_ids（N）——4-10 要求两者元素数一致。
+            auto vcpRes = vcpOp.Execute(d_allEndpoints, d_allEndpointIds,
+                                        stereoK, stereoR, stream);
+            if (!vcpRes.success) {
+                spdlog::error("4-10 virtual_camera_pose failed: {}", vcpRes.message);
             } else {
-                auto vcpRes = vcpOp.Execute(*endpointRes.d_endpoints,
-                                            *endpointRes.d_line_ids,
-                                            stereoK, stereoR, stream);
-                if (!vcpRes.success) {
-                    spdlog::error("4-10 virtual_camera_pose failed: {}", vcpRes.message);
-                } else {
                     spdlog::info("4-10 OK: virtualT=({:.3f},{:.3f},{:.3f}), "
                                  "{} lines, fit_err={:.4f}",
                                  vcpRes.virtualT[0], vcpRes.virtualT[1], vcpRes.virtualT[2],
@@ -487,7 +560,6 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
                 }
             }
         }
-    }
 
     // ------------------------------------------------------------------
     // 3d. 5-3 + 4-13 (4-11 成功后执行; 都依赖 finalVirtualK/R/T)
