@@ -259,6 +259,27 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
                                        kLaserTypes[scannerModeCbx_->currentData().toInt() - 1].key)));
     }
 
+    // 曝光/增益实时下发：用户一改就写相机（缓存也同步更新，
+    // 下次 startAcquisition 按参考顺序重新应用同一值）
+    connect(exposureSpin_, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            this, [this](double us) {
+        if (!rig_ || !rig_->isOpen()) return;
+        if (auto* L = rig_->left())
+            if (L->capability().exposureUs) L->setExposureUs(us);
+        if (auto* R = rig_->right())
+            if (R->capability().exposureUs) R->setExposureUs(us);
+        emit statusMessage(QStringLiteral("曝光已下发: %1 μs").arg(us, 0, 'f', 0));
+    });
+    connect(gainSpin_, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            this, [this](double db) {
+        if (!rig_ || !rig_->isOpen()) return;
+        if (auto* L = rig_->left())
+            if (L->capability().gainDb) L->setGainDb(db);
+        if (auto* R = rig_->right())
+            if (R->capability().gainDb) R->setGainDb(db);
+        emit statusMessage(QStringLiteral("增益已下发: %1 dB").arg(db, 0, 'f', 2));
+    });
+
     rig_ = std::make_unique<StereoCameraRig>();
     scanner_ = std::make_unique<ScannerControl>();
     m_pLeft = new cv::Mat();

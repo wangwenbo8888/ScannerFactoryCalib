@@ -120,11 +120,16 @@ bool GalaxyCameraSource::open(int deviceId) {
             IGXFactory::GetInstance().OpenDeviceBySN(sn, GX_ACCESS_EXCLUSIVE));
         devicePtr_ = device;
 
-        // 临时探测 width/height（不保持 feature control；正式的在 startAcquisition 获取）
+        // 探测 width/height 并保留 feature control：打开设备后即可实时下发
+        // 曝光/增益（用户在 GUI 改参数不必等 startAcquisition）。
+        // startAcquisition 仍会重新获取（照搬 LeadScanK2 每次 start 重取的做法）。
         try {
-            CGXFeatureControlPointer feat = (*device)->GetRemoteFeatureControl();
-            width_  = static_cast<int>(feat->GetIntFeature("Width")->GetValue());
-            height_ = static_cast<int>(feat->GetIntFeature("Height")->GetValue());
+            if (!featureCtrlPtr_) featureCtrlPtr_ = new CGXFeatureControlPointer;
+            *static_cast<CGXFeatureControlPointer*>(featureCtrlPtr_) =
+                (*device)->GetRemoteFeatureControl();
+            auto* fp = static_cast<CGXFeatureControlPointer*>(featureCtrlPtr_);
+            width_  = static_cast<int>((*fp)->GetIntFeature("Width")->GetValue());
+            height_ = static_cast<int>((*fp)->GetIntFeature("Height")->GetValue());
         } catch (...) {}
 
         displayName_ = std::string("[") + std::to_string(deviceId) + "] " +
