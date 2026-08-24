@@ -455,9 +455,8 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
                 continue;
             }
 
-            // [debug] 逐 pose 导出 4-4 steger 亚像素中心点图
-            // （灰度底 + 按线号伪彩画亚像素点；点跨行画 1px 方块，放大可见连续折线）
-            {
+            // [debug] 前 3 帧导出 4-4 原始坐标中心点：图 + CSV
+            if (pi < 3) {
                 std::error_code ec;
                 std::filesystem::path dbgDir =
                     std::filesystem::path(outPath).parent_path() / "debug_steger";
@@ -513,6 +512,17 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
                     cv::imwrite((dbgDir / name).string(), vis);
                     spdlog::info("[debug] pose {} tube {} {}: {} subpixel points",
                                  pi, ti, side, n);
+                    // CSV：原始坐标逐点（x, y, lineId）
+                    char cn[64];
+                    std::snprintf(cn, sizeof(cn), "pose_%02llu_%s_steger_raw.csv",
+                                  (unsigned long long)pi, side);
+                    std::ofstream cf(dbgDir / cn);
+                    if (cf.is_open()) {
+                        cf << "x,y,lineId\n";
+                        for (int k = 0; k < n; ++k)
+                            cf << std::fixed << std::setprecision(4)
+                               << p[k][0] << ',' << p[k][1] << ',' << lid[k] << '\n';
+                    }
                 };
                 if (stegerResL.d_centerPoints && stegerResL.d_line_ids)
                     saveSteger(*stegerResL.d_centerPoints, *stegerResL.d_line_ids,
@@ -593,8 +603,8 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
                 continue;
             }
 
-            // [debug] 逐 pose 导出 4-5 去畸变+矫正后的点（画在立体矫正图上）
-            if (undistResL.d_rectifiedPoints && undistResR.d_rectifiedPoints) {
+            // [debug] 前 3 帧导出 4-5 矫正坐标点：图 + CSV
+            if (pi < 3 && undistResL.d_rectifiedPoints && undistResR.d_rectifiedPoints) {
                 std::error_code ec;
                 auto dbgDir = std::filesystem::path(outPath).parent_path() / "debug_undist";
                 std::filesystem::create_directories(dbgDir, ec);
@@ -647,11 +657,71 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
                     std::snprintf(name, sizeof(name), "pose_%02llu_t%llu_%s_%s.png",
                                   (unsigned long long)pi, (unsigned long long)ti, side, tag);
                     cv::imwrite((dbgDir / name).string(), vis);
+                    // CSV：矫正坐标逐点（x, y, lineId）
+                    char cn[64];
+                    std::snprintf(cn, sizeof(cn), "pose_%02llu_%s_%s.csv",
+                                  (unsigned long long)pi, side, tag);
+                    std::ofstream cf(dbgDir / cn);
+                    if (cf.is_open()) {
+                        cf << "x,y,lineId\n";
+                        for (size_t k = 0; k < pts.total(); ++k)
+                            cf << std::fixed << std::setprecision(4)
+                               << p[k][0] << ',' << p[k][1] << ',' << lid[k] << '\n';
+                    }
                 };
                 if (undistResL.d_line_ids)
                     savePts(*undistResL.d_rectifiedPoints, *undistResL.d_line_ids, rectL, "L", "undist");
                 if (undistResR.d_line_ids)
                     savePts(*undistResR.d_rectifiedPoints, *undistResR.d_line_ids, rectR, "R", "undist");
+            }
+
+            // [aggr] 去畸变点按像素格平均：4-5 输出同一条线的多响应候选
+            // （同格 x 差 <1px），按 (line, floor(x), floor(y)) 聚合取均值后
+            // 再喂 4-6 插值——插值输入每格唯一，消除候选冗余。
+            {
+                auto pixelAvg = [&](const cv::cuda::GpuMat& dpts,
+                                    const cv::cuda::GpuMat& dids,
+                                    cv::cuda::GpuMat& outPts,
+                                    cv::cuda::GpuMat& outIds) {
+                    cv::Mat h, ids;
+                    dpts.download(h, stream);
+                    dids.download(ids, stream);
+                    cudaStreamSynchronize(cv::cuda::StreamAccessor::getStream(stream));
+                    if (h.empty()) return;
+                    // 行级合并键 (line, gy)：同一行内所有候选（跨 x 格）归为
+                    // 一个中心点 —— 每线每行唯一，中心线序列稳定不跳变。
+                    // （适用于本工程斜线：每行与线相交一次。近水平线不适用。）
+                    struct Acc { double sx=0, sy=0; int n=0; };
+                    std::map<std::tuple<int,int>, Acc> acc;
+                    const cv::Vec2f* pp = h.ptr<cv::Vec2f>();
+                    const int* pi = ids.ptr<int>();
+                    for (size_t k = 0; k < h.total(); ++k) {
+                        int gy = (int)std::floor(pp[k][1]);
+                        auto key = std::make_tuple(pi[k], gy);
+                        auto& a = acc[key];
+                        a.sx += pp[k][0];
+                        a.sy += pp[k][1];
+                        a.n += 1;
+                    }
+                    cv::Mat oq(1, (int)acc.size(), CV_32FC2);
+                    cv::Mat oi(1, (int)acc.size(), CV_32SC1);
+                    int w = 0;
+                    for (const auto& [key, a] : acc) {
+                        oq.ptr<cv::Vec2f>()[w] = cv::Vec2f(
+                            (float)(a.sx / a.n), (float)(a.sy / a.n));
+                        oi.ptr<int>()[w] = std::get<0>(key);
+                        ++w;
+                    }
+                    outPts.upload(oq, stream);
+                    outIds.upload(oi, stream);
+                };
+                cv::cuda::GpuMat avgPtsL, avgIdsL, avgPtsR, avgIdsR;
+                pixelAvg(*undistResL.d_rectifiedPoints, *undistResL.d_line_ids, avgPtsL, avgIdsL);
+                pixelAvg(*undistResR.d_rectifiedPoints, *undistResR.d_line_ids, avgPtsR, avgIdsR);
+                undistResL.d_rectifiedPoints = std::make_shared<cv::cuda::GpuMat>(avgPtsL);
+                undistResL.d_line_ids = std::make_shared<cv::cuda::GpuMat>(avgIdsL);
+                undistResR.d_rectifiedPoints = std::make_shared<cv::cuda::GpuMat>(avgPtsR);
+                undistResR.d_line_ids = std::make_shared<cv::cuda::GpuMat>(avgIdsR);
             }
 
             // ----- 4-6 epipolar_interp (L + R) -----
@@ -674,6 +744,89 @@ int runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
                              pi, ti, epipolarResL.success, epipolarResR.success);
                 ++framesSkip;
                 continue;
+            }
+
+            // [debug] 插值结果图（仅前 3 帧）：矫正底图 + 极线点按线号着色
+            if (pi < 3 && epipolarResL.d_interpPoints && epipolarResL.d_interp_line_ids) {
+                std::error_code ec;
+                auto dbgDir = std::filesystem::path(outPath).parent_path() / "debug_interp";
+                std::filesystem::create_directories(dbgDir, ec);
+                cv::Mat mapXL, mapYL, rectL;
+                cv::initUndistortRectifyMap(h.cameraMatrixL, h.distCoeffsL, h.R1, h.P1,
+                                            h.imageSize, CV_32FC1, mapXL, mapYL);
+                cv::remap(f.leftGray, rectL, mapXL, mapYL, cv::INTER_LINEAR);
+                cv::Mat vis;
+                cv::cvtColor(rectL, vis, cv::COLOR_GRAY2BGR);
+                vis.convertTo(vis, -1, 1.0 / 3.0);   // 压暗底图
+                cv::Mat pts, ids;
+                epipolarResL.d_interpPoints->download(pts, stream);
+                epipolarResL.d_interp_line_ids->download(ids, stream);
+                cudaStreamSynchronize(cv::cuda::StreamAccessor::getStream(stream));
+                int drawn = 0;
+                for (int k = 0; k < (int)pts.total(); ++k) {
+                    int lb = ids.ptr<int>()[k];
+                    cv::Vec2f q = pts.ptr<cv::Vec2f>()[k];
+                    int x = (int)std::lround(q[0]), y = (int)std::lround(q[1]);
+                    if (x < 0 || x >= vis.cols || y < 0 || y >= vis.rows) continue;
+                    cv::Scalar c((lb * 61) & 255, (lb * 127 + 40) & 255, (lb * 251 + 80) & 255);
+                    cv::rectangle(vis, cv::Point(x, y), cv::Point(x, y), c);
+                    ++drawn;
+                }
+                char nm[64];
+                std::snprintf(nm, sizeof(nm), "pose_%02llu_t%llu_L_interp.png",
+                              (unsigned long long)pi, (unsigned long long)ti);
+                cv::imwrite((dbgDir / nm).string(), vis);
+                spdlog::info("[debug] pose {} tube {} L interp: {} pts -> {}", pi, ti, drawn, nm);
+
+                // R 路也画 + L/R 双侧 CSV（插值点逐点）
+                if (epipolarResR.d_interpPoints && epipolarResR.d_interp_line_ids) {
+                    cv::Mat mapXR, mapYR, rectR;
+                    cv::initUndistortRectifyMap(h.cameraMatrixR, h.distCoeffsR, h.R2, h.P2,
+                                                h.imageSize, CV_32FC1, mapXR, mapYR);
+                    cv::remap(f.rightGray, rectR, mapXR, mapYR, cv::INTER_LINEAR);
+                    cv::Mat visR;
+                    cv::cvtColor(rectR, visR, cv::COLOR_GRAY2BGR);
+                    visR.convertTo(visR, -1, 1.0 / 3.0);
+                    cv::Mat ptsR, idsR;
+                    epipolarResR.d_interpPoints->download(ptsR, stream);
+                    epipolarResR.d_interp_line_ids->download(idsR, stream);
+                    cudaStreamSynchronize(cv::cuda::StreamAccessor::getStream(stream));
+                    int drawnR = 0;
+                    for (int k = 0; k < (int)ptsR.total(); ++k) {
+                        int lb = idsR.ptr<int>()[k];
+                        cv::Vec2f q = ptsR.ptr<cv::Vec2f>()[k];
+                        int xx = (int)std::lround(q[0]), yy = (int)std::lround(q[1]);
+                        if (xx < 0 || xx >= visR.cols || yy < 0 || yy >= visR.rows) continue;
+                        cv::Scalar c((lb * 61) & 255, (lb * 127 + 40) & 255, (lb * 251 + 80) & 255);
+                        cv::rectangle(visR, cv::Point(xx, yy), cv::Point(xx, yy), c);
+                        ++drawnR;
+                    }
+                    char nr[64];
+                    std::snprintf(nr, sizeof(nr), "pose_%02llu_t%llu_R_interp.png",
+                                  (unsigned long long)pi, (unsigned long long)ti);
+                    cv::imwrite((dbgDir / nr).string(), visR);
+                }
+                // CSV: L 与 R 插值点（x, y, lineId）
+                auto saveCsv = [&](const cv::cuda::GpuMat& dpts,
+                                   const cv::cuda::GpuMat& dids, const char* side) {
+                    cv::Mat hp, hi;
+                    dpts.download(hp, stream);
+                    dids.download(hi, stream);
+                    cudaStreamSynchronize(cv::cuda::StreamAccessor::getStream(stream));
+                    char cn[64];
+                    std::snprintf(cn, sizeof(cn), "pose_%02llu_%s_interp.csv",
+                                  (unsigned long long)pi, side);
+                    std::ofstream cf(dbgDir / cn);
+                    if (!cf.is_open()) return;
+                    cf << "x,y,lineId\n";
+                    for (int k = 0; k < (int)hp.total(); ++k)
+                        cf << std::fixed << std::setprecision(4)
+                           << hp.ptr<cv::Vec2f>()[k][0] << ','
+                           << hp.ptr<cv::Vec2f>()[k][1] << ','
+                           << hi.ptr<int>()[k] << '\n';
+                };
+                saveCsv(*epipolarResL.d_interpPoints, *epipolarResL.d_interp_line_ids, "L");
+                saveCsv(*epipolarResR.d_interpPoints, *epipolarResR.d_interp_line_ids, "R");
             }
 
             // ----- 4-7 laser_match -----

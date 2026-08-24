@@ -30,6 +30,9 @@ struct EpipolarInterpCuda::Impl {
     cv::cuda::GpuMat d_output_;
     cv::cuda::GpuMat d_output_fids_;
     cv::cuda::GpuMat d_output_count_;
+    cv::cuda::GpuMat lineSegStart_;   // 每线起始下标（lineCount+1 个）
+    cv::cuda::GpuMat lineSegList_;    // 线号列表（lineCount 个）
+    int lineCount_ = 0;
     void* d_cub_temp_storage_ = nullptr;
     size_t cub_temp_size_ = 0;
     int last_max_pairs_count_ = 0;

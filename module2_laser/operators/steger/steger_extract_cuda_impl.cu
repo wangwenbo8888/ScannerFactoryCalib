@@ -61,7 +61,8 @@ struct SubpixelPointToLabel {
 __global__ void GaussianConvRowKernel(
     const float* d_input, float* d_output,
     int rows, int cols, size_t in_step, size_t out_step,
-    const float* d_kernel, int kernel_size)
+    const float* d_kernel, int kernel_size,
+    int normalize_wsum)   // 1=平滑核(边界裁剪时归一), 0=导数核(和≈0, 严禁除)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -82,15 +83,22 @@ __global__ void GaussianConvRowKernel(
         }
     }
 
+    // 修复：gx 等反对称导数核 Σw≈0，除 w_sum 会放大 1e17 倍产生垃圾值
+    //（此前 ix/iy/ixy 全为垃圾、亚像素修正 t=0 的根因）。仅平滑核归一。
+    if (normalize_wsum && fabsf(w_sum) > 1e-8f) {
+        sum /= w_sum;
+    }
+
     float* out_row = reinterpret_cast<float*>(
         reinterpret_cast<char*>(d_output) + y * out_step);
-    out_row[x] = sum / w_sum;
+    out_row[x] = sum;
 }
 
 __global__ void GaussianConvColKernel(
     const float* d_input, float* d_output,
     int rows, int cols, size_t in_step, size_t out_step,
-    const float* d_kernel, int kernel_size)
+    const float* d_kernel, int kernel_size,
+    int normalize_wsum)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -111,9 +119,13 @@ __global__ void GaussianConvColKernel(
         }
     }
 
+    if (normalize_wsum && fabsf(w_sum) > 1e-8f) {
+        sum /= w_sum;
+    }
+
     float* out_row = reinterpret_cast<float*>(
         reinterpret_cast<char*>(d_output) + y * out_step);
-    out_row[x] = sum / w_sum;
+    out_row[x] = sum;
 }
 
 __global__ void Convert8UTo32FKernel(
@@ -233,6 +245,7 @@ __global__ void HessianEigenAndTaylorKernel(
     float px = static_cast<float>(x) + t * nx;
     float py = static_cast<float>(y) + t * ny;
 
+
     if (px < 0.0f || px >= static_cast<float>(cols) ||
         py < 0.0f || py >= static_cast<float>(rows)) return;
 
@@ -314,7 +327,7 @@ void StegerExtractorCUDA::Impl::buildGaussianKernels() {
     d_gx_kernel_.assign(h_gx.begin(), h_gx.end());
     d_gxx_kernel_.assign(h_gxx.begin(), h_gxx.end());
 
-    CALIB_LOG_INFO("Gaussian kernels built: sigma={}, kernelSize={}", params_.sigma, actualKernelSize_);
+    CALIB_LOG_INFO("Gaussian kernels built: sigma={}, kernelSize={}", params_.sigma, actualKernelSize_, 0);
 }
 
 // ============================================================================
@@ -531,56 +544,56 @@ StegerResult StegerExtractorCUDA::Impl::Execute(
         GaussianConvRowKernel<<<conv_grid, conv_block, 0, cuda_stream>>>(
             d_float_.ptr<float>(), d_temp_.ptr<float>(),
             rows, cols, d_float_.step, d_temp_.step,
-            thrust::raw_pointer_cast(d_gx_kernel_.data()), actualKernelSize_);
+            thrust::raw_pointer_cast(d_gx_kernel_.data()), actualKernelSize_, 0);
 
         GaussianConvColKernel<<<conv_grid, conv_block, 0, cuda_stream>>>(
             d_temp_.ptr<float>(), d_ix_.ptr<float>(),
             rows, cols, d_temp_.step, d_ix_.step,
-            thrust::raw_pointer_cast(d_g_kernel_.data()), actualKernelSize_);
+            thrust::raw_pointer_cast(d_g_kernel_.data()), actualKernelSize_, 1);
 
         // 2b: Iy = g * (g' ⊗_col I)
         GaussianConvRowKernel<<<conv_grid, conv_block, 0, cuda_stream>>>(
             d_float_.ptr<float>(), d_temp_.ptr<float>(),
             rows, cols, d_float_.step, d_temp_.step,
-            thrust::raw_pointer_cast(d_g_kernel_.data()), actualKernelSize_);
+            thrust::raw_pointer_cast(d_g_kernel_.data()), actualKernelSize_, 1);
 
         GaussianConvColKernel<<<conv_grid, conv_block, 0, cuda_stream>>>(
             d_temp_.ptr<float>(), d_iy_.ptr<float>(),
             rows, cols, d_temp_.step, d_iy_.step,
-            thrust::raw_pointer_cast(d_gx_kernel_.data()), actualKernelSize_);
+            thrust::raw_pointer_cast(d_gx_kernel_.data()), actualKernelSize_, 0);
 
         // 2c: Ixx = (g'' ⊗_row g) * I
         GaussianConvRowKernel<<<conv_grid, conv_block, 0, cuda_stream>>>(
             d_float_.ptr<float>(), d_temp_.ptr<float>(),
             rows, cols, d_float_.step, d_temp_.step,
-            thrust::raw_pointer_cast(d_gxx_kernel_.data()), actualKernelSize_);
+            thrust::raw_pointer_cast(d_gxx_kernel_.data()), actualKernelSize_, 0);
 
         GaussianConvColKernel<<<conv_grid, conv_block, 0, cuda_stream>>>(
             d_temp_.ptr<float>(), d_ixx_.ptr<float>(),
             rows, cols, d_temp_.step, d_ixx_.step,
-            thrust::raw_pointer_cast(d_g_kernel_.data()), actualKernelSize_);
+            thrust::raw_pointer_cast(d_g_kernel_.data()), actualKernelSize_, 1);
 
         // 2d: Iyy = g * (g'' ⊗_col I)
         GaussianConvRowKernel<<<conv_grid, conv_block, 0, cuda_stream>>>(
             d_float_.ptr<float>(), d_temp_.ptr<float>(),
             rows, cols, d_float_.step, d_temp_.step,
-            thrust::raw_pointer_cast(d_g_kernel_.data()), actualKernelSize_);
+            thrust::raw_pointer_cast(d_g_kernel_.data()), actualKernelSize_, 1);
 
         GaussianConvColKernel<<<conv_grid, conv_block, 0, cuda_stream>>>(
             d_temp_.ptr<float>(), d_iyy_.ptr<float>(),
             rows, cols, d_temp_.step, d_iyy_.step,
-            thrust::raw_pointer_cast(d_gxx_kernel_.data()), actualKernelSize_);
+            thrust::raw_pointer_cast(d_gxx_kernel_.data()), actualKernelSize_, 0);
 
         // 2e: Ixy = (g' ⊗_row g') * I
         GaussianConvRowKernel<<<conv_grid, conv_block, 0, cuda_stream>>>(
             d_float_.ptr<float>(), d_temp_.ptr<float>(),
             rows, cols, d_float_.step, d_temp_.step,
-            thrust::raw_pointer_cast(d_gx_kernel_.data()), actualKernelSize_);
+            thrust::raw_pointer_cast(d_gx_kernel_.data()), actualKernelSize_, 0);
 
         GaussianConvColKernel<<<conv_grid, conv_block, 0, cuda_stream>>>(
             d_temp_.ptr<float>(), d_ixy_.ptr<float>(),
             rows, cols, d_temp_.step, d_ixy_.step,
-            thrust::raw_pointer_cast(d_gx_kernel_.data()), actualKernelSize_);
+            thrust::raw_pointer_cast(d_gx_kernel_.data()), actualKernelSize_, 0);
 
         cudaEventRecord(ev_s2, cuda_stream);
 

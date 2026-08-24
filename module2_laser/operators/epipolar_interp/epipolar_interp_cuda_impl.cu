@@ -18,6 +18,10 @@
 #include <opencv2/core/cuda_stream_accessor.hpp>
 #include <cub/cub.cuh>
 #include <cmath>
+#include <climits>
+#include <vector>
+#include <map>
+#include <utility>
 #include <stdexcept>
 
 using namespace calib;
@@ -52,81 +56,81 @@ static inline void safeCudaFree(T*& ptr) {
 // CUDA Kernel
 // ============================================================================
 
-__global__ void __launch_bounds__(256, 4) kernelMarkAndCompute(
-    const float2* __restrict__ d_input,
-    const int* __restrict__ d_line_ids,
-    int pair_count,
-    float epipolar_step,
-    float max_x_diff,
-    float max_y_span,
-    bool line_id_check,
-    int* __restrict__ d_flags,
-    float2* __restrict__ d_interp_pts,
-    int* __restrict__ d_interp_fids)
+// ============ 逐极线选点式插值（v2，2026-08-23 重设计）============
+// 设计目标（五条硬性约定）：
+//   ① 极线上下必须都有点（开区间严格夹住）
+//   ② 两点 X 差 <1.4px 且 Y 差 <1.4px（门禁参数，可配）
+//   ③ 两点是距该极线最近的点（按 Y：y 有序流中夹住极线的相邻对）
+//   ④ 极线步距可配（默认 0.7px）
+//   ⑤ 每线每极线最多一个点（槽位唯一 = line × 极线行号，无重复产出）
+// 实现：每线程负责 (一条线的起始点范围, 一批极线行)，对每条极线二分找
+//       夹住它的相邻两点，校验门禁后线性插值，写入唯一槽。
+// 输入要求：点流按 (line, y) 严格有序（行级合并后每线每行 1 点）。
+
+__device__ __forceinline__ int findSpan(
+    const float2* __restrict__ pts, int lo, int hi, float yq)
 {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (idx >= pair_count) {
-        return;
+    // 二分：返回最大下标 i 使 pts[i].y <= yq（lo<=i<hi-1）
+    // 即 pts[i] 是 yq 下方最近点、pts[i+1] 是上方最近点
+    while (lo + 1 < hi) {
+        int mid = (lo + hi) >> 1;
+        if (pts[mid].y <= yq) lo = mid;
+        else hi = mid;
     }
+    return lo;
+}
 
-    if (line_id_check && d_line_ids[idx] != d_line_ids[idx + 1]) {
-        d_flags[idx] = 0;
-        return;
-    }
+__global__ void __launch_bounds__(256, 4) kernelRowInterp(
+    const float2* __restrict__ d_input,    // (line,y) 有序点流
+    const int*   __restrict__ d_line_start,// 每条线在点流中的起始下标（+1 为终止）
+    const int*   __restrict__ d_line_list, // 线号列表
+    int line_count,
+    int row_base,                          // 极线行号基准（y 最小处的行号）
+    float epipolar_step,                   // ④ 极线步距（默认 0.7）
+    float max_pt_diff,                     // ② 两点 X/Y 差上限（1.4）
+    int* __restrict__ d_flags,             // 槽 = 全局极线行号 × line_count + lineIdx
+    float2* __restrict__ d_interp_pts,
+    int* __restrict__ d_interp_fids,
+    int total_slots)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_slots) return;
+    d_flags[idx] = 0;
 
-    const int fid = d_line_ids[idx];
+    // 槽 → (极线行号, 线)
+    int row = idx / line_count;
+    int li  = idx - row * line_count;
+    int lineId = d_line_list[li];
+    int s = d_line_start[li];
+    int e = d_line_start[li + 1];
+    if (e - s < 2) return;   // 线内点不足
 
-    float2 p1 = d_input[idx];
-    float2 p2 = d_input[idx + 1];
+    float yq = (row + row_base) * epipolar_step;
 
-    if (p1.y > p2.y) {
-        float2 temp = p1;
-        p1 = p2;
-        p2 = temp;
-    }
+    // ③ 二分找夹住 yq 的相邻两点（y 有序流中必然是最近的两点）
+    int i = findSpan(d_input, s, e, yq);
+    if (i < s || i + 1 >= e) return;
+    float2 p1 = d_input[i];
+    float2 p2 = d_input[i + 1];
+    if (p1.y > p2.y) { float2 tmp = p1; p1 = p2; p2 = tmp; }
 
-    const float dx = fabsf(p1.x - p2.x);
-    if (dx >= max_x_diff) {
-        d_flags[idx] = 0;
-        return;
-    }
+    // ① 极线必须严格在两点之间（上下都有点）
+    if (!(yq > p1.y && yq < p2.y)) return;
 
-    const float y_min = p1.y;
-    const float y_max = p2.y;
+    // ② 门禁：两点间 X/Y 差 <1.4px，且两点距极线的 Y 距离都 <0.7px（=步距，
+    //    即两点分别紧贴极线上下、跨距不超过一个步距）
+    if (fabsf(p1.x - p2.x) >= max_pt_diff) return;
+    if (fabsf(p1.y - p2.y) >= max_pt_diff) return;
+    if (fabsf(p1.y - yq) >= epipolar_step) return;
+    if (fabsf(p2.y - yq) >= epipolar_step) return;
 
-    if ((y_max - y_min) >= max_y_span) {
-        d_flags[idx] = 0;
-        return;
-    }
+    // 线性插值（连线与极线 y=yq 的交点）
+    float t = (yq - p1.y) / (p2.y - p1.y);
+    float xq = p1.x + t * (p2.x - p1.x);
 
-    const float y_target = ceilf(y_min / epipolar_step) * epipolar_step;
-
-    const float dist_to_min = y_target - y_min;
-    const float dist_to_max = y_max - y_target;
-
-    if (dist_to_min > 0.0f &&
-        dist_to_max > 0.0f &&
-        dist_to_min < DIST_THRESHOLD &&
-        dist_to_max < DIST_THRESHOLD)
-    {
-        const float denom = y_max - y_min;
-
-        if (fabsf(denom) < EPSILON) {
-            d_flags[idx] = 0;
-            return;
-        }
-
-        const float t = dist_to_min / denom;
-        const float x_interp = p1.x + t * (p2.x - p1.x);
-
-        d_interp_pts[idx] = make_float2(x_interp, y_target);
-        d_interp_fids[idx] = fid;
-        d_flags[idx] = 1;
-    }
-    else {
-        d_flags[idx] = 0;
-    }
+    d_interp_pts[idx] = make_float2(xq, yq);
+    d_interp_fids[idx] = lineId;
+    d_flags[idx] = 1;      // ⑤ 槽唯一，天然每线每极线一点
 }
 
 // ============================================================================
@@ -199,11 +203,13 @@ bool EpipolarInterpCuda::Impl::allocateBuffers(int pointCount) {
 
     CALIB_LOG_DEBUG("Allocating GPU buffers for {} pairs", num_pairs);
 
-    d_flags_.create(1, num_pairs, CV_32SC1);
-    d_temp_interp_.create(1, num_pairs, CV_32FC2);
-    d_temp_fids_.create(1, num_pairs, CV_32SC1);
-    d_output_.create(1, num_pairs, CV_32FC2);
-    d_output_fids_.create(1, num_pairs, CV_32SC1);
+    // 每 pair 最多 4 个输出槽 → 缓冲 4 倍（多点产出 kernel）
+    const int slots = num_pairs * 4;
+    d_flags_.create(1, slots, CV_32SC1);
+    d_temp_interp_.create(1, slots, CV_32FC2);
+    d_temp_fids_.create(1, slots, CV_32SC1);
+    d_output_.create(1, slots, CV_32FC2);
+    d_output_fids_.create(1, slots, CV_32SC1);
     d_output_count_.create(1, 1, CV_32SC1);
 
     last_max_pairs_count_ = num_pairs;
@@ -259,25 +265,94 @@ EpipolarInterpResult EpipolarInterpCuda::Impl::Execute(
 
         cudaStream_t cuda_stream = cv::cuda::StreamAccessor::getStream(stream);
 
-        const float2* d_input_ptr = d_points.ptr<float2>();
-        const int* d_fid_ptr = d_line_ids.ptr<int>();
+        // ---- 行级合并（host 侧一次性预处理）：按 (line, floor(y)) 取均值 →
+        //      每线每行唯一点，(line,y) 严格有序 —— kernel v2 的输入契约
+        cv::Mat h_pts, h_ids;
+        d_points.download(h_pts, stream);
+        d_line_ids.download(h_ids, stream);
+        cudaStreamSynchronize(cv::cuda::StreamAccessor::getStream(stream));
+        {
+            struct Acc { double sx=0, sy=0; int n=0; };
+            std::map<std::pair<int,int>, Acc> acc;
+            const cv::Vec2f* pp = h_pts.ptr<cv::Vec2f>();
+            const int* pi = h_ids.ptr<int>();
+            for (int k = 0; k < (int)h_pts.total(); ++k) {
+                auto key = std::make_pair(pi[k], (int)std::floor(pp[k][1]));
+                auto& a = acc[key];
+                a.sx += pp[k][0];
+                a.sy += pp[k][1];
+                a.n += 1;
+            }
+            int w = 0;
+            for (const auto& [key, a] : acc) {
+                h_pts.ptr<cv::Vec2f>()[w] = cv::Vec2f(
+                    (float)(a.sx / a.n), (float)(a.sy / a.n));
+                h_ids.ptr<int>()[w] = key.first;
+                ++w;
+            }
+            h_pts = h_pts.colRange(0, w);
+            h_ids = h_ids.colRange(0, w);
+        }
+        pointCount = (int)h_pts.total();
+
+        // 上传合并后的点流 + 计算每线 [start,end) 分段
+        cv::cuda::GpuMat d_in_pts, d_in_ids;
+        d_in_pts.upload(h_pts, stream);
+        d_in_ids.upload(h_ids, stream);
+        {
+            std::vector<int> starts, lines;
+            int prev = INT_MIN;
+            const int* pi = h_ids.ptr<int>();
+            for (int k = 0; k < pointCount; ++k) {
+                if (pi[k] != prev) { starts.push_back(k); lines.push_back(pi[k]); prev = pi[k]; }
+            }
+            starts.push_back(pointCount);
+            lineSegStart_.upload(cv::Mat(starts).reshape(1, 1), stream);
+            lineSegList_.upload(cv::Mat(lines).reshape(1, 1), stream);
+            lineCount_ = (int)lines.size();
+        }
+
+        // ---- 槽位规划：全局极线行号 = floor(y / step)，槽 = row × lineCount + li
+        const float* ppy = h_pts.ptr<cv::Vec2f>()[0].val; // note: 仅取首元素探测
+        float yMin = 1e30f, yMax = -1e30f;
+        for (int k = 0; k < pointCount; ++k) {
+            float y = h_pts.ptr<cv::Vec2f>()[k][1];
+            yMin = fminf(yMin, y);
+            yMax = fmaxf(yMax, y);
+        }
+        const int row0 = (int)std::floor(yMin / params_.epipolar_row_step);
+        const int row1 = (int)std::ceil(yMax / params_.epipolar_row_step);
+        const int totalRows = row1 - row0 + 1;
+        const int totalSlots = totalRows * lineCount_;
+
+        if (!allocateBuffers(totalSlots)) {
+            result.success = false;
+            result.message = "GPU buffer allocation failed";
+            CALIB_LOG_ERROR("Execute(): {}", result.message);
+            return result;
+        }
+
         int* d_flags_ptr = d_flags_.ptr<int>();
         float2* d_temp_ptr = d_temp_interp_.ptr<float2>();
         int* d_temp_fid_ptr = d_temp_fids_.ptr<int>();
         float2* d_output_ptr = d_output_.ptr<float2>();
         int* d_output_fid_ptr = d_output_fids_.ptr<int>();
         int* d_count_ptr = d_output_count_.ptr<int>();
+        int* d_count_ptr2 = d_output_count_.ptr<int>();
 
-        const int num_pairs = pointCount - 1;
-        const int grid_size = (num_pairs + BLOCK_SIZE - 1) / BLOCK_SIZE;
-
-        kernelMarkAndCompute<<<grid_size, BLOCK_SIZE, 0, cuda_stream>>>(
-            d_input_ptr, d_fid_ptr, num_pairs,
-            params_.epipolar_row_step,
-            params_.max_x_diff,
-            params_.max_y_span,
-            params_.lineIdCheck,
-            d_flags_ptr, d_temp_ptr, d_temp_fid_ptr);
+        {
+            const int grid_size = (totalSlots + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            kernelRowInterp<<<grid_size, BLOCK_SIZE, 0, cuda_stream>>>(
+                d_in_pts.ptr<float2>(),
+                lineSegStart_.ptr<int>(),
+                lineSegList_.ptr<int>(),
+                lineCount_,
+                row0,
+                params_.epipolar_row_step,
+                params_.max_x_diff,      // 复用 maxXDiff 作为门禁（config 设 1.4）
+                d_flags_ptr, d_temp_ptr, d_temp_fid_ptr,
+                totalSlots);
+        }
 
         cudaError_t kernel_err = cudaGetLastError();
         if (kernel_err != cudaSuccess) {
@@ -294,7 +369,7 @@ EpipolarInterpResult EpipolarInterpCuda::Impl::Execute(
             nullptr, temp_storage_bytes,
             d_temp_ptr, d_flags_ptr,
             d_output_ptr, d_count_ptr,
-            num_pairs, cuda_stream);
+            totalSlots, cuda_stream);
 
         if (cub_err != cudaSuccess) {
             result.success = false;
@@ -306,8 +381,8 @@ EpipolarInterpResult EpipolarInterpCuda::Impl::Execute(
         cub_err = cub::DeviceSelect::Flagged(
             nullptr, temp_storage_fids,
             d_temp_fid_ptr, d_flags_ptr,
-            d_output_fid_ptr, d_count_ptr,
-            num_pairs, cuda_stream);
+            d_output_fid_ptr, d_count_ptr2,
+            totalSlots, cuda_stream);
 
         if (cub_err != cudaSuccess) {
             result.success = false;
@@ -336,7 +411,7 @@ EpipolarInterpResult EpipolarInterpCuda::Impl::Execute(
             d_cub_temp_storage_, cub_temp_size_,
             d_temp_ptr, d_flags_ptr,
             d_output_ptr, d_count_ptr,
-            num_pairs, cuda_stream);
+            totalSlots, cuda_stream);
 
         if (cub_err != cudaSuccess) {
             result.success = false;
@@ -348,26 +423,15 @@ EpipolarInterpResult EpipolarInterpCuda::Impl::Execute(
         cub_err = cub::DeviceSelect::Flagged(
             d_cub_temp_storage_, cub_temp_size_,
             d_temp_fid_ptr, d_flags_ptr,
-            d_output_fid_ptr, d_count_ptr,
-            num_pairs, cuda_stream);
+            d_output_fid_ptr, d_count_ptr2,
+            totalSlots, cuda_stream);
 
         if (cub_err != cudaSuccess) {
             result.success = false;
-            result.message = std::string("CUB::Flagged execution failed: ") + cudaGetErrorString(cub_err);
+            result.message = std::string("CUB::Flagged execution failed (fids): ") + cudaGetErrorString(cub_err);
             CALIB_LOG_ERROR("Execute(): {}", result.message);
             return result;
         }
-
-#ifndef NDEBUG
-        cudaStreamSynchronize(cuda_stream);
-        kernel_err = cudaGetLastError();
-        if (kernel_err != cudaSuccess) {
-            result.success = false;
-            result.message = std::string("Kernel execution failed: ") + cudaGetErrorString(kernel_err);
-            CALIB_LOG_ERROR("Execute(): {}", result.message);
-            return result;
-        }
-#endif
 
         int h_count = 0;
         cudaMemcpyAsync(&h_count, d_count_ptr, sizeof(int), cudaMemcpyDeviceToHost, cuda_stream);
