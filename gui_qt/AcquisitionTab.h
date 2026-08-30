@@ -3,6 +3,12 @@
 #include <QWidget>
 #include <QImage>
 #include <memory>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
+#include <utility>
 #include <opencv2/core.hpp>
 
 class QComboBox;
@@ -39,6 +45,7 @@ private slots:
     void onOpenClose();
     void onFreezeFrame();        // 预览当前帧：界面停在当前帧（后台 lastLeft_/Right 继续刷新）
     void onTogglePreview(bool on);  // 连续预览开关（on=刷新界面，off=停在当前帧）
+    void onToggleRecord(bool on);   // 连续存储开关：on=开始整帧连续存盘（独立文件夹）；off=停止收尾
     void onSaveCamera();         // 把当前【显示】帧保存到 data_in/camera/left,N.png + right,N.png
     void onSaveLaser();          // 保存到 data_in/laser/pose_NN/L_tube*.png + R_tube*.png
     void onBrowseLeftFolder();
@@ -69,6 +76,11 @@ private:
     // 按用户勾选的「左/右 180°」复选框旋转图像（GUI 层处理，与 deviceId 解耦）
     void applyGuiRotation(cv::Mat& leftImg, cv::Mat& rightImg);
 
+    // —— 连续存储（独立写盘线程，全分辨率左右成对帧）——
+    void stopRecord();             // 停止存储并 join 写盘线程（幂等）
+    void enqueueRecordPair();      // 回调线程：配对整帧克隆入队
+    void recordWriterLoop();       // 写盘线程主循环
+
     // 开机自动流程：开串口 → 启动扫描仪 → 开设备 → 进实时预览
     void autoStart();
 
@@ -93,6 +105,17 @@ private:
     QCheckBox*  rightRotateChk_   = nullptr;  // 右相机 180° 旋转
     bool        previewing_       = false;   // 扫描仪启动后自动进入预览态
     bool        scannerRunning_   = false;   // 扫描仪电机/激光是否已启动（N10 已发）
+
+    // —— 连续存储 ——
+    QPushButton* recordBtn_       = nullptr; // 「⏺ 连续存储」checkable（勾选=绿色=存储中）
+    std::atomic<bool> recording_  = {false}; // 存储开关（相机回调线程读）
+    std::thread           recordWriter_;     // 后台写盘线程
+    std::mutex            recordMtx_;
+    std::condition_variable recordCv_;
+    std::deque<std::pair<cv::Mat, cv::Mat>> recordQueue_;  // 待写盘左右成对帧
+    QString               recordDir_;        // 本次存储目录（data_in/continuous/<开始时间>）
+    int                   recordWritten_ = 0;  // 已写盘对数（仅 writer 线程）
+    int                   recordDropped_ = 0;  // 队列满丢弃对数（recordMtx_ 保护）
 
     // —— 扫描仪硬件控制（串口）——
     QComboBox*   comPortCbx_       = nullptr;

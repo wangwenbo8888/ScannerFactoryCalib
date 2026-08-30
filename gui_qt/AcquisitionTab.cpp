@@ -37,6 +37,11 @@
 
 namespace fc::gui {
 
+namespace {
+// 连续存储待写队列上限（左右成对帧）。写盘跟不上时丢新帧，防止内存无限增长
+constexpr size_t kRecordQueueCap = 120;
+}
+
 AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
     auto* root = new QVBoxLayout(this);
     root->setContentsMargins(8, 8, 8, 8);
@@ -96,6 +101,12 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
     previewBtn_->setCheckable(true);
     previewBtn_->setChecked(true);   // 默认连续预览
     previewBtn_->setEnabled(false);
+    recordBtn_ = new QPushButton(QStringLiteral("⏺ 连续存储"));
+    recordBtn_->setCheckable(true);
+    recordBtn_->setEnabled(false);
+    // 勾选=存储中（绿色），再点一次停止并收尾落盘
+    recordBtn_->setStyleSheet(
+        QStringLiteral("QPushButton:checked { background-color: #2fa84f; color: white; }"));
     saveCameraBtn_ = new QPushButton(QStringLiteral("💾 保存到 data_in/camera"));
     saveLaserBtn_  = new QPushButton(QStringLiteral("💾 保存到 data_in/laser/pose_NN"));
     saveCameraBtn_->setEnabled(false);
@@ -115,6 +126,7 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
     ctrlRow->addWidget(openBtn_);
     ctrlRow->addWidget(captureBtn_);
     ctrlRow->addWidget(previewBtn_);
+    ctrlRow->addWidget(recordBtn_);
     ctrlRow->addWidget(new QLabel(QStringLiteral("曝光:")));
     ctrlRow->addWidget(exposureSpin_);
     ctrlRow->addWidget(new QLabel(QStringLiteral("增益:")));
@@ -216,6 +228,7 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
     connect(openBtn_,        &QPushButton::clicked,     this, &AcquisitionTab::onOpenClose);
     connect(captureBtn_,     &QPushButton::clicked,     this, &AcquisitionTab::onFreezeFrame);
     connect(previewBtn_,     &QPushButton::toggled,     this, &AcquisitionTab::onTogglePreview);
+    connect(recordBtn_,      &QPushButton::toggled,     this, &AcquisitionTab::onToggleRecord);
     connect(saveCameraBtn_,  &QPushButton::clicked,     this, &AcquisitionTab::onSaveCamera);
     connect(saveLaserBtn_,   &QPushButton::clicked,     this, &AcquisitionTab::onSaveLaser);
     connect(leftBrowseBtn_,  &QPushButton::clicked,     this, &AcquisitionTab::onBrowseLeftFolder);
@@ -302,6 +315,9 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
 }
 
 AcquisitionTab::~AcquisitionTab() {
+    // 先收尾连续存储：停入队 → 等写盘线程排空退出（关窗时允许等待），再拆相机/串口
+    stopRecord();
+    if (recordWriter_.joinable()) recordWriter_.join();
     // 退出前先停扫描仪（电机/激光）——无论哪种退出路径（关闭窗口/菜单退出/quit），
     // Qt 对象树析构都会走到这里；串口未开或未启动则静默跳过，不发多余 N11
     if (scanner_ && scanner_->isOpen() && scannerRunning_) {
@@ -416,6 +432,7 @@ void AcquisitionTab::setDeviceOpenUI(bool opened) {
     openBtn_->setText(opened ? QStringLiteral("关闭设备") : QStringLiteral("打开设备"));
     captureBtn_->setEnabled(opened);
     previewBtn_->setEnabled(opened);
+    recordBtn_->setEnabled(opened);
     sourceTypeCbx_->setEnabled(!opened);
     leftDevSpin_->setEnabled(!opened);
     rightDevSpin_->setEnabled(!opened);
@@ -423,6 +440,8 @@ void AcquisitionTab::setDeviceOpenUI(bool opened) {
     rightFolderEdit_->setEnabled(!opened);
     refreshBtn_->setEnabled(!opened);
     if (!opened) {
+        stopRecord();  // 设备关闭：连续存储随停（幂等）
+        if (recordBtn_->isChecked()) recordBtn_->setChecked(false);
         saveCameraBtn_->setEnabled(false);
         saveLaserBtn_->setEnabled(false);
     }
@@ -438,6 +457,101 @@ void AcquisitionTab::onFreezeFrame() {
 void AcquisitionTab::onTogglePreview(bool on) {
     previewing_ = on;
     if (on) emit statusMessage(QStringLiteral("连续预览（界面实时刷新）"));
+}
+
+// ============================================================================
+// 连续存储：全分辨率左右成对帧 → 独立写盘线程落盘
+//   点一下开始（按钮变绿），再点一下停止；与预览状态互不影响（冻结预览也在存）
+//   目录 data_in/continuous/<开始时间yyyyMMdd_HHmmss>/{left,right}/NNNNNN.png
+// ============================================================================
+void AcquisitionTab::onToggleRecord(bool on) {
+    if (on) {
+        if (recording_) return;
+        // 上一轮 writer 若还在排空收尾，此处 join（通常早已退出，瞬时返回）
+        if (recordWriter_.joinable()) recordWriter_.join();
+        recordDir_ = QStringLiteral("data_in/continuous/") +
+            QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss"));
+        QDir().mkpath(recordDir_ + QStringLiteral("/left"));
+        QDir().mkpath(recordDir_ + QStringLiteral("/right"));
+        {
+            std::lock_guard<std::mutex> lk(recordMtx_);
+            recordQueue_.clear();
+        }
+        recordWritten_ = 0;
+        recordDropped_ = 0;
+        recording_ = true;
+        recordWriter_ = std::thread([this] { recordWriterLoop(); });
+        emit statusMessage(QStringLiteral("⏺ 连续存储已开始: ") + recordDir_);
+    } else {
+        stopRecord();
+    }
+}
+
+void AcquisitionTab::stopRecord() {
+    if (!recording_.exchange(false)) return;   // 未在存储/已停止（幂等）
+    recordCv_.notify_all();
+    // 不在 UI 线程 join：剩余队列（至多 120 对全分辨率 PNG）写完可能数秒，会卡死界面。
+    // writer 线程排空后经 QueuedConnection 回报汇总；join 留给下一次 start（瞬时）与析构。
+    size_t pending = 0;
+    {
+        std::lock_guard<std::mutex> lk(recordMtx_);
+        pending = recordQueue_.size();
+    }
+    if (pending > 0) {
+        emit statusMessage(QStringLiteral("停止连续存储：后台正在写完剩余 %1 对…").arg(pending));
+    }
+}
+
+// 相机回调线程调用（setLeft/RightImage 配对成功处）：整帧克隆入队
+// （f.image 本是每帧独立拷贝，clone 再解耦队列与 m_pLeft 覆写，写盘慢也不丢数据本体）
+void AcquisitionTab::enqueueRecordPair() {
+    if (!recording_) return;
+    {
+        std::lock_guard<std::mutex> lk(recordMtx_);
+        if (recordQueue_.size() >= kRecordQueueCap) {
+            ++recordDropped_;   // 写盘跟不上：丢新帧保内存，停止时汇总提示
+            return;
+        }
+        recordQueue_.emplace_back(m_pLeft->clone(), m_pRight->clone());
+    }
+    recordCv_.notify_one();
+}
+
+// 后台写盘线程：PNG 低压缩（level 1）换写盘速度；停止后排空队列再退出
+void AcquisitionTab::recordWriterLoop() {
+    const std::vector<int> pngFast = {cv::IMWRITE_PNG_COMPRESSION, 1};
+    while (true) {
+        std::pair<cv::Mat, cv::Mat> item;
+        {
+            std::unique_lock<std::mutex> lk(recordMtx_);
+            recordCv_.wait(lk, [this] { return !recording_ || !recordQueue_.empty(); });
+            if (recordQueue_.empty()) {
+                if (!recording_) break;   // 已停止且队列排空
+                continue;
+            }
+            item = std::move(recordQueue_.front());
+            recordQueue_.pop_front();
+        }
+        const QString n = QString::number(recordWritten_).rightJustified(6, '0');
+        cv::imwrite((recordDir_ + QStringLiteral("/left/")  + n + QStringLiteral(".png")).toStdString(),
+                    item.first, pngFast);
+        cv::imwrite((recordDir_ + QStringLiteral("/right/") + n + QStringLiteral(".png")).toStdString(),
+                    item.second, pngFast);
+        ++recordWritten_;
+    }
+    // 排空收尾：汇总经 singleShot 投递回 UI 线程（context=this，对象已销毁则自动丢弃；
+    // Qt5.9 无 invokeMethod functor+connectionType 重载，故用 singleShot 等价实现）
+    const int written = recordWritten_;
+    int dropped = 0;
+    {
+        std::lock_guard<std::mutex> lk(recordMtx_);
+        dropped = recordDropped_;
+    }
+    const QString dir = recordDir_;
+    QTimer::singleShot(0, this, [this, written, dropped, dir] {
+        emit statusMessage(QStringLiteral("⏹ 连续存储结束: %1（已写 %2 对，丢弃 %3 对）")
+                               .arg(dir).arg(written).arg(dropped));
+    });
 }
 
 void AcquisitionTab::onSaveCamera() {
@@ -652,6 +766,7 @@ void AcquisitionTab::setLeftImage(cv::Mat& left, uint64_t id) {
     *m_pLeft = left;
     m_iLeftId = id;
     if (m_iLeftId == m_iRightId) {
+        enqueueRecordPair();   // 连续存储：配对整帧入队（与预览刷新互不影响）
         cv::Mat reducedLeft, reducedRight;
         cv::resize(*m_pLeft, reducedLeft, cv::Size(), 0.25, 0.25, cv::INTER_AREA);
         cv::resize(*m_pRight, reducedRight, cv::Size(), 0.25, 0.25, cv::INTER_AREA);
@@ -665,6 +780,7 @@ void AcquisitionTab::setRightImage(cv::Mat& right, uint64_t id) {
     *m_pRight = right;
     m_iRightId = id;
     if (m_iLeftId == m_iRightId) {
+        enqueueRecordPair();   // 连续存储：配对整帧入队（与预览刷新互不影响）
         cv::Mat reducedLeft, reducedRight;
         cv::resize(*m_pLeft, reducedLeft, cv::Size(), 0.25, 0.25, cv::INTER_AREA);
         cv::resize(*m_pRight, reducedRight, cv::Size(), 0.25, 0.25, cv::INTER_AREA);
