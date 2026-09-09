@@ -696,10 +696,19 @@ void AcquisitionTab::onStartScanner() {
     ScannerParams p;
     p.freq       = freqSlider_->value();
     p.background = bgLightSlider_->value();
-    // 模式 0 = 仅补光（相机标定）→ 激光关（laser=0）
-    // 模式 1 = 激光+补光（激光标定）→ 用滑块值
+    // 模式 → N10 四管开关（260831 协议，一对一映射）：
+    //   0=仅标志点 → 四管全关（T0 V0 C0 D0，仅补光，相机标定）
+    //   1=左斜 → 仅 T1；2=右斜 → 仅 V1；3=精细 → 仅 C1；4=深孔 → 仅 D1
+    // 协议语义：已开启的管按 T→V→C→D 轮流点亮，单开一管即固定该激光线
     int mode = scannerModeCbx_->currentData().toInt();
-    p.laser = (mode >= 1) ? laserSlider_->value() : 0;   // 四类激光模式协议暂同（下位机未区分）
+    p.laser = laserSlider_->value();
+    switch (mode) {
+        case 1:  p.tubeT = 1; break;
+        case 2:  p.tubeV = 1; break;
+        case 3:  p.tubeC = 1; break;
+        case 4:  p.tubeD = 1; break;
+        default: p.laser = 0; break;   // 仅标志点：激光关（四管全 0）
+    }
     scanner_->start(p);
     scannerRunning_ = true;
 

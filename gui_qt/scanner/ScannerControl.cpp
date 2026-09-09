@@ -68,26 +68,32 @@ bool ScannerControl::isOpen() const {
 }
 
 bool ScannerControl::start(const ScannerParams& p) {
-    { std::ofstream d("E:/workfold/factory_calib/debug.txt", std::ios::app); d << "scannerStart open=" << isOpen() << " freq=" << p.freq << " laser=" << p.laser << "\n"; }
+    { std::ofstream d("E:/workfold/factory_calib/debug.txt", std::ios::app); d << "scannerStart open=" << isOpen() << " freq=" << p.freq << " laser=" << p.laser
+        << " T" << p.tubeT << " V" << p.tubeV << " C" << p.tubeC << " D" << p.tubeD << "\n"; }
     if (!isOpen()) {
         notify(QStringLiteral("请先打开扫描仪串口"));
         return false;
     }
-    // 仿 on_pushButton_Start_Scanner_Clicked() 构造命令字符串
-    // 格式: "N10 H{freq} B{bg} T1 V2 L{laser};"
-    // laser<=0 → 只补光模式（激光关）: "N10 H{freq} B{bg} T1 V2 L0;"
+    // 260831 协议七参格式: "N10 H{freq} B{bg} T{t} V{v} C{c} D{d} L{laser};"
+    // T/V/C/D 四管开关：已开启者按 T→V→C→D 轮流点亮，单开一管即固定该激光线
     int laserVal = (p.laser > 0) ? p.laser : 0;
-    QString cmd = QStringLiteral("N10 H%1 B%2 T1 V2 L%3;")
+    QString cmd = QStringLiteral("N10 H%1 B%2 T%3 V%4 C%5 D%6 L%7;")
                       .arg(p.freq)
                       .arg(p.background)
+                      .arg(p.tubeT ? 1 : 0)
+                      .arg(p.tubeV ? 1 : 0)
+                      .arg(p.tubeC ? 1 : 0)
+                      .arg(p.tubeD ? 1 : 0)
                       .arg(laserVal);
     spdlog::info("[Scanner] 启动命令: {}", cmd.toStdString());
     notify(QStringLiteral("发送启动命令: %1").arg(cmd));
 
     bool ok = sendLine(cmd);
     if (ok) {
-        notify(QStringLiteral("扫描仪已启动 (freq=%1 bg=%2 laser=%3)")
-                   .arg(p.freq).arg(p.background).arg(laserVal));
+        notify(QStringLiteral("扫描仪已启动 (freq=%1 bg=%2 laser=%3 T%4 V%5 C%6 D%7)")
+                   .arg(p.freq).arg(p.background).arg(laserVal)
+                   .arg(p.tubeT ? 1 : 0).arg(p.tubeV ? 1 : 0)
+                   .arg(p.tubeC ? 1 : 0).arg(p.tubeD ? 1 : 0));
     }
     return ok;
 }
