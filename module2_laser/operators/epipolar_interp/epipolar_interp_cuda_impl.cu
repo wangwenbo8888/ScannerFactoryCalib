@@ -121,8 +121,8 @@ __global__ void __launch_bounds__(256, 4) kernelRowInterp(
     //    即两点分别紧贴极线上下、跨距不超过一个步距）
     if (fabsf(p1.x - p2.x) >= max_pt_diff) return;
     if (fabsf(p1.y - p2.y) >= max_pt_diff) return;
-    if (fabsf(p1.y - yq) >= epipolar_step) return;
-    if (fabsf(p2.y - yq) >= epipolar_step) return;
+    if (fabsf(p1.y - yq) >= max_pt_diff) return;   // 贴线容差用绝对量(1.4px), 不随 step 缩
+    if (fabsf(p2.y - yq) >= max_pt_diff) return;
 
     // 线性插值（连线与极线 y=yq 的交点）
     float t = (yq - p1.y) / (p2.y - p1.y);
