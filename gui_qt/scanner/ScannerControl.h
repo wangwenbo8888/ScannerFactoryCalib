@@ -35,8 +35,8 @@ struct ScannerParams {
     int laser      = 60;   // N10 L 激光管亮度 0-100（四管共用）
     int tubeT      = 0;    // N10 T 激光管1（左斜） 0/1
     int tubeV      = 0;    // N10 V 激光管2（右斜） 0/1
-    int tubeC      = 0;    // N10 C 激光管3（精细） 0/1
-    int tubeD      = 0;    // N10 D 激光管4（深孔） 0/1
+    int tubeC      = 0;    // N10 C 激光管3（深孔） 0/1
+    int tubeD      = 0;    // N10 D 激光管4（精细） 0/1
 };
 
 class ScannerControl {
