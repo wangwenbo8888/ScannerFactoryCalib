@@ -13,6 +13,9 @@ namespace fc::gui {
 
 ScannerControl::ScannerControl() {
     port_ = new QSerialPort();
+    // 上行接收：readyRead → onReadyRead 累积按 ';' 分帧（协议分帧符）。
+    // lambda 以 port_ 为 context，port_ 析构连接自动断；不引入 Q_OBJECT/MOC
+    QObject::connect(port_, &QSerialPort::readyRead, port_, [this] { onReadyRead(); });
 }
 
 ScannerControl::~ScannerControl() {
@@ -58,8 +61,9 @@ void ScannerControl::close() {
     if (port_ && port_->isOpen()) {
         port_->clear();
         port_->close();
+        rxBuf_.clear();
         spdlog::info("[Scanner] 串口已关闭");
-        notify(QStringLiteral("扫描仪串口已关闭"));
+        notify(QStringLiteral("串口已关闭"));
     }
 }
 
@@ -121,7 +125,27 @@ bool ScannerControl::sendLine(const QString& line) {
         spdlog::warn("[Scanner] 写入不完整: 期望 {} 实际 {}", data.size(), written);
         return false;
     }
-    return port_->waitForBytesWritten(1000);
+    if (!port_->waitForBytesWritten(1000)) return false;
+    if (onTx) onTx(line);   // 串口监视：完整写出后才上报为「已发送」
+    return true;
+}
+
+// 上行分帧：协议以 ';' 结尾分帧；缓冲跨包拼半帧，超 4KB 仍无分帧符视为垃圾丢弃
+void ScannerControl::onReadyRead() {
+    rxBuf_.append(port_->readAll());
+    int idx;
+    while ((idx = rxBuf_.indexOf(';')) >= 0) {
+        const QByteArray frame = rxBuf_.left(idx + 1);
+        rxBuf_.remove(0, idx + 1);
+        const QString s = QString::fromLatin1(frame).trimmed();
+        if (s.isEmpty()) continue;
+        spdlog::info("[Scanner] RX: {}", s.toStdString());
+        if (onRx) onRx(s);
+    }
+    if (rxBuf_.size() > 4096) {
+        spdlog::warn("[Scanner] RX 缓冲 {} 字节无分帧符，丢弃", rxBuf_.size());
+        rxBuf_.clear();
+    }
 }
 
 }  // namespace fc::gui

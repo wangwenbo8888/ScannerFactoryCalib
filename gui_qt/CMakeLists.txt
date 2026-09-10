@@ -83,6 +83,7 @@ set(GUI_SOURCES
     CalibWorker.cpp CalibWorker.h
     SpdlogBridge.cpp SpdlogBridge.h
     PreviewWidget.cpp PreviewWidget.h
+    SerialMonitorDialog.cpp SerialMonitorDialog.h
     ResultView.cpp ResultView.h
     gui_common.cpp gui_common.h
     camera/ICameraSource.cpp camera/ICameraSource.h

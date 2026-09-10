@@ -13,6 +13,9 @@
 // 扫描仪硬件收到 N10 启动后，电机+激光运转，同时在 Line2 上发硬件触发脉冲，
 // 此时 GalaxyCameraSource 的相机才能拿到帧（TriggerSource=Line2）。
 //
+// 上行接收（G01/G02/G03）：readyRead 累积缓冲按 ';' 分帧 → onRx 回调
+// （串口监视显示；后续协议解析如需消费 G 帧，也从此入口接）。
+//
 // 注: 不用 Q_OBJECT/signals，避免 AUTOMOC 配置问题；用 std::function 回调。
 // =============================================================================
 
@@ -43,6 +46,9 @@ public:
 
     // 状态消息回调（替代 Qt signal，避免 MOC 依赖）
     std::function<void(const QString&)> onStatus;
+    // 串口监视回调：onTx=下行帧完整写入串口后（sendLine 成功）；onRx=收到上行完整 ';' 帧
+    std::function<void(const QString&)> onTx;
+    std::function<void(const QString&)> onRx;
 
     // 枚举系统所有可用 COM 口
     static QStringList availablePorts();
@@ -62,9 +68,11 @@ public:
 
 private:
     bool sendLine(const QString& line);
+    void onReadyRead();       // 串口可读：累积缓冲、按 ';' 切帧回调 onRx
     void notify(const QString& msg) { if (onStatus) onStatus(msg); }
 
     QSerialPort* port_ = nullptr;
+    QByteArray rxBuf_;        // 上行接收缓冲（跨 readyRead 拼半帧）
 };
 
 }  // namespace fc::gui

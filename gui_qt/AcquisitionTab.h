@@ -26,6 +26,7 @@ namespace fc::gui {
 class PreviewWidget;
 class StereoCameraRig;
 class ScannerControl;
+class SerialMonitorDialog;
 
 // 图像采集 tab：双相机点击抓拍 + 显示 + 保存。
 // 不做实时预览（用户眼睛反应不过来），仅在用户点击"抓拍"时取一帧。
@@ -39,6 +40,9 @@ signals:
     void statusMessage(QString msg);
     // 照搬 LeadScanK2：左右配对后 emit updateImages(QImage,QImage)，QueuedConnection 到 onUpdateImages
     void updateImages(QImage left, QImage right);
+    // 串口监视：上位机↓发送 / 下位机↑返回帧（ScannerControl onTx/onRx 转发）
+    void serialTx(QString frame);
+    void serialRx(QString frame);
 
 private slots:
     void onRefreshDevices();
@@ -131,6 +135,10 @@ private:
     QLabel*      bgValLbl_         = nullptr;
     QLabel*      laserValLbl_      = nullptr;
     std::unique_ptr<ScannerControl> scanner_;
+
+    // —— 串口通讯监视（开机自动弹出的 TX/RX 弹窗）——
+    SerialMonitorDialog* monitor_       = nullptr;
+    QPushButton*         serialMonitorBtn_ = nullptr;
 
     // —— 显示 ——
     PreviewWidget* leftPreview_  = nullptr;

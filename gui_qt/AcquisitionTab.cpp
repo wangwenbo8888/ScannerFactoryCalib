@@ -1,5 +1,6 @@
 #include "AcquisitionTab.h"
 #include "PreviewWidget.h"
+#include "SerialMonitorDialog.h"
 #include "gui_common.h"
 #include "camera/ICameraSource.h"
 #include "camera/StereoCameraRig.h"
@@ -160,6 +161,8 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
     scannerStopBtn_->setEnabled(false);
     scanRow1->addWidget(scannerStartBtn_);
     scanRow1->addWidget(scannerStopBtn_);
+    serialMonitorBtn_ = new QPushButton(QStringLiteral("🖥 串口监视"));
+    scanRow1->addWidget(serialMonitorBtn_);
     scanRow1->addStretch(1);
     root->addLayout(scanRow1);
 
@@ -241,6 +244,11 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
     connect(scannerOpenBtn_,  &QPushButton::clicked, this, &AcquisitionTab::onOpenCloseScanner);
     connect(scannerStartBtn_, &QPushButton::clicked, this, &AcquisitionTab::onStartScanner);
     connect(scannerStopBtn_,  &QPushButton::clicked, this, &AcquisitionTab::onStopScanner);
+    connect(serialMonitorBtn_, &QPushButton::clicked, this, [this] {
+        monitor_->show();
+        monitor_->raise();
+        monitor_->activateWindow();
+    });
     // 照搬 LeadScanK2：updateImages 配对双张，Qt::QueuedConnection
     connect(this, SIGNAL(updateImages(QImage,QImage)), this, SLOT(onUpdateImages(QImage,QImage)), Qt::QueuedConnection);
     connect(freqSlider_,      &QSlider::valueChanged, this, [this](int v){
@@ -302,6 +310,15 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
     m_iIndex = 0;
     // 用回调代替 Qt signal（避开 ScannerControl 的 MOC 依赖问题）
     scanner_->onStatus = [this](const QString& msg) { emit statusMessage(msg); };
+    // 串口监视：下行/上行帧转发为 Qt 信号（SerialMonitorDialog 显示）
+    scanner_->onTx = [this](const QString& frame) { emit serialTx(frame); };
+    scanner_->onRx = [this](const QString& frame) { emit serialRx(frame); };
+
+    // 串口通讯监视弹窗：随软件打开自动弹出（非模态，不挡主界面操作），
+    // 关掉后可点「🖥 串口监视」重开
+    monitor_ = new SerialMonitorDialog(this);
+    connect(this, &AcquisitionTab::serialTx, monitor_, &SerialMonitorDialog::appendTx);
+    connect(this, &AcquisitionTab::serialRx, monitor_, &SerialMonitorDialog::appendRx);
 
     onRefreshDevices();
     onRefreshComPorts();
@@ -311,7 +328,10 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
     // 开机自动：开串口 → 开设备（注册帧回调）。
     // 扫描仪启动留给用户点（onStartScanner 里发 N10 + 自动进预览）。
     // 延迟到事件循环启动后执行，避免在构造函数里阻塞 UI
-    QTimer::singleShot(0, this, [this] { autoStart(); });
+    QTimer::singleShot(0, this, [this] {
+        monitor_->show();   // 串口监视弹窗随软件打开自动弹出
+        autoStart();
+    });
 }
 
 AcquisitionTab::~AcquisitionTab() {
