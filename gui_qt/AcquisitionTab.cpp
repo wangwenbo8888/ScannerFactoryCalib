@@ -113,7 +113,7 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
     saveCameraBtn_->setEnabled(false);
     saveLaserBtn_->setEnabled(false);
     exposureSpin_ = new QDoubleSpinBox;
-    exposureSpin_->setRange(10.0, 1e7); exposureSpin_->setValue(10000.0);
+    exposureSpin_->setRange(10.0, 1e7); exposureSpin_->setValue(2000.0);
     exposureSpin_->setSuffix(QStringLiteral(" μs"));
     exposureSpin_->setDecimals(0);
     gainSpin_ = new QDoubleSpinBox;
