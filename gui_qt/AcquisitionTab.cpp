@@ -34,6 +34,7 @@
 #include <spdlog/spdlog.h>
 #include <QTransform>
 #include <atomic>
+#include <chrono>
 #include <memory>
 
 namespace fc::gui {
@@ -41,6 +42,9 @@ namespace fc::gui {
 namespace {
 // 连续存储待写队列上限（左右成对帧）。写盘跟不上时丢新帧，防止内存无限增长
 constexpr size_t kRecordQueueCap = 120;
+// 预览 emit 最小间隔（ns，≈30fps）：120fps 全量 QPixmap 转换+setPixmap 会吃满 UI
+// 线程；录制不受限频影响
+constexpr int64_t kPreviewMinIntervalNs = 33'000'000;
 }
 
 AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
@@ -190,6 +194,14 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
     laserValLbl_->setMinimumWidth(32);
     scanRow2->addWidget(laserSlider_, 1);
     scanRow2->addWidget(laserValLbl_);
+
+    // 下位机 4 路温度（G02@1Hz）：随串口打开常显，与扫描启停无关
+    tempLbl_ = new QLabel(QStringLiteral("温度 --"));
+    tempLbl_->setStyleSheet("color:#888;");
+    tempLbl_->setToolTip(QStringLiteral(
+        "下位机 G02 温度回传（N12 T1000 = 1Hz）。A/B/C/D 四路传感器位置语义见下位机资料；"
+        "串口关闭后停止刷新。"));
+    scanRow2->addWidget(tempLbl_);
     root->addLayout(scanRow2);
 
     // 打开/关闭设备 + 曝光/增益/旋转 行移至滑动条下方
@@ -222,6 +234,12 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
     saveRow->addWidget(saveCameraBtn_);
     saveRow->addWidget(saveLaserBtn_);
     saveRow->addStretch(1);
+    fpsLbl_ = new QLabel(QStringLiteral("fps L:- R:- pair:- | 丢帧 L:-(?) R:-(?)"));
+    fpsLbl_->setStyleSheet("color:#888;");
+    fpsLbl_->setToolTip(QStringLiteral(
+        "丢帧 = frameID 跳变检测到的真丢失（相机缓冲/USB 传输环节）。格式：每秒(累计)。\n"
+        "判读：丢帧>0 而 fps 低 → 传输/带宽丢帧；丢帧=0 而 fps<设定 → 触发侧没给够脉冲。"));
+    saveRow->addWidget(fpsLbl_);
     snapCountLbl_ = new QLabel(QStringLiteral("相机: 0 张    激光: 0 pose"));
     saveRow->addWidget(snapCountLbl_);
     root->addLayout(saveRow);
@@ -301,6 +319,66 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
         emit statusMessage(QStringLiteral("增益已下发: %1 dB").arg(db, 0, 'f', 2));
     });
 
+    // 连续存储心跳（UI 线程，1s）：每 5s 回报「已写/待写/丢弃」；3 秒无配对帧报警——
+    // 旧版配对死锁/相机不出图时整场 0 张且静默，用户无从得知（2026-09-27 修复）
+    recordHeartbeat_ = new QTimer(this);
+    recordHeartbeat_->setInterval(1000);
+    connect(recordHeartbeat_, &QTimer::timeout, this, [this] {
+        if (!recording_.load()) { recordHeartbeat_->stop(); return; }
+        ++heartbeatTicks_;
+        const int64_t fed = pairCount_.load();
+        if (fed != lastFedPairs_) {
+            lastFedPairs_ = fed;
+            starvedTicks_ = 0;
+        } else {
+            ++starvedTicks_;
+            if (starvedTicks_ == 3 || starvedTicks_ % 10 == 0) {
+                emit statusMessage(QStringLiteral(
+                    "⚠ 连续存储：%1 秒未收到左右配对帧（相机未出图/左右未配对），"
+                    "本次可能存不到图，建议「■ 停止扫描仪」后重新启动").arg(starvedTicks_));
+            }
+        }
+        if (heartbeatTicks_ % 5 == 0) {
+            size_t queued = 0; int dropped = 0;
+            {
+                std::lock_guard<std::mutex> lk(recordMtx_);
+                queued = recordQueue_.size();
+                dropped = recordDropped_;
+            }
+            emit statusMessage(QStringLiteral("⏺ 录制中: 已写 %1 对 | 待写 %2 | 丢弃 %3")
+                                   .arg(recordWritten_.load()).arg(queued).arg(dropped));
+        }
+    });
+
+    // 帧率统计（1s 差分）：相机回调累计计数，UI 线程差分上屏。常开于设备打开期间
+    // （含未启动扫描仪/预览冻结/录制中），L/R 单机帧率一眼分辨「单边不出图」，
+    // pair 为左右配对速率（配对死锁时 L/R 有值而 pair=0，一目了然）
+    fpsTimer_ = new QTimer(this);
+    fpsTimer_->setInterval(1000);
+    connect(fpsTimer_, &QTimer::timeout, this, [this] {
+        const int64_t l = leftFrames_.load();
+        const int64_t r = rightFrames_.load();
+        const int64_t p = pairCount_.load();
+        const int64_t ld = leftDropped_.load();
+        const int64_t rd = rightDropped_.load();
+        const int64_t lf = l - lastLeftFrames_;
+        const int64_t rf = r - lastRightFrames_;
+        const int64_t pf = p - lastPairCount_;
+        fpsLbl_->setText(QStringLiteral("fps L:%1 R:%2 pair:%3 | 丢帧 L:%4(%5) R:%6(%7)")
+                             .arg(lf).arg(rf).arg(pf)
+                             .arg(ld - lastLeftDropped_).arg(ld)
+                             .arg(rd - lastRightDropped_).arg(rd));
+        if (!leftBaseInfo_.isEmpty())
+            leftInfoLbl_->setText(leftBaseInfo_ + QStringLiteral("  |  %1 fps").arg(lf));
+        if (!rightBaseInfo_.isEmpty())
+            rightInfoLbl_->setText(rightBaseInfo_ + QStringLiteral("  |  %1 fps").arg(rf));
+        lastLeftFrames_ = l;
+        lastRightFrames_ = r;
+        lastPairCount_ = p;
+        lastLeftDropped_ = ld;
+        lastRightDropped_ = rd;
+    });
+
     rig_ = std::make_unique<StereoCameraRig>();
     scanner_ = std::make_unique<ScannerControl>();
     m_pLeft = new cv::Mat();
@@ -313,6 +391,13 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
     // 串口监视：下行/上行帧转发为 Qt 信号（SerialMonitorDialog 显示）
     scanner_->onTx = [this](const QString& frame) { emit serialTx(frame); };
     scanner_->onRx = [this](const QString& frame) { emit serialRx(frame); };
+    // G02 温度（主线程事件循环回调，直接刷标签；1Hz 打一条日志留档）
+    scanner_->onTemp = [this](float a, float b, float c, float d) {
+        tempLbl_->setText(QStringLiteral("温度 A:%1 B:%2 C:%3 D:%4 °C")
+                              .arg(a, 0, 'f', 1).arg(b, 0, 'f', 1)
+                              .arg(c, 0, 'f', 1).arg(d, 0, 'f', 1));
+        spdlog::info("[Scanner] G02 温度 A:{:.1f} B:{:.1f} C:{:.1f} D:{:.1f}", a, b, c, d);
+    };
 
     // 串口通讯监视弹窗：随软件打开自动弹出（非模态，不挡主界面操作），
     // 关掉后可点「🖥 串口监视」重开
@@ -417,17 +502,24 @@ void AcquisitionTab::onOpenClose() {
     if (auto* L = rig_->left()) {
         if (L->capability().exposureUs) L->setExposureUs(exposureSpin_->value());
         if (L->capability().gainDb)     L->setGainDb(gainSpin_->value());
-        leftInfoLbl_->setText(QString::fromStdString(L->displayName()) +
-            QStringLiteral("  %1×%2").arg(L->width()).arg(L->height()));
+        leftBaseInfo_ = QString::fromStdString(L->displayName()) +
+            QStringLiteral("  %1×%2").arg(L->width()).arg(L->height());
+        leftInfoLbl_->setText(leftBaseInfo_);
     }
     if (auto* R = rig_->right()) {
         if (R->capability().exposureUs) R->setExposureUs(exposureSpin_->value());
         if (R->capability().gainDb)     R->setGainDb(gainSpin_->value());
-        rightInfoLbl_->setText(QString::fromStdString(R->displayName()) +
-            QStringLiteral("  %1×%2").arg(R->width()).arg(R->height()));
+        rightBaseInfo_ = QString::fromStdString(R->displayName()) +
+            QStringLiteral("  %1×%2").arg(R->width()).arg(R->height());
+        rightInfoLbl_->setText(rightBaseInfo_);
     }
     // 照搬 LeadScanK2：回调线程调 setLeftImage/setRightImage（内部配对后 emit updateImages）
     rig_->setLeftFrameCallback([this](const CameraFrame& f) {
+        ++leftFrames_;   // 帧率统计：本机累计
+        // 丢帧检测：frameID 跳号 = 中间帧在相机缓冲/USB 传输环节丢失（ID 回退=流重开，重置基线）
+        if (leftLastId_ >= 0 && f.frameIndex > leftLastId_ + 1)
+            leftDropped_ += f.frameIndex - leftLastId_ - 1;
+        leftLastId_ = f.frameIndex;
         cv::Mat img = f.image;
         if (leftRotateChk_ && leftRotateChk_->isChecked() && !img.empty()) {
             cv::rotate(img, img, cv::ROTATE_180);
@@ -436,6 +528,11 @@ void AcquisitionTab::onOpenClose() {
         setLeftImage(img, static_cast<uint64_t>(f.frameIndex));
     });
     rig_->setRightFrameCallback([this](const CameraFrame& f) {
+        ++rightFrames_;   // 帧率统计：本机累计
+        // 丢帧检测：同左
+        if (rightLastId_ >= 0 && f.frameIndex > rightLastId_ + 1)
+            rightDropped_ += f.frameIndex - rightLastId_ - 1;
+        rightLastId_ = f.frameIndex;
         cv::Mat img = f.image;
         if (rightRotateChk_ && rightRotateChk_->isChecked() && !img.empty()) {
             cv::rotate(img, img, cv::ROTATE_180);
@@ -459,7 +556,19 @@ void AcquisitionTab::setDeviceOpenUI(bool opened) {
     leftFolderEdit_->setEnabled(!opened);
     rightFolderEdit_->setEnabled(!opened);
     refreshBtn_->setEnabled(!opened);
-    if (!opened) {
+    if (opened) {
+        // 帧率统计开表：快照对齐当前计数（首个 1s 差分从现在起算，不吃历史累计）
+        lastLeftFrames_ = leftFrames_.load();
+        lastRightFrames_ = rightFrames_.load();
+        lastPairCount_ = pairCount_.load();
+        // 丢帧检测开表：累计清零、frameID 基线待定（首帧建立基线）
+        leftDropped_ = 0;  rightDropped_ = 0;
+        leftLastId_ = -1;  rightLastId_ = -1;
+        lastLeftDropped_ = 0;  lastRightDropped_ = 0;
+        fpsTimer_->start();
+    } else {
+        fpsTimer_->stop();
+        fpsLbl_->setText(QStringLiteral("fps L:- R:- pair:- | 丢帧 L:-(?) R:-(?)"));
         stopRecord();  // 设备关闭：连续存储随停（幂等）
         if (recordBtn_->isChecked()) recordBtn_->setChecked(false);
         saveCameraBtn_->setEnabled(false);
@@ -501,6 +610,11 @@ void AcquisitionTab::onToggleRecord(bool on) {
         recordDropped_ = 0;
         recording_ = true;
         recordWriter_ = std::thread([this] { recordWriterLoop(); });
+        // 心跳：进度回报 + 断流报警（基线取当前 pairCount_，断流按差值判定）
+        lastFedPairs_ = pairCount_.load();
+        starvedTicks_ = 0;
+        heartbeatTicks_ = 0;
+        recordHeartbeat_->start();
         emit statusMessage(QStringLiteral("⏺ 连续存储已开始: ") + recordDir_);
     } else {
         stopRecord();
@@ -509,6 +623,7 @@ void AcquisitionTab::onToggleRecord(bool on) {
 
 void AcquisitionTab::stopRecord() {
     if (!recording_.exchange(false)) return;   // 未在存储/已停止（幂等）
+    recordHeartbeat_->stop();
     recordCv_.notify_all();
     // 不在 UI 线程 join：剩余队列（至多 120 对全分辨率 PNG）写完可能数秒，会卡死界面。
     // writer 线程排空后经 QueuedConnection 回报汇总；join 留给下一次 start（瞬时）与析构。
@@ -522,9 +637,10 @@ void AcquisitionTab::stopRecord() {
     }
 }
 
-// 相机回调线程调用（setLeft/RightImage 配对成功处）：整帧克隆入队
-// （f.image 本是每帧独立拷贝，clone 再解耦队列与 m_pLeft 覆写，写盘慢也不丢数据本体）
-void AcquisitionTab::enqueueRecordPair() {
+// 相机回调线程调用（配对成功处）：入队已克隆的私有整帧。
+// 克隆在 pairMtx_ 内完成（见 setLeft/RightImage），此处只入队/满队丢弃，
+// 不再读 m_pLeft/m_pRight——顺带消除旧版「入队 clone 与对侧换帧并发」的竞态。
+void AcquisitionTab::enqueueRecordPair(cv::Mat left, cv::Mat right) {
     if (!recording_) return;
     {
         std::lock_guard<std::mutex> lk(recordMtx_);
@@ -532,7 +648,7 @@ void AcquisitionTab::enqueueRecordPair() {
             ++recordDropped_;   // 写盘跟不上：丢新帧保内存，停止时汇总提示
             return;
         }
-        recordQueue_.emplace_back(m_pLeft->clone(), m_pRight->clone());
+        recordQueue_.emplace_back(std::move(left), std::move(right));
     }
     recordCv_.notify_one();
 }
@@ -552,7 +668,7 @@ void AcquisitionTab::recordWriterLoop() {
             item = std::move(recordQueue_.front());
             recordQueue_.pop_front();
         }
-        const QString n = QString::number(recordWritten_).rightJustified(6, '0');
+        const QString n = QString::number(recordWritten_.load()).rightJustified(6, '0');
         cv::imwrite((recordDir_ + QStringLiteral("/left/")  + n + QStringLiteral(".png")).toStdString(),
                     item.first, pngFast);
         cv::imwrite((recordDir_ + QStringLiteral("/right/") + n + QStringLiteral(".png")).toStdString(),
@@ -561,7 +677,7 @@ void AcquisitionTab::recordWriterLoop() {
     }
     // 排空收尾：汇总经 singleShot 投递回 UI 线程（context=this，对象已销毁则自动丢弃；
     // Qt5.9 无 invokeMethod functor+connectionType 重载，故用 singleShot 等价实现）
-    const int written = recordWritten_;
+    const int written = recordWritten_.load();
     int dropped = 0;
     {
         std::lock_guard<std::mutex> lk(recordMtx_);
@@ -688,6 +804,7 @@ void AcquisitionTab::onOpenCloseScanner() {
         scannerStopBtn_->setEnabled(false);
         comPortCbx_->setEnabled(true);
         comRefreshBtn_->setEnabled(true);
+        tempLbl_->setText(QStringLiteral("温度 --"));
         return;
     }
     QString port = comPortCbx_->currentText();
@@ -701,6 +818,11 @@ void AcquisitionTab::onOpenCloseScanner() {
         scannerStopBtn_->setEnabled(true);
         comPortCbx_->setEnabled(false);
         comRefreshBtn_->setEnabled(false);
+        // 开口即开温度回传：N12 T1000（1Hz G02 四路）。<5ms 会压爆 115200 串口
+        // （协议 D9 结论）；显示用途 1Hz 足够，且与扫描启停无关、常显
+        if (!scanner_->setTempReportPeriod(1000)) {
+            emit statusMessage(QStringLiteral("警告：温度回传周期设置失败（N12 T1000）"));
+        }
     }
 }
 
@@ -729,20 +851,28 @@ void AcquisitionTab::onStartScanner() {
         case 4:  p.tubeC = 1; break;   // 深孔 → C 管
         default: p.laser = 0; break;   // 仅标志点：激光关（四管全 0）
     }
+    // 布防顺序关键（2026-09-27 修复）：先布防相机、后发 N10。
+    // 旧顺序先发 N10 电机立刻转，相机左右布防有数~数十 ms 间隙（含两次 OpenStream），
+    // 间隙内来一个触发脉冲只有一侧拍到 → 左右 frameID 从此永久差 1 → 配对死锁
+    // （连续存储整场 0 张的根因之一）。现在脉冲到来时两相机必然都已就绪。
+    bool camReady = true;
+    if (rig_ && rig_->isOpen()) {
+        if (rig_->isAcquiring()) rig_->stopAcquisition();  // 防重复 StartGrab/Register
+        camReady = rig_->startAcquisition();               // 两相机全部 arm + AcquisitionStart
+    }
+
+    // 照搬 LeadScanK2 on_pushButton_Start_Scanner_Clicked：直接 start（N10），不先 stop。
+    // 先 stop(N11)+start(N10) 连续发会导致 MCU 偶发不启动（第一次稳定、后续偶发的根因）。
+    // 如需停再启，由用户分别点「停止」「启动」（秒级间隔），不在一次点击里连发。
     scanner_->start(p);
     scannerRunning_ = true;
 
-    // 启动相机采集：注册 SDK 回调，Line2 硬件触发脉冲来即出帧 → 自动进入实时预览。
-    // 回调在 SDK 线程 emit frameArrived，queued 投递到主线程 onFrameArrived 刷新。
-    if (rig_ && rig_->isOpen()) {
-        if (rig_->isAcquiring()) rig_->stopAcquisition();  // 防重复 StartGrab/Register
-        if (rig_->startAcquisition()) {
-            previewing_ = true;
-            previewBtn_->setChecked(true);   // 默认连续预览
-            emit statusMessage(QStringLiteral("实时预览已开启（连续预览，回调驱动刷新）"));
-        } else {
-            emit statusMessage(QStringLiteral("警告：相机启动采集失败，无法预览"));
-        }
+    if (camReady) {
+        previewing_ = true;
+        previewBtn_->setChecked(true);   // 默认连续预览
+        emit statusMessage(QStringLiteral("实时预览已开启（连续预览，回调驱动刷新）"));
+    } else if (rig_ && rig_->isOpen()) {
+        emit statusMessage(QStringLiteral("警告：相机启动采集失败，无法预览"));
     }
 
     if (mode == 0) {
@@ -790,32 +920,72 @@ QImage convertMattoQImage(cv::Mat& mat) {
 }
 }  // namespace
 
-// 照搬 LeadScanK2 setLeftImage（SDK 回调线程调用）：左右按 id 配对后 emit updateImages
+// 左右帧配对（SDK 回调线程调用）：轮次制——左右各有未消费新帧即成一对，后到者触发。
+// 2026-09-27 修复：旧版照搬 LeadScanK2 用 frameID 严格相等（m_iLeftId==m_iRightId），
+// 单边多一帧（左右布防间隙抢到触发脉冲 / ok=0 失败帧占号 / 单边丢帧）后 ID 永久错位 1，
+// == 从此永不成立 → 预览冻结 + 连续存储整场 0 张且无报错。轮次制错位自愈，
+// 最坏损失一帧新鲜度。配对瞬间在 pairMtx_ 内克隆私有整帧（录制与预览共用，与对侧
+// 换帧互不干扰）。
+// 预览 emit 限频 ~30fps（120fps 全量 QPixmap 转换+setPixmap 会吃满 UI 线程）；
+// 录制不受限频影响。限频窗口且未录制时整帧克隆直接省掉（回调路径最大开销削减点）。
 void AcquisitionTab::setLeftImage(cv::Mat& left, uint64_t id) {
-    *m_pLeft = left;
-    m_iLeftId = id;
-    if (m_iLeftId == m_iRightId) {
-        enqueueRecordPair();   // 连续存储：配对整帧入队（与预览刷新互不影响）
+    cv::Mat pairL, pairR;
+    bool doPreview = false;
+    {
+        std::lock_guard<std::mutex> lk(pairMtx_);
+        *m_pLeft = left;
+        m_iLeftId = id;
+        leftFresh_ = true;
+        if (!rightFresh_) return;
+        const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        doPreview = nowNs - lastPreviewNs_ >= kPreviewMinIntervalNs;
+        if (doPreview || recording_.load()) {
+            pairL = m_pLeft->clone();
+            pairR = m_pRight->clone();
+        }
+        if (doPreview) lastPreviewNs_ = nowNs;
+        leftFresh_ = rightFresh_ = false;
+    }
+    ++pairCount_;
+    if (doPreview) {
         cv::Mat reducedLeft, reducedRight;
-        cv::resize(*m_pLeft, reducedLeft, cv::Size(), 0.25, 0.25, cv::INTER_AREA);
-        cv::resize(*m_pRight, reducedRight, cv::Size(), 0.25, 0.25, cv::INTER_AREA);
+        cv::resize(pairL, reducedLeft, cv::Size(), 0.25, 0.25, cv::INTER_AREA);
+        cv::resize(pairR, reducedRight, cv::Size(), 0.25, 0.25, cv::INTER_AREA);
         emit updateImages(QPixmap::fromImage(convertMattoQImage(reducedLeft)).toImage(),
                           QPixmap::fromImage(convertMattoQImage(reducedRight)).toImage());
     }
+    if (!pairL.empty()) enqueueRecordPair(std::move(pairL), std::move(pairR));
 }
 
-// 照搬 LeadScanK2 setRightImage
 void AcquisitionTab::setRightImage(cv::Mat& right, uint64_t id) {
-    *m_pRight = right;
-    m_iRightId = id;
-    if (m_iLeftId == m_iRightId) {
-        enqueueRecordPair();   // 连续存储：配对整帧入队（与预览刷新互不影响）
+    cv::Mat pairL, pairR;
+    bool doPreview = false;
+    {
+        std::lock_guard<std::mutex> lk(pairMtx_);
+        *m_pRight = right;
+        m_iRightId = id;
+        rightFresh_ = true;
+        if (!leftFresh_) return;
+        const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        doPreview = nowNs - lastPreviewNs_ >= kPreviewMinIntervalNs;
+        if (doPreview || recording_.load()) {
+            pairL = m_pLeft->clone();
+            pairR = m_pRight->clone();
+        }
+        if (doPreview) lastPreviewNs_ = nowNs;
+        leftFresh_ = rightFresh_ = false;
+    }
+    ++pairCount_;
+    if (doPreview) {
         cv::Mat reducedLeft, reducedRight;
-        cv::resize(*m_pLeft, reducedLeft, cv::Size(), 0.25, 0.25, cv::INTER_AREA);
-        cv::resize(*m_pRight, reducedRight, cv::Size(), 0.25, 0.25, cv::INTER_AREA);
+        cv::resize(pairL, reducedLeft, cv::Size(), 0.25, 0.25, cv::INTER_AREA);
+        cv::resize(pairR, reducedRight, cv::Size(), 0.25, 0.25, cv::INTER_AREA);
         emit updateImages(QPixmap::fromImage(convertMattoQImage(reducedLeft)).toImage(),
                           QPixmap::fromImage(convertMattoQImage(reducedRight)).toImage());
     }
+    if (!pairL.empty()) enqueueRecordPair(std::move(pairL), std::move(pairR));
 }
 
 // 照搬 LeadScanK2 onUpdateImages（主线程）：setPixmap

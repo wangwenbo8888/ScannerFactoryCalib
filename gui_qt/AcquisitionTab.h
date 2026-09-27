@@ -81,8 +81,8 @@ private:
     void applyGuiRotation(cv::Mat& leftImg, cv::Mat& rightImg);
 
     // —— 连续存储（独立写盘线程，全分辨率左右成对帧）——
-    void stopRecord();             // 停止存储并 join 写盘线程（幂等）
-    void enqueueRecordPair();      // 回调线程：配对整帧克隆入队
+    void stopRecord();             // 停止存储（幂等；join 留给下次 start 与析构）
+    void enqueueRecordPair(cv::Mat left, cv::Mat right);  // 回调线程：已克隆的私有整帧入队
     void recordWriterLoop();       // 写盘线程主循环
 
     // 开机自动流程：开串口 → 启动扫描仪 → 开设备 → 进实时预览
@@ -118,8 +118,12 @@ private:
     std::condition_variable recordCv_;
     std::deque<std::pair<cv::Mat, cv::Mat>> recordQueue_;  // 待写盘左右成对帧
     QString               recordDir_;        // 本次存储目录（data_in/continuous/<开始时间>）
-    int                   recordWritten_ = 0;  // 已写盘对数（仅 writer 线程）
+    std::atomic<int>      recordWritten_ = {0};  // 已写盘对数（writer 写，心跳/UI 读）
     int                   recordDropped_ = 0;  // 队列满丢弃对数（recordMtx_ 保护）
+    QTimer*               recordHeartbeat_  = nullptr;  // 1s 心跳：进度回报+断流报警（UI 线程）
+    int64_t               lastFedPairs_    = 0;  // 心跳上轮 pairCount_ 快照（断流检测）
+    int                   starvedTicks_    = 0;  // 连续无新配对帧的秒数
+    int                   heartbeatTicks_  = 0;  // 心跳累计 tick（每 5s 回报一次进度）
 
     // —— 扫描仪硬件控制（串口）——
     QComboBox*   comPortCbx_       = nullptr;
@@ -134,6 +138,7 @@ private:
     QLabel*      freqValLbl_       = nullptr;
     QLabel*      bgValLbl_         = nullptr;
     QLabel*      laserValLbl_      = nullptr;
+    QLabel*      tempLbl_          = nullptr;   // 下位机 4 路温度（G02@1Hz，随串口常显）
     std::unique_ptr<ScannerControl> scanner_;
 
     // —— 串口通讯监视（开机自动弹出的 TX/RX 弹窗）——
@@ -165,6 +170,35 @@ private:
     uint64_t m_iLeftId = 0;
     uint64_t m_iRightId = 0;
     uint64_t m_iIndex = 0;
+
+    // 配对改为轮次制（2026-09-27 修复「连续存储有时 0 张」）：左右各有未消费新帧即成
+    // 一对（后到者触发），不再用 frameID 严格相等。旧 == 门禁在单边多一帧（布防间隙
+    // 抢到脉冲/ok=0 失败帧占号/单边丢帧）后 ID 永久错位 → 整场 0 配对且无任何报错。
+    std::mutex pairMtx_;                    // 保护 m_pLeft/Right 换帧 + fresh 标志 + 配对克隆
+    bool leftFresh_  = false;               // 左有未消费新帧（pairMtx_）
+    bool rightFresh_ = false;               // 右有未消费新帧（pairMtx_）
+    std::atomic<int64_t> pairCount_ = {0};  // 累计配对对数（录制断流报警/帧率统计用）
+
+    // —— 帧率统计（相机回调累计计数，UI 每秒差分上屏；与预览/录制状态无关）——
+    QTimer*   fpsTimer_ = nullptr;              // 1s 差分定时器（设备打开期间常开）
+    QLabel*   fpsLbl_   = nullptr;              // 保存行小标签：fps L/R/pair
+    std::atomic<int64_t> leftFrames_  = {0};    // 左相机累计帧数（左回调线程递增）
+    std::atomic<int64_t> rightFrames_ = {0};    // 右相机累计帧数（右回调线程递增）
+    int64_t   lastLeftFrames_  = 0;             // 上秒快照（仅 UI 线程）
+    int64_t   lastRightFrames_ = 0;
+    int64_t   lastPairCount_   = 0;
+
+    // —— 丢帧检测（frameID 跳号 = 中间帧在相机缓冲/USB 传输环节真丢失）——
+    std::atomic<int64_t> leftDropped_  = {0};   // 左丢帧累计（左回调线程写）
+    std::atomic<int64_t> rightDropped_ = {0};   // 右丢帧累计（右回调线程写）
+    int64_t   leftLastId_  = -1;                // 左最近 frameID（仅左回调线程；<0=待基线）
+    int64_t   rightLastId_ = -1;                // 右最近 frameID（仅右回调线程）
+    int64_t   lastLeftDropped_  = 0;            // 上秒丢帧快照（仅 UI 线程）
+    int64_t   lastRightDropped_ = 0;
+
+    int64_t   lastPreviewNs_ = 0;               // 上次预览 emit 时刻 ns（pairMtx_；限频用）
+    QString   leftBaseInfo_;                    // 左信息栏基础文案（设备名+分辨率），fps 追加在后
+    QString   rightBaseInfo_;
 };
 
 }  // namespace fc::gui

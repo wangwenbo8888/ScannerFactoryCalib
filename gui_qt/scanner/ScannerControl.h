@@ -14,7 +14,8 @@
 // 此时 GalaxyCameraSource 的相机才能拿到帧（TriggerSource=Line2）。
 //
 // 上行接收（G01/G02/G03）：readyRead 累积缓冲按 ';' 分帧 → onRx 回调
-// （串口监视显示；后续协议解析如需消费 G 帧，也从此入口接）。
+// （串口监视显示全部帧）。其中 G02（4 路温度）已消费：parseG02 解析后经
+// onTemp 回调上报数值（260831 协议: "G02 A<t1> B<t2> C<t3> D<t4>;"）。
 //
 // 注: 不用 Q_OBJECT/signals，避免 AUTOMOC 配置问题；用 std::function 回调。
 // =============================================================================
@@ -49,6 +50,8 @@ public:
     // 串口监视回调：onTx=下行帧完整写入串口后（sendLine 成功）；onRx=收到上行完整 ';' 帧
     std::function<void(const QString&)> onTx;
     std::function<void(const QString&)> onRx;
+    // G02 温度回调：4 路摄氏度（0-100，一位小数；串口线程=主线程事件循环，可直接刷 UI）
+    std::function<void(float, float, float, float)> onTemp;
 
     // 枚举系统所有可用 COM 口
     static QStringList availablePorts();
@@ -66,9 +69,14 @@ public:
     // 停止扫描仪：发 "N11 H0;"
     bool stop();
 
+    // 设定温度回传周期（260831 协议: "N12 T<ms>;")。ms 1-1000；<5ms 会压爆
+    // 115200 串口带宽（协议 D9 结论），显示用途建议 >=500
+    bool setTempReportPeriod(int ms);
+
 private:
     bool sendLine(const QString& line);
     void onReadyRead();       // 串口可读：累积缓冲、按 ';' 切帧回调 onRx
+    void parseG02(const QString& frame);  // "G02 A.. B.. C.. D..;" → onTemp
     void notify(const QString& msg) { if (onStatus) onStatus(msg); }
 
     QSerialPort* port_ = nullptr;

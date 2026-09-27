@@ -4,6 +4,7 @@
 
 #include "ScannerControl.h"
 
+#include <QRegularExpression>
 #include <QSerialPort>
 #include <QSerialPortInfo>
 #include <spdlog/spdlog.h>
@@ -117,6 +118,16 @@ bool ScannerControl::stop() {
     return ok;
 }
 
+// 设定温度回传周期：260831 协议 "N12 T<ms>;"（G02 周期上报由此触发）
+bool ScannerControl::setTempReportPeriod(int ms) {
+    if (!isOpen()) return false;
+    if (ms < 1) ms = 1;
+    if (ms > 1000) ms = 1000;
+    QString cmd = QStringLiteral("N12 T%1;").arg(ms);
+    spdlog::info("[Scanner] 温度回传周期: {}", cmd.toStdString());
+    return sendLine(cmd);
+}
+
 bool ScannerControl::sendLine(const QString& line) {
     if (!port_ || !port_->isOpen()) return false;
     QByteArray data = line.toLocal8Bit();
@@ -130,22 +141,54 @@ bool ScannerControl::sendLine(const QString& line) {
     return true;
 }
 
-// 上行分帧：协议以 ';' 结尾分帧；缓冲跨包拼半帧，超 4KB 仍无分帧符视为垃圾丢弃
+// 上行分帧：协议以 ';' 结尾分帧；同时兼容 '\n'（'\r' 按空白剥掉）——实测下位机
+// 上行帧尾存在不带 ';' 的可能（2026-09-27 N12 已发但零 RX 帧，待 hex 诊断定位）。
+// 缓冲跨包拼半帧，超 4KB 仍无分帧符视为垃圾丢弃（附 hex 预览供协议比对）。
 void ScannerControl::onReadyRead() {
-    rxBuf_.append(port_->readAll());
-    int idx;
-    while ((idx = rxBuf_.indexOf(';')) >= 0) {
+    const QByteArray chunk = port_->readAll();
+    rxBuf_.append(chunk);
+    // 诊断：本包字节里没有任何分帧符 → 打印 hex 预览（真实帧样貌一锤定音；
+    // 2026-09-27 加，定位「串口有数据但分帧不符」，问题定位后可删）
+    if (!chunk.isEmpty() && chunk.indexOf(';') < 0 && chunk.indexOf('\n') < 0) {
+        spdlog::warn("[Scanner] RX 无分帧符字节 hex 预览: [{}]",
+                     QString::fromLatin1(rxBuf_.left(48).toHex(' ')).toStdString());
+    }
+    while (true) {
+        // 取最早出现的分帧符（';' 或 '\n'）——混合帧尾时避免跨帧误切
+        const int is = rxBuf_.indexOf(';');
+        const int in = rxBuf_.indexOf('\n');
+        if (is < 0 && in < 0) break;
+        const int idx = (is < 0) ? in : ((in < 0) ? is : qMin(is, in));
         const QByteArray frame = rxBuf_.left(idx + 1);
         rxBuf_.remove(0, idx + 1);
         const QString s = QString::fromLatin1(frame).trimmed();
         if (s.isEmpty()) continue;
         spdlog::info("[Scanner] RX: {}", s.toStdString());
+        if (s.startsWith(QStringLiteral("G02"))) parseG02(s);
         if (onRx) onRx(s);
     }
     if (rxBuf_.size() > 4096) {
-        spdlog::warn("[Scanner] RX 缓冲 {} 字节无分帧符，丢弃", rxBuf_.size());
+        spdlog::warn("[Scanner] RX 缓冲 {} 字节无分帧符，丢弃。hex 预览: [{}]",
+                     rxBuf_.size(),
+                     QString::fromLatin1(rxBuf_.left(64).toHex(' ')).toStdString());
         rxBuf_.clear();
     }
+}
+
+// G02 温度帧解析：格式 "G02 A25.3 B25.4 C26.0 D24.5;"（0-100，一位小数；
+// 字母数字间、字段间空白容忍）。解析失败静默（畸形帧不影响其余流程）。
+void ScannerControl::parseG02(const QString& s) {
+    static const QRegularExpression re(QStringLiteral(
+        "^G02\\s+A(\\d+(?:\\.\\d+)?)\\s+B(\\d+(?:\\.\\d+)?)"
+        "\\s+C(\\d+(?:\\.\\d+)?)\\s+D(\\d+(?:\\.\\d+)?)"));
+    const auto m = re.match(s);
+    if (!m.hasMatch()) {
+        spdlog::warn("[Scanner] G02 解析失败: {}", s.toStdString());
+        return;
+    }
+    if (onTemp)
+        onTemp(m.captured(1).toFloat(), m.captured(2).toFloat(),
+               m.captured(3).toFloat(), m.captured(4).toFloat());
 }
 
 }  // namespace fc::gui
