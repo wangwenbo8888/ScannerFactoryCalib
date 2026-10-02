@@ -79,6 +79,8 @@ private:
     void setDeviceOpenUI(bool opened);
     // 按用户勾选的「左/右 180°」复选框旋转图像（GUI 层处理，与 deviceId 解耦）
     void applyGuiRotation(cv::Mat& leftImg, cv::Mat& rightImg);
+    // 左右对比度滑条 → 相机源（Galaxy 逐帧 LUT）＋QSettings 持久化（261002）
+    void applyContrastFromUi();
 
     // —— 连续存储（独立写盘线程，全分辨率左右成对帧）——
     void stopRecord();             // 停止存储（幂等；join 留给下次 start 与析构）
@@ -107,6 +109,11 @@ private:
     QDoubleSpinBox* gainSpin_     = nullptr;
     QCheckBox*  leftRotateChk_    = nullptr;  // 左相机 180° 旋转
     QCheckBox*  rightRotateChk_   = nullptr;  // 右相机 180° 旋转
+    // —— 左右分置对比度（261002）——软件 LUT（-50..100，0=不调整），启动读配置文件
+    QSlider*    contrastLSlider_  = nullptr;  // 左相机对比度
+    QSlider*    contrastRSlider_  = nullptr;  // 右相机对比度
+    QLabel*     contrastLValLbl_  = nullptr;
+    QLabel*     contrastRValLbl_  = nullptr;
     bool        previewing_       = false;   // 扫描仪启动后自动进入预览态
     bool        scannerRunning_   = false;   // 扫描仪电机/激光是否已启动（N10 已发）
 

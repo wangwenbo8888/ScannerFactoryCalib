@@ -54,6 +54,11 @@ public:
     // —— 参数（仅当 CameraCapability 对应位为 true 时有效）——
     virtual void setExposureUs(double us) { (void)us; }
     virtual void setGainDb(double db) { (void)db; }
+    // 图像对比度（软件 LUT，范围 -50..100，0=不调整；与曝光/增益不同，不依赖
+    // capability 位——Galaxy 真机源逐帧 cv::LUT 变换，SDK ImageImprovment 对
+    // Mono8 实测 no-op 的软件替代，照搬主工程 261002 CameraControl 实现）。
+    // 其他源默认 no-op。
+    virtual void setContrast(int value) { (void)value; }
     virtual void setTriggerMode(bool on, int32_t src = 0) { (void)on; (void)src; }
 
     // 软触发：发一帧指令（仅 setTriggerMode(true, Software) 后有意义）。

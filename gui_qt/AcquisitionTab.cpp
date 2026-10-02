@@ -21,6 +21,7 @@
 #include <QThread>
 #include <QPixmap>
 #include <QPushButton>
+#include <QSettings>
 #include <fstream>
 #include <QCheckBox>
 #include <QSerialPortInfo>
@@ -207,6 +208,33 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
     // 打开/关闭设备 + 曝光/增益/旋转 行移至滑动条下方
     root->addLayout(ctrlRow);
 
+    // —— 左右分置对比度（261002 新增）——软件 LUT 逐帧变换（Galaxy 源内实现），
+    // 与曝光/增益（SDK 硬件参数）不同层；左/右独立调节，改即存配置文件
+    auto* contrastRow = new QHBoxLayout;
+    contrastRow->addWidget(new QLabel(QStringLiteral("对比度 左:")));
+    contrastLSlider_ = new QSlider(Qt::Horizontal);
+    contrastLSlider_->setRange(-50, 100);
+    contrastLSlider_->setValue(0);
+    contrastLSlider_->setToolTip(QStringLiteral(
+        "左相机软件对比度：output=(v−128)×factor+128，factor=1+值/100；"
+        "范围 -50~100（0.5x~2.0x），0=不调整。改动即存配置文件，启动自动读回"));
+    contrastLValLbl_ = new QLabel(QStringLiteral("0"));
+    contrastLValLbl_->setMinimumWidth(32);
+    contrastRow->addWidget(contrastLSlider_, 1);
+    contrastRow->addWidget(contrastLValLbl_);
+    contrastRow->addWidget(new QLabel(QStringLiteral("  右:")));
+    contrastRSlider_ = new QSlider(Qt::Horizontal);
+    contrastRSlider_->setRange(-50, 100);
+    contrastRSlider_->setValue(0);
+    contrastRSlider_->setToolTip(QStringLiteral(
+        "右相机软件对比度：output=(v−128)×factor+128，factor=1+值/100；"
+        "范围 -50~100（0.5x~2.0x），0=不调整。改动即存配置文件，启动自动读回"));
+    contrastRValLbl_ = new QLabel(QStringLiteral("0"));
+    contrastRValLbl_->setMinimumWidth(32);
+    contrastRow->addWidget(contrastRSlider_, 1);
+    contrastRow->addWidget(contrastRValLbl_);
+    root->addLayout(contrastRow);
+
     // —— 双预览（点采集后才显示）——
     auto* previewRow = new QHBoxLayout;
     auto* leftCol = new QVBoxLayout;
@@ -318,6 +346,26 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
             if (R->capability().gainDb) R->setGainDb(db);
         emit statusMessage(QStringLiteral("增益已下发: %1 dB").arg(db, 0, 'f', 2));
     });
+
+    // 左右分置对比度（261002）：改动即应用到相机源（Galaxy 逐帧 LUT，直显直存
+    // 均为变换后图像）＋写配置文件；启动时下方读回。设备未开时只记账，开设备
+    // 时 onOpenClose 统一下发
+    connect(contrastLSlider_, &QSlider::valueChanged, this, [this](int v) {
+        contrastLValLbl_->setText(QString::number(v));
+        applyContrastFromUi();
+    });
+    connect(contrastRSlider_, &QSlider::valueChanged, this, [this](int v) {
+        contrastRValLbl_->setText(QString::number(v));
+        applyContrastFromUi();
+    });
+    // 启动读配置文件（261002 用户口径：每次启动读左右相机对比度）——setValue
+    // 触发 valueChanged → 滑条/相机/配置文件三处对齐
+    {
+        QSettings s(QCoreApplication::applicationDirPath() + QStringLiteral("/factory_calib_gui.ini"),
+                    QSettings::IniFormat);
+        contrastLSlider_->setValue(qBound(-50, s.value("acquisition/contrastLeft", 0).toInt(), 100));
+        contrastRSlider_->setValue(qBound(-50, s.value("acquisition/contrastRight", 0).toInt(), 100));
+    }
 
     // 连续存储心跳（UI 线程，1s）：每 5s 回报「已写/待写/丢弃」；3 秒无配对帧报警——
     // 旧版配对死锁/相机不出图时整场 0 张且静默，用户无从得知（2026-09-27 修复）
@@ -471,6 +519,22 @@ void AcquisitionTab::onBrowseRightFolder() {
     if (!d.isEmpty()) rightFolderEdit_->setText(d);
 }
 
+// 左右对比度（261002）：滑条 → 相机源（Galaxy 源内逐帧 LUT；simulated/hikvision
+// 默认 no-op）＋配置文件持久化（exe 同目录 factory_calib_gui.ini）。设备未开时
+// 仅落盘，开设备时 onOpenClose 会按滑条当前值统一下发
+void AcquisitionTab::applyContrastFromUi() {
+    const int l = contrastLSlider_->value();
+    const int r = contrastRSlider_->value();
+    if (rig_ && rig_->isOpen()) {
+        if (auto* L = rig_->left())  L->setContrast(l);
+        if (auto* R = rig_->right()) R->setContrast(r);
+    }
+    QSettings s(QCoreApplication::applicationDirPath() + QStringLiteral("/factory_calib_gui.ini"),
+                QSettings::IniFormat);
+    s.setValue("acquisition/contrastLeft", l);
+    s.setValue("acquisition/contrastRight", r);
+}
+
 void AcquisitionTab::onOpenClose() {
     if (rig_->isOpen()) {
         rig_->close();
@@ -502,6 +566,7 @@ void AcquisitionTab::onOpenClose() {
     if (auto* L = rig_->left()) {
         if (L->capability().exposureUs) L->setExposureUs(exposureSpin_->value());
         if (L->capability().gainDb)     L->setGainDb(gainSpin_->value());
+        L->setContrast(contrastLSlider_->value());   // 左右分置对比度（261002，软件 LUT）
         leftBaseInfo_ = QString::fromStdString(L->displayName()) +
             QStringLiteral("  %1×%2").arg(L->width()).arg(L->height());
         leftInfoLbl_->setText(leftBaseInfo_);
@@ -509,6 +574,7 @@ void AcquisitionTab::onOpenClose() {
     if (auto* R = rig_->right()) {
         if (R->capability().exposureUs) R->setExposureUs(exposureSpin_->value());
         if (R->capability().gainDb)     R->setGainDb(gainSpin_->value());
+        R->setContrast(contrastRSlider_->value());   // 左右分置对比度（261002，软件 LUT）
         rightBaseInfo_ = QString::fromStdString(R->displayName()) +
             QStringLiteral("  %1×%2").arg(R->width()).arg(R->height());
         rightInfoLbl_->setText(rightBaseInfo_);

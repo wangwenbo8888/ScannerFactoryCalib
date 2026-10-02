@@ -72,16 +72,19 @@ public:
         std::memcpy(src.data, img->GetBuffer(),
                     static_cast<size_t>(h) * static_cast<size_t>(w));
 
+        // 对比度 LUT（先 LUT 后旋转——与主工程 CameraControl 顺序一致）
+        cv::Mat frame = owner_->applyContrastLut(src);
+
         CameraFrame f;
         f.frameIndex = static_cast<int64_t>(img->GetFrameID());  // 照搬 LeadScanK2：真实 frame id 供配对
         f.timestampNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
         if (owner_->rotate180()) {
             cv::Mat rotated;
-            cv::rotate(src, rotated, cv::ROTATE_180);
+            cv::rotate(frame, rotated, cv::ROTATE_180);
             f.image = rotated;
         } else {
-            f.image = src;
+            f.image = frame;
         }
         owner_->dispatchFrame(f);
     }
@@ -336,6 +339,33 @@ void GalaxyCameraSource::setGainDb(double db) {
     } catch (const std::exception& e) {
         spdlog::warn("[Galaxy] setGainDb 异常: {}", e.what());
     }
+}
+
+// 对比度（261002 左右分置·照搬主工程 08 CameraControl）：Galaxy SDK
+// ImageImprovment 对 Mono8 实测静默 no-op（返回 null 不变换）——软件 cv::LUT
+// 逐像素真实替代。UI 线程只写 atomic 值；LUT 懒建/值变重建仅 SDK 回调线程触碰
+void GalaxyCameraSource::setContrast(int value) {
+    if (value < -50) value = -50;   // 量程 -50..100（261002 用户口径：0.5x~2.0x）
+    if (value > 100) value = 100;
+    contrast_.store(value, std::memory_order_relaxed);
+}
+
+cv::Mat GalaxyCameraSource::applyContrastLut(const cv::Mat& src) {
+    const int ctr = contrast_.load(std::memory_order_relaxed);
+    if (ctr == 0 || src.empty()) return src;
+    if (lutContrastCached_ != ctr || contrastLut_.empty()) {
+        const double factor = 1.0 + ctr / 100.0;
+        contrastLut_ = cv::Mat(1, 256, CV_8UC1);
+        for (int i = 0; i < 256; ++i) {
+            const int v = static_cast<int>((i - 128) * factor + 128 + 0.5);
+            contrastLut_.at<uint8_t>(0, i) =
+                static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
+        }
+        lutContrastCached_ = ctr;
+    }
+    cv::Mat processed;
+    cv::LUT(src, contrastLut_, processed);
+    return processed;
 }
 
 void GalaxyCameraSource::setTriggerMode(bool on, int32_t src) {

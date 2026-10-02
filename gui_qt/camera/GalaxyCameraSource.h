@@ -33,6 +33,7 @@ public:
 
     void setExposureUs(double us) override;
     void setGainDb(double db) override;
+    void setContrast(int value) override;   // 软件对比度 LUT（-50..100，0=直通）
     void setTriggerMode(bool on, int32_t src = 0) override;
     void triggerOnce() override;
     void setFrameCallback(FrameCallback cb) override;
@@ -53,6 +54,10 @@ public:
     // 供内部 SDK 采集回调线程调用：把已组装好的 CameraFrame 推给已注册的 frameCb_。
     // 不暴露 Galaxy 类型，仅用 cv 类型。
     void dispatchFrame(const CameraFrame& f);
+
+    // 供内部 SDK 采集回调线程调用：应用对比度 LUT（懒建/值变重建，仅 SDK 线程
+    // 触碰 lut 资源）；ctr=0 或空帧直通原 Mat。返回变换后的帧
+    cv::Mat applyContrastLut(const cv::Mat& src);
 
 private:
     // Galaxy SDK 智能指针（实现文件里使用具体类型）
@@ -75,6 +80,12 @@ private:
     // SDK 采集线程上正在执行的 dispatchFrame 计数；stopAcquisition 用它等待
     // in-flight 回调退出，避免析构期间回调访问已释放的 GUI 对象。
     std::atomic<int> cbInFlight_{0};
+
+    // —— 对比度 LUT（261002 左右分置）——contrast_：UI 线程写/Sdk 线程读（atomic）；
+    // contrastLut_/lutContrastCached_：仅 SDK 采集回调线程触碰（懒建，无锁）
+    std::atomic<int> contrast_{0};
+    cv::Mat contrastLut_;
+    int lutContrastCached_ = 0;
 };
 
 }  // namespace fc::gui
