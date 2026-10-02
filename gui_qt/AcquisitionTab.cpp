@@ -242,8 +242,12 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
     // 扫描软件每次启动读该文件取 camera.contrastLeft/contrastRight（AppContext）
     exportContrastBtn_ = new QPushButton(QStringLiteral("📤 导出到扫描软件"));
     exportContrastBtn_->setToolTip(QStringLiteral(
-        "把当前左右对比度写入扫描软件的 config/camera.json（读-改-写，保留其它装机口径键，"
-        "只更新 camera.contrastLeft/contrastRight）。扫描软件每次启动读该文件自动应用。"
+        "把当前左右对比度写入 camera.json（读-改-写，保留其它装机口径键，只更新 "
+        "camera.contrastLeft/contrastRight）。扫描软件每次启动读其 exe 目录 "
+        "config\\camera.json 自动应用。\n"
+        "同机：直接选扫描软件的 config\\camera.json；\n"
+        "跨机（标定机≠扫描机）：选 U 盘/共享目录存一份，拷到扫描机扫描软件 "
+        "config\\ 下替换即可（扫描软件构建只播种不覆盖，不会冲掉此文件）。"
         "路径会记住，第二次起一键导出"));
     contrastRow->addWidget(exportContrastBtn_);
     root->addLayout(contrastRow);
@@ -582,9 +586,26 @@ void AcquisitionTab::onExportContrast() {
     }
     if (!merged && QFile::exists(path)) {
         if (QMessageBox::question(this, QStringLiteral("camera.json"),
-                QStringLiteral("目标文件不是有效 JSON——覆盖为仅含对比度两键的最小配置？")) !=
+                QStringLiteral("目标文件不是有效 JSON——覆盖为标准装机口径模板（含当前对比度）？")) !=
             QMessageBox::Yes)
             return;
+    }
+    if (!merged) {
+        // 全键模板（261002 定版：跨机整文件替换安全）——键集对齐扫描软件出厂基线
+        // config/camera.json（缺省键由扫描软件 AppContext 按内置默认补齐，行为一致）
+        QJsonObject cam;
+        cam[QStringLiteral("deviceIndexLeft")]  = 0;
+        cam[QStringLiteral("deviceIndexRight")] = 1;
+        cam[QStringLiteral("rotateRight180")]   = true;
+        cam[QStringLiteral("triggerSource")]    = QStringLiteral("Line2");
+        cam[QStringLiteral("previewFps")]       = 10;
+        cam[QStringLiteral("pairStrictFrameId")] = true;
+        root[QStringLiteral("camera")] = cam;
+        root[QStringLiteral("_说明")] = QStringLiteral(
+            "相机装机口径配置（工厂标定导出 261002）：contrastLeft/contrastRight＝厂家"
+            "标定工位调定的左右相机对比度（扫描软件逐帧 cv::LUT 变换；0=直通；正增强/"
+            "负减弱，域 [-100,100]）。整文件拷贝到扫描软件 exe 目录 config\\ 下替换即"
+            "生效（启动时读取）；扫描软件构建只播种不覆盖，不会冲掉本文件。");
     }
 
     QJsonObject cam = root.value(QStringLiteral("camera")).toObject();
