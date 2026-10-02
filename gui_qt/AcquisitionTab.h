@@ -52,6 +52,7 @@ private slots:
     void onToggleRecord(bool on);   // 连续存储开关：on=开始整帧连续存盘（独立文件夹）；off=停止收尾
     void onSaveCamera();         // 把当前【显示】帧保存到 data_in/camera/left,N.png + right,N.png
     void onSaveLaser();          // 保存到 data_in/laser/pose_NN/L_tube*.png + R_tube*.png
+    void onExportContrast();     // 左右对比度导出到扫描软件 config/camera.json（读改写合并）
     void onBrowseLeftFolder();
     void onBrowseRightFolder();
     void onSourceTypeChanged();
@@ -114,6 +115,7 @@ private:
     QSlider*    contrastRSlider_  = nullptr;  // 右相机对比度
     QLabel*     contrastLValLbl_  = nullptr;
     QLabel*     contrastRValLbl_  = nullptr;
+    QPushButton* exportContrastBtn_ = nullptr;  // 导出对比度到扫描软件 camera.json
     bool        previewing_       = false;   // 扫描仪启动后自动进入预览态
     bool        scannerRunning_   = false;   // 扫描仪电机/激光是否已启动（N10 已发）
 

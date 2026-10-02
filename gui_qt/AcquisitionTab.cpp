@@ -22,6 +22,11 @@
 #include <QPixmap>
 #include <QPushButton>
 #include <QSettings>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonParseError>
+#include <QSaveFile>
+#include <QFile>
 #include <fstream>
 #include <QCheckBox>
 #include <QSerialPortInfo>
@@ -233,6 +238,14 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
     contrastRValLbl_->setMinimumWidth(32);
     contrastRow->addWidget(contrastRSlider_, 1);
     contrastRow->addWidget(contrastRValLbl_);
+    // 导出：把调好的左右对比度写进扫描软件（scan_demo）的 config/camera.json——
+    // 扫描软件每次启动读该文件取 camera.contrastLeft/contrastRight（AppContext）
+    exportContrastBtn_ = new QPushButton(QStringLiteral("📤 导出到扫描软件"));
+    exportContrastBtn_->setToolTip(QStringLiteral(
+        "把当前左右对比度写入扫描软件的 config/camera.json（读-改-写，保留其它装机口径键，"
+        "只更新 camera.contrastLeft/contrastRight）。扫描软件每次启动读该文件自动应用。"
+        "路径会记住，第二次起一键导出"));
+    contrastRow->addWidget(exportContrastBtn_);
     root->addLayout(contrastRow);
 
     // —— 双预览（点采集后才显示）——
@@ -358,6 +371,8 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
         contrastRValLbl_->setText(QString::number(v));
         applyContrastFromUi();
     });
+    // 导出左右对比度到扫描软件 camera.json（261002：工厂标定调好 → 扫描软件用）
+    connect(exportContrastBtn_, &QPushButton::clicked, this, &AcquisitionTab::onExportContrast);
     // 启动读配置文件（261002 用户口径：每次启动读左右相机对比度）——setValue
     // 触发 valueChanged → 滑条/相机/配置文件三处对齐
     {
@@ -533,6 +548,64 @@ void AcquisitionTab::applyContrastFromUi() {
                 QSettings::IniFormat);
     s.setValue("acquisition/contrastLeft", l);
     s.setValue("acquisition/contrastRight", r);
+}
+
+// 导出左右对比度到扫描软件（scan_demo）config/camera.json（261002）：扫描软件每次
+// 启动读该文件（AppContext），取 camera.contrastLeft/contrastRight 两键。读-改-写
+// 合并——保留 deviceIndex/rotate180/trigger 等其它装机口径键；文件不存在则新建
+// 最小结构；路径记入本 GUI 配置，第二次起默认定位同一文件
+void AcquisitionTab::onExportContrast() {
+    const int l = contrastLSlider_->value();
+    const int r = contrastRSlider_->value();
+    QSettings ini(QCoreApplication::applicationDirPath() + QStringLiteral("/factory_calib_gui.ini"),
+                  QSettings::IniFormat);
+    const QString last = ini.value("scanSoftware/cameraJson").toString();
+    const QString path = QFileDialog::getSaveFileName(
+        this, QStringLiteral("选择扫描软件 camera.json（合并写入对比度）"),
+        last.isEmpty() ? QStringLiteral("camera.json") : last,
+        QStringLiteral("JSON (*.json)"));
+    if (path.isEmpty()) return;   // 用户取消
+
+    // 读现有文件（存在且合法才合并；否则问一次是否新建最小结构）
+    QJsonObject root;
+    bool merged = false;
+    {
+        QFile f(path);
+        if (f.open(QIODevice::ReadOnly)) {
+            QJsonParseError err{};
+            const QJsonDocument doc = QJsonDocument::fromJson(f.readAll(), &err);
+            if (err.error == QJsonParseError::NoError && doc.isObject()) {
+                root = doc.object();
+                merged = true;
+            }
+        }
+    }
+    if (!merged && QFile::exists(path)) {
+        if (QMessageBox::question(this, QStringLiteral("camera.json"),
+                QStringLiteral("目标文件不是有效 JSON——覆盖为仅含对比度两键的最小配置？")) !=
+            QMessageBox::Yes)
+            return;
+    }
+
+    QJsonObject cam = root.value(QStringLiteral("camera")).toObject();
+    cam[QStringLiteral("contrastLeft")] = l;
+    cam[QStringLiteral("contrastRight")] = r;
+    root[QStringLiteral("camera")] = cam;
+
+    QSaveFile out(path);
+    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        emit statusMessage(QStringLiteral("导出失败：无法写 %1").arg(path));
+        return;
+    }
+    out.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+    if (!out.commit()) {
+        emit statusMessage(QStringLiteral("导出失败：写入 %1 出错").arg(path));
+        return;
+    }
+    ini.setValue("scanSoftware/cameraJson", path);   // 记住路径，下次一键导出
+    emit statusMessage(QStringLiteral(
+        "对比度已导出到扫描软件：L=%1 R=%2 → %3（扫描软件下次启动生效）")
+        .arg(l).arg(r).arg(QDir::toNativeSeparators(path)));
 }
 
 void AcquisitionTab::onOpenClose() {
