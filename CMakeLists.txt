@@ -66,3 +66,28 @@ if(FC_BUILD_GUI)
     set(CMAKE_AUTOUIC ON)
     add_subdirectory(gui_qt)
 endif()
+
+# —— 基线验证测试（2026-10-05 新增）——
+# 固化数据＋标准参数重跑两 CLI，与固化基线逐位对拍；守护算法代码与主控参数库
+# （camera/laser_calib_params.json）任何改动。资产缺失自动 SKIP（无数据机器保绿）。
+# 日常快速回归可排除：ctest -LE baseline
+if(FC_BUILD_TESTS AND TARGET camera_calib AND TARGET laser_calib)
+    find_program(FC_POWERSHELL NAMES powershell pwsh)
+    if(FC_POWERSHELL)
+        add_test(NAME test_camera_baseline
+            COMMAND "${FC_POWERSHELL}" -NoProfile -ExecutionPolicy Bypass -File
+                    "${CMAKE_SOURCE_DIR}/verify_baseline/verify_baseline.ps1"
+                    -BuildDir "${CMAKE_BINARY_DIR}" -Only camera
+                    -OutDir "${CMAKE_BINARY_DIR}/baseline_run_camera")
+        set_tests_properties(test_camera_baseline PROPERTIES TIMEOUT 300 LABELS "baseline")
+
+        add_test(NAME test_laser_baseline
+            COMMAND "${FC_POWERSHELL}" -NoProfile -ExecutionPolicy Bypass -File
+                    "${CMAKE_SOURCE_DIR}/verify_baseline/verify_baseline.ps1"
+                    -BuildDir "${CMAKE_BINARY_DIR}" -Only laser
+                    -OutDir "${CMAKE_BINARY_DIR}/baseline_run_laser")
+        set_tests_properties(test_laser_baseline PROPERTIES TIMEOUT 900 LABELS "baseline")
+
+        message(STATUS "baseline tests registered: test_camera_baseline / test_laser_baseline (label: baseline)")
+    endif()
+endif()
