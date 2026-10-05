@@ -384,6 +384,11 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
                     QSettings::IniFormat);
         contrastLSlider_->setValue(qBound(-50, s.value("acquisition/contrastLeft", 0).toInt(), 100));
         contrastRSlider_->setValue(qBound(-50, s.value("acquisition/contrastRight", 0).toInt(), 100));
+        // 中心 ROI（261005）：默认 1688×1400（用户口径），ini 可改；0=满幅。
+        // 开设备时 onOpenClose 下发，存图/预览/标定全链自动跟随
+        roiW_ = s.value("acquisition/roiWidth", 1688).toInt();
+        roiH_ = s.value("acquisition/roiHeight", 1400).toInt();
+        if (roiW_ <= 0 || roiH_ <= 0) { roiW_ = 0; roiH_ = 0; }
     }
 
     // 连续存储心跳（UI 线程，1s）：每 5s 回报「已写/待写/丢弃」；3 秒无配对帧报警——
@@ -656,6 +661,10 @@ void AcquisitionTab::onOpenClose() {
         emit statusMessage(QStringLiteral("设备 open 失败"));
         return;
     }
+    // 中心 ROI（261005）：设备已开未采集，立即下发硬件 AOI；此后 info 栏/预览/存图
+    // 均为 ROI 后尺寸（simulated 等不支持 ROI 的源为 no-op，保持原尺寸）
+    if (auto* L = rig_->left())  L->setCenterRoi(roiW_, roiH_);
+    if (auto* R = rig_->right()) R->setCenterRoi(roiW_, roiH_);
     // 应用曝光/增益（旋转统一在 GUI 层按预览框勾选处理，与 deviceId 解耦）
     if (auto* L = rig_->left()) {
         if (L->capability().exposureUs) L->setExposureUs(exposureSpin_->value());

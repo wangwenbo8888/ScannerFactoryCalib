@@ -61,6 +61,11 @@ public:
     virtual void setContrast(int value) { (void)value; }
     virtual void setTriggerMode(bool on, int32_t src = 0) { (void)on; (void)src; }
 
+    // 中心 ROI（硬件 AOI，采集前生效）：w/h>0 → 传感器中心裁剪到 w×h；w=h=0 → 满幅。
+    // 仅支持设备端 ROI 的源（Galaxy）override；其余默认 no-op。设备未采集中调用立即
+    // 下发，open() 时按缓存值生效。
+    virtual void setCenterRoi(int w, int h) { (void)w; (void)h; }
+
     // 软触发：发一帧指令（仅 setTriggerMode(true, Software) 后有意义）。
     // 默认 no-op；不支持的源（simulated 等）静默忽略。
     virtual void triggerOnce() {}

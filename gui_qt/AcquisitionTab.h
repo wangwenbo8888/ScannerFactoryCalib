@@ -166,6 +166,10 @@ private:
     QLabel*     snapCountLbl_   = nullptr;
 
     std::unique_ptr<StereoCameraRig> rig_;
+    // 中心 ROI（261005）：exe 同目录 factory_calib_gui.ini [acquisition] roiWidth/
+    // roiHeight 读入；0=满幅。开设备时下发给相机源（Galaxy 硬件 AOI），改尺寸只改 ini 不改代码
+    int roiW_ = 1688;
+    int roiH_ = 1400;
     cv::Mat lastLeft_;          // 后台持续刷新的最新帧（相机回调写入）
     cv::Mat lastRight_;
     cv::Mat frozenLeft_;        // 当前【显示】帧：连续预览时随 lastLeft_ 更新；点「预览当前帧」后冻结

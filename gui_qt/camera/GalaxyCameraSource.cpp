@@ -16,6 +16,7 @@
 
 #include <opencv2/imgproc.hpp>
 #include <spdlog/spdlog.h>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -134,6 +135,10 @@ bool GalaxyCameraSource::open(int deviceId) {
             width_  = static_cast<int>((*fp)->GetIntFeature("Width")->GetValue());
             height_ = static_cast<int>((*fp)->GetIntFeature("Height")->GetValue());
         } catch (...) {}
+
+        // 中心 ROI（261005）：设备打开即下发（此时未采集，AOI 可写）；
+        // 后续 start/stopAcquisition 期间 ROI 在设备侧保持，无需重复下发
+        if (roiW_ > 0 && roiH_ > 0) applyRoi();
 
         displayName_ = std::string("[") + std::to_string(deviceId) + "] " +
                        devList[deviceId].GetDisplayName().c_str();
@@ -366,6 +371,65 @@ cv::Mat GalaxyCameraSource::applyContrastLut(const cv::Mat& src) {
     cv::Mat processed;
     cv::LUT(src, contrastLut_, processed);
     return processed;
+}
+
+// 中心 ROI（261005 配置文件口径）：缓存目标宽高；设备已开且未采集立即下发。
+// w/h 任一 ≤0 视为关闭 ROI（回满幅）
+void GalaxyCameraSource::setCenterRoi(int w, int h) {
+    if (w <= 0 || h <= 0) {
+        roiW_ = 0;
+        roiH_ = 0;
+    } else {
+        roiW_ = w;
+        roiH_ = h;
+    }
+    if (opened_ && !acquiring_ && featureCtrlPtr_) applyRoi();
+}
+
+bool GalaxyCameraSource::applyRoi() {
+    if (!featureCtrlPtr_) return false;
+    auto* fp = static_cast<CGXFeatureControlPointer*>(featureCtrlPtr_);
+    try {
+        auto val = [fp](const char* n) -> int64_t {
+            return (*fp)->GetIntFeature(n)->GetValue();
+        };
+        auto set = [fp](const char* n, int64_t v) {
+            (*fp)->GetIntFeature(n)->SetValue(v);
+        };
+        auto inc = [fp](const char* n) -> int64_t {
+            const int64_t i = (*fp)->GetIntFeature(n)->GetInc();
+            return i > 0 ? i : 1;
+        };
+        auto alignDown = [](int64_t v, int64_t i) -> int64_t {
+            return i > 1 ? v / i * i : v;
+        };
+
+        const int64_t maxW = val("WidthMax");
+        const int64_t maxH = val("HeightMax");
+        const int64_t w = roiW_ > 0
+            ? alignDown(std::min<int64_t>(roiW_, maxW), inc("Width")) : maxW;
+        const int64_t h = roiH_ > 0
+            ? alignDown(std::min<int64_t>(roiH_, maxH), inc("Height")) : maxH;
+        // 居中偏移向下对齐步进（保证 OffsetX+Width ≤ WidthMax）
+        const int64_t ox = roiW_ > 0 ? alignDown((maxW - w) / 2, inc("OffsetX")) : 0;
+        const int64_t oy = roiH_ > 0 ? alignDown((maxH - h) / 2, inc("OffsetY")) : 0;
+
+        // SFNC 顺序：先归零 Offset 再设宽高，最后回填居中 Offset
+        set("OffsetX", 0);
+        set("OffsetY", 0);
+        set("Width", w);
+        set("Height", h);
+        set("OffsetX", ox);
+        set("OffsetY", oy);
+
+        width_  = static_cast<int>(w);
+        height_ = static_cast<int>(h);
+        spdlog::info("[Galaxy] ROI {}x{} @({},{}), sensor {}x{}", w, h, ox, oy, maxW, maxH);
+        return true;
+    } catch (const std::exception& e) {
+        spdlog::warn("[Galaxy] ROI 下发失败, 保持当前 AOI: {}", e.what());
+        return false;
+    }
 }
 
 void GalaxyCameraSource::setTriggerMode(bool on, int32_t src) {

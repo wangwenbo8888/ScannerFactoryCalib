@@ -35,6 +35,7 @@ public:
     void setGainDb(double db) override;
     void setContrast(int value) override;   // 软件对比度 LUT（-50..100，0=直通）
     void setTriggerMode(bool on, int32_t src = 0) override;
+    void setCenterRoi(int w, int h) override;   // 硬件 AOI（261005 配置文件口径）
     void triggerOnce() override;
     void setFrameCallback(FrameCallback cb) override;
     void executeAcquisitionStart() override;
@@ -60,6 +61,9 @@ public:
     cv::Mat applyContrastLut(const cv::Mat& src);
 
 private:
+    // 把 roiW_/roiH_ 下发到设备（Width/Height/OffsetX/OffsetY，SFNC 顺序：先归零
+    // Offset 再设宽高）。0/0=满幅。成功后同步 width_/height_；失败回退满幅仅告警。
+    bool applyRoi();
     // Galaxy SDK 智能指针（实现文件里使用具体类型）
     void* devicePtr_      = nullptr;  // CGXDevicePointer*
     void* streamPtr_      = nullptr;  // CGXStreamPointer*
@@ -68,6 +72,8 @@ private:
 
     int width_  = 0;
     int height_ = 0;
+    int roiW_   = 0;          // 中心 ROI 目标宽高（0/0=满幅；261005 由 GUI 配置文件注入）
+    int roiH_   = 0;
     bool opened_ = false;
     bool acquiring_ = false;
     bool rotate180_ = false;   // per-instance; 由 AcquisitionTab 配置
