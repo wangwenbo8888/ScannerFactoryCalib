@@ -28,18 +28,21 @@ struct WarmupConfig;
 /**
  * @brief 激光掩膜提取参�? */
 struct MaskExtractParams {
-    int threshold = 80;          ///< 二值化阈�?[0, 255]
+    int threshold = 80;          ///< 二值化阈值 [0, 255]
     int erodeSize = 5;           ///< 腐蚀核大小（奇数，去噪）
     int laserDilateSize = 3;     ///< 激光膨胀核大小（奇数，恢复形状）
-    int minArea = 100;           ///< 最小区域面积阈值
-    int maxArea = 100000;        ///< 最大区域面积阈值
-    // 保留面积前 K 大的连通域（0=不启用）。产线规格激光线固定条数
-    //（左斜25/右斜25/精细7/深孔1）：面积过滤先清碎块，再按面积排序
-    // 只留前 K 条，杜绝断线/粘连导致的条数超标。
-    int keepTopK = 0;
+    /// 膨胀后二次腐蚀核大小（奇数; 0=关闭）。目的: 强膨胀连通相邻碎段后,
+    /// 收缩掩膜外形回归亮带实际宽度, 抑制大膨胀带来的跨线粘连/外形虚胖。
+    /// 典型用法: e3 + d19 + post13 (等效闭操作连通 + 开操作收边)
+    int postErodeSize = 0;
+    /// 大核形态学加速: 1=膨胀/二次腐蚀用横竖两趟线核近似（Minkowski 和为矩形,
+    /// 比 2D 椭圆核快数倍; 掩膜对角方向外形略有差异, 需下游 A/B 验证）;
+    /// 0=精确 2D 椭圆核（默认）。erodeSize<=1 时首腐蚀恒等跳过（不受此开关影响）
+    int morphApprox = 0;
     /**
-    * @brief 参数合法性校�? 
-    * @throws std::invalid_argument 参数不合�?     */
+    * @brief 参数合法性校验
+    * @throws std::invalid_argument 参数不合法
+    */
     void validate() const {
         if (threshold < 0 || threshold > 255)
             throw std::invalid_argument("MaskExtractParams::threshold must be [0, 255]");
@@ -47,12 +50,10 @@ struct MaskExtractParams {
             throw std::invalid_argument("MaskExtractParams::erodeSize must be positive odd");
         if (laserDilateSize < 1 || laserDilateSize % 2 == 0)
             throw std::invalid_argument("MaskExtractParams::laserDilateSize must be positive odd");
-        if (minArea < 0)
-            throw std::invalid_argument("MaskExtractParams::minArea must be >= 0");
-        if (maxArea <= minArea)
-            throw std::invalid_argument("MaskExtractParams::maxArea must be > minArea");
-        if (keepTopK < 0)
-            throw std::invalid_argument("MaskExtractParams::keepTopK must be >= 0");
+        if (postErodeSize < 0 || (postErodeSize > 0 && postErodeSize % 2 == 0))
+            throw std::invalid_argument("MaskExtractParams::postErodeSize must be positive odd or 0 (off)");
+        if (morphApprox != 0 && morphApprox != 1)
+            throw std::invalid_argument("MaskExtractParams::morphApprox must be 0 or 1");
     }
 
     /**
@@ -63,28 +64,26 @@ struct MaskExtractParams {
             {"threshold", threshold},
             {"erodeSize", erodeSize},
             {"laserDilateSize", laserDilateSize},
-            {"minArea", minArea},
-            {"maxArea", maxArea},
-            {"keepTopK", keepTopK}
+            {"postErodeSize", postErodeSize},
+            {"morphApprox", morphApprox}
         };
     }
 
     /**
-     * @brief �?JSON 反序列化
-     * @throws std::invalid_argument 参数不合�?     */
+     * @brief 从 JSON 反序列化
+     * @throws std::invalid_argument 参数不合法
+     */
     static MaskExtractParams fromJson(const nlohmann::json& j) {
         MaskExtractParams p;
         if (j.contains("threshold")) p.threshold = j.at("threshold").get<int>();
         if (j.contains("erodeSize")) p.erodeSize = j.at("erodeSize").get<int>();
         if (j.contains("laserDilateSize")) p.laserDilateSize = j.at("laserDilateSize").get<int>();
-        if (j.contains("minArea")) p.minArea = j.at("minArea").get<int>();
-        if (j.contains("keepTopK")) p.keepTopK = j.at("keepTopK").get<int>();
-        if (j.contains("maxArea")) p.maxArea = j.at("maxArea").get<int>();
+        if (j.contains("postErodeSize")) p.postErodeSize = j.at("postErodeSize").get<int>();
+        if (j.contains("morphApprox")) p.morphApprox = j.at("morphApprox").get<int>();
         p.validate();
         return p;
     }
 };
-
 /**
  * @brief 激光掩膜提取结�? * 
  * 结果结构体包含：

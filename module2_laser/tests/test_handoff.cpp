@@ -217,3 +217,120 @@ TEST(Handoff, MalformedJsonReturnsNullopt) {
     auto h = loadCameraCalibHandoff(p.string());
     EXPECT_FALSE(h.has_value());
 }
+
+// ============================================================================
+// TEST 8: stereoRectifyTempTable 解析 → haveRectifyTempTable=true, 档数/排序/矩阵
+//         (含一档畸形 → 弃档不弃表; 两档乱序 → 升序排序)
+// ============================================================================
+TEST(Handoff, ParsesRectifyTempTable) {
+    json j = json::parse(makeValidHandoffJson());
+
+    auto I3 = json::array({{1.0,0.0,0.0},{0.0,1.0,0.0},{0.0,0.0,1.0}});
+    auto P  = json::array({{1000.0,0.0,64.0,0.0},
+                           {0.0,1000.0,64.0,0.0},
+                           {0.0,0.0,1.0,0.0}});
+    auto Q4 = json::array({{1.0,0.0,0.0,-64.0},
+                           {0.0,1.0,0.0,-64.0},
+                           {0.0,0.0,0.0,1000.0},
+                           {0.0,0.0,0.01,0.0}});
+    auto roi = json{{"x", 0}, {"y", 0}, {"w", 128}, {"h", 128}};
+
+    auto entry = [&](double t) {
+        json e;
+        e["temperature"] = t;
+        e["deltaT"]      = t - 22.5;
+        e["R1"] = I3; e["R2"] = I3; e["P1"] = P; e["P2"] = P; e["Q"] = Q4;
+        e["validRoiLeft"]  = roi;
+        e["validRoiRight"] = roi;
+        return e;
+    };
+
+    json bad;  // 缺 R2/P1/P2/Q → 应被弃档
+    bad["temperature"] = 26.0;
+    bad["R1"] = I3;
+
+    j["stereoRectifyTempTable"] = json{
+        {"success", true}, {"message", ""}, {"qualityFlag", 0},
+        {"referenceTemp", 22.5}, {"cte", 23.6e-6}, {"tableSize", 2},
+        {"table", json::array({entry(25.5), bad, entry(25.0)})}};
+
+    auto p = writeTmp("handoff_ttable.json", j.dump(2));
+    auto h = loadCameraCalibHandoff(p.string());
+    ASSERT_TRUE(h.has_value());
+
+    EXPECT_TRUE(h->haveRectifyTempTable);
+    ASSERT_EQ(h->rectifyTempTable.table.size(), 2u);  // 畸形档被弃
+    EXPECT_TRUE(h->rectifyTempTable.success);
+    EXPECT_EQ(h->rectifyTempTable.tableSize, 2);
+    EXPECT_DOUBLE_EQ(h->rectifyTempTable.referenceTemp, 22.5);
+
+    // 升序排序: 首档 25.0（JSON 中 25.5 在前）
+    EXPECT_DOUBLE_EQ(h->rectifyTempTable.table[0].temperature, 25.0);
+    EXPECT_DOUBLE_EQ(h->rectifyTempTable.table[1].temperature, 25.5);
+
+    // 首档矩阵形状与内容
+    EXPECT_EQ(h->rectifyTempTable.table[0].R1.size(), cv::Size(3, 3));
+    EXPECT_DOUBLE_EQ(h->rectifyTempTable.table[0].R1.at<double>(0, 0), 1.0);
+    EXPECT_EQ(h->rectifyTempTable.table[0].Q.size(), cv::Size(4, 4));
+    EXPECT_EQ(h->rectifyTempTable.table[0].validRoiLeft, cv::Rect(0, 0, 128, 128));
+}
+
+// ============================================================================
+// TEST 9: 无 stereoRectifyTempTable 节 → have=false, load 仍成功（容忍老输出）
+// ============================================================================
+TEST(Handoff, ToleratesMissingRectifyTempTable) {
+    auto p = writeTmp("handoff_no_ttable.json", makeValidHandoffJson());
+    auto h = loadCameraCalibHandoff(p.string());
+    ASSERT_TRUE(h.has_value());
+    EXPECT_FALSE(h->haveRectifyTempTable);
+    EXPECT_TRUE(h->rectifyTempTable.table.empty());
+}
+
+// ============================================================================
+// TEST 10: 0.2 步距网格浮点表示误差 → 参考温档就地校正为精确值
+//          夹具: 一档 temperature=22.500000000000004 (0.2 二进制不可精确表示,
+//          模块1 网格生成累计误差; C++/JSON 十进制解析同落 22.5+1ulp, 与 22.5
+//          位级不等但 |Δ|=3.55e-15<1e-6), 一档 25.5; 表节点 referenceTemp=22.5
+//          → 解析后首档位级精确等于 22.5 (EXPECT_DOUBLE_EQ), 25.5 档不受影响
+// ============================================================================
+TEST(Handoff, CorrectsFloatGridReferenceTier) {
+    json j = json::parse(makeValidHandoffJson());
+
+    auto I3 = json::array({{1.0,0.0,0.0},{0.0,1.0,0.0},{0.0,0.0,1.0}});
+    auto P  = json::array({{1000.0,0.0,64.0,0.0},
+                           {0.0,1000.0,64.0,0.0},
+                           {0.0,0.0,1.0,0.0}});
+    auto Q4 = json::array({{1.0,0.0,0.0,-64.0},
+                           {0.0,1.0,0.0,-64.0},
+                           {0.0,0.0,0.0,1000.0},
+                           {0.0,0.0,0.01,0.0}});
+    auto roi = json{{"x", 0}, {"y", 0}, {"w", 128}, {"h", 128}};
+
+    auto entry = [&](double t) {
+        json e;
+        e["temperature"] = t;
+        e["deltaT"]      = t - 22.5;
+        e["R1"] = I3; e["R2"] = I3; e["P1"] = P; e["P2"] = P; e["Q"] = Q4;
+        e["validRoiLeft"]  = roi;
+        e["validRoiRight"] = roi;
+        return e;
+    };
+
+    j["stereoRectifyTempTable"] = json{
+        {"success", true}, {"qualityFlag", 0},
+        {"referenceTemp", 22.5}, {"cte", 23.6e-6},
+        {"table", json::array({entry(22.500000000000004), entry(25.5)})}};
+
+    auto p = writeTmp("handoff_floatgrid.json", j.dump(2));
+    auto h = loadCameraCalibHandoff(p.string());
+    ASSERT_TRUE(h.has_value());
+    ASSERT_TRUE(h->haveRectifyTempTable);
+    ASSERT_EQ(h->rectifyTempTable.table.size(), 2u);
+
+    // 参考温档被校正为精确 22.5 (EXPECT_DOUBLE_EQ 位级比较), 补偿参数原样保留
+    EXPECT_DOUBLE_EQ(h->rectifyTempTable.table[0].temperature, 22.5);
+    EXPECT_EQ(h->rectifyTempTable.table[0].R1.size(), cv::Size(3, 3));
+    EXPECT_DOUBLE_EQ(h->rectifyTempTable.table[0].R1.at<double>(0, 0), 1.0);
+    // 非参考档 25.5 距 22.5 为 3.0 >> 1e-6, 不在校正窗口, 保持不变
+    EXPECT_DOUBLE_EQ(h->rectifyTempTable.table[1].temperature, 25.5);
+}

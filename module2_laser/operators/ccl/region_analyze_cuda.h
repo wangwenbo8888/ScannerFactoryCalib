@@ -50,6 +50,9 @@ struct WarmupConfig;
 struct RegionAnalyzerParams {
     int minArea = 100;       ///< 最小面积阈值（像素）
     int maxArea = 100000;    ///< 最大面积阈值（像素）
+    /// 只保留面积最大的前 X 个区域，其余删除（0=关闭）。
+    /// 在 minArea/maxArea 过滤后二次筛选；边界并列（面积==第 X 大）全部保留。
+    int topXCount = 0;
     int deviceId = 0;        ///< GPU 设备 ID（多 GPU 场景），默认设备 0
 
     /**
@@ -61,6 +64,8 @@ struct RegionAnalyzerParams {
             throw std::invalid_argument("RegionAnalyzerParams::minArea must be >= 0");
         if (maxArea <= minArea)
             throw std::invalid_argument("RegionAnalyzerParams::maxArea must be > minArea");
+        if (topXCount < 0)
+            throw std::invalid_argument("RegionAnalyzerParams::topXCount must be >= 0 (0=off)");
         if (deviceId < 0)
             throw std::invalid_argument("RegionAnalyzerParams::deviceId must be >= 0");
     }
@@ -72,6 +77,7 @@ struct RegionAnalyzerParams {
         return {
             {"minArea", minArea},
             {"maxArea", maxArea},
+            {"topXCount", topXCount},
             {"deviceId", deviceId}
         };
     }
@@ -84,6 +90,7 @@ struct RegionAnalyzerParams {
         RegionAnalyzerParams p;
         if (j.contains("minArea")) p.minArea = j.at("minArea").get<int>();
         if (j.contains("maxArea")) p.maxArea = j.at("maxArea").get<int>();
+        if (j.contains("topXCount")) p.topXCount = j.at("topXCount").get<int>();
         if (j.contains("deviceId")) p.deviceId = j.at("deviceId").get<int>();
         p.validate();
         return p;

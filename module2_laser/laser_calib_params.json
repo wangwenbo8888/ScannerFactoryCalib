@@ -1,0 +1,23 @@
+{
+  "_doc": "laser_calib 主控参数库：三层合并的中间层。下层=编译内置默认(同值)，上层=数据集 config.json 逐叶覆盖。rowStep/depthMin/depthMax 随标定走(红线)不外置；lineIds 省略=从累积点云反推。注意: pjc.acceptance 的 a1/a2 阈值作用在归一化坐标残差(非像素)。",
+  "plane_map": { "gridStep": 0.5, "depthMin": 100.0, "depthMax": 5000.0, "depthSamples": 200, "epipolarStep": 0.5 },
+  "deviceId": 0,
+  "f7Threads": 0,
+  "cmttThreads": 0,
+  "temperature": { "cte": 2.36e-05, "referenceTemp": 25.0, "tempRangeMin": -15.0, "tempRangeMax": 15.0, "tempStep": 0.5 },
+  "rectify": { "alpha": 0.0, "flags": 1 },
+  "laser_label": { "scanDirection": 0, "centerRowOffset": 0, "realLineTolerance": 10 },
+  "mask": { "threshold": 50, "erodeSize": 1, "laserDilateSize": 19, "postErodeSize": 13 },
+  "ccl": { "minArea": 0, "topXCount": 27 },
+  "steger": { "sigma": 1.5, "kernelSize": 0, "lowThreshold": 2.0, "highThreshold": 0.0, "maxLabels": 256 },
+  "match": { "disparityMarginFactor": 1.05 },
+  "pjc": {
+    "maxIterations": 100, "convergenceThreshold": 1e-8, "minPoses": 5, "minPointsPerPose": 50,
+    "planeFitInlierThresh": 0.6, "enableTiming": false, "lambda0": 1.0, "lambdaDecay": 0.95,
+    "huberToCauchyThresh": 1.0, "cauchyToL2Thresh": 0.3, "topologyEpsilon": 0.001,
+    "curveDegree": 3, "useCeres": false, "useBlockJtJ": true, "anomalyRmsThreshold": 0.15,
+    "robustEnabled": true, "huberDelta0": 1.0, "irlsMaxRounds": 2, "poseWeightEnabled": true,
+    "acceptance": { "a1MaxLineRms": 0.5, "a2MaxP95": 1.5, "a3MaxOutlierRatio": 0.02, "a5MaxLineDrift": 1.0, "a6MaxPoseDrift": 2.0, "a7MaxBasinSpread": 0.5 }
+  },
+  "cmtt": { "tempHalfRange": 15.0, "clampedWarnRatio": 0.05 }
+}

@@ -29,12 +29,11 @@ struct CameraCalibConfig {
     // 温度
     double cte = 23.6e-6;
     double referenceTemp = 22.5;
-    double tempRangeMin = -10.0;
-    double tempRangeMax = 10.0;
-    double tempStep = 0.2;
+    double tempRangeMin = -15.0;
+    double tempRangeMax = 15.0;
+    double tempStep = 0.5;
     // 矫正
     double rectifyAlpha = 0.0;
-    // stereoRectify 仅接受 0 或 CALIB_ZERO_DISPARITY(=1024)；旧默认 1 会触发 validate 抛异常
     int rectifyFlags = cv::CALIB_ZERO_DISPARITY;
     // 温度系数（标定板热膨胀，喂 intrinsic_calib 的 temperature_coeff）
     double plateTempCoeff = 5.0e-6;
@@ -43,6 +42,21 @@ struct CameraCalibConfig {
     static CameraCalibConfig fromJson(const std::string& path);
 };
 
+// ============================================================================
+// CameraOpParams —— 算子层可调参数（2026-10-04 主库化；编译默认＝CLI 原硬编码）
+// 主库 camera_calib_params.json 与数据集 config.json 均可逐叶覆盖
+// （同 schema 同解析器 applyCameraParamsJson）。
+// ============================================================================
+struct CameraOpParams {
+    double extrinsicMaxReprojFactor = 100.0;  // maxReproj = reproj_error_threshold × 此系数
+    int    extrinsicMinViewCount    = 4;
+    int    framesMinValidFrames     = 4;      // 角点有效帧下限
+};
+
+// 统一解析器：对一份 JSON 文档做 present-key 覆盖（主库与数据集 config 共用）
+void applyCameraParamsJson(const nlohmann::json& j,
+                           CameraCalibConfig& c, CameraOpParams& ops);
+
 struct FramePair {
     cv::Mat leftGray;
     cv::Mat rightGray;
@@ -50,14 +64,16 @@ struct FramePair {
 
 struct CameraInput {
     CameraCalibConfig config;
+    CameraOpParams ops;
     std::vector<FramePair> frames;
 };
 
-// 读 data_in/camera/ 目录
-std::optional<CameraInput> loadCameraInput(const std::string& dir);
+// 读 data_in/camera/ 目录；baseCfg/baseOps＝上层（主库）合并结果，数据集键覆盖之
+std::optional<CameraInput> loadCameraInput(const std::string& dir,
+                                           const CameraCalibConfig* baseCfg = nullptr,
+                                           const CameraOpParams* baseOps = nullptr);
 
 // 把模块1 全部结果与配置汇总成单个 json（复用各算子的 toJson()）
-// 结果文件视角：剔除过程/诊断数据（rvecs/tvecs、逐视角误差、外参内重复的 K/D 副本等）
 nlohmann::json buildCameraCalibJson(
     const CameraCalibConfig& cfg,
     const calib::IntrinsicCalibResult& intrin,
@@ -67,16 +83,6 @@ nlohmann::json buildCameraCalibJson(
     const calib::IntrinsicCompensateCPUResult& intrinTableR,
     const calib::ExtrinsicCompensateCPUResult& extrinTable,
     const calib::StereoRectifyTempTableResult& rectifyTable);
-
-// 过程文件视角：逐视角观测数据（rvecs/tvecs、per_view_errors、perView*Errors）
-// + 运行配置复述（板规格/阈值/温度区间）。供问题追溯与诊断，下游不消费
-nlohmann::json buildCameraCalibProcessJson(
-    const CameraCalibConfig& cfg,
-    const calib::IntrinsicCalibResult& intrin,
-    const calib::ExtrinsicCalibCpuResult& extrin);
-
-// 由结果文件路径推导过程文件路径：camera_calib.json -> camera_calib_process.json
-std::string deriveProcessPath(const std::string& outputPath);
 
 bool writeJson(const std::string& path, const nlohmann::json& j);
 

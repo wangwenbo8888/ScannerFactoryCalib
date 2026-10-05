@@ -13,11 +13,7 @@
 #include <opencv2/cudafilters.hpp>
 #include <opencv2/cudaarithm.hpp>
 #include <opencv2/imgproc.hpp>
-#include <opencv2/core/cuda_stream_accessor.hpp>
 #include <chrono>
-#include <algorithm>
-#include <utility>
-#include <vector>
 #include <stdexcept>
 #include <memory>
 
@@ -50,26 +46,101 @@ MaskExtractCUDA::Impl::Impl(const MaskExtractParams& params)
 // rebuildFilters() - 重建形态学核和滤波器
 // ============================================================
 void MaskExtractCUDA::Impl::rebuildFilters() {
-    // 创建腐蚀核（去噪）
-    kernel_erode_ = cv::getStructuringElement(
-        cv::MORPH_ELLIPSE,
-        cv::Size(params_.erodeSize, params_.erodeSize)
-    );
+    // 首腐蚀: erodeSize<=1 数学恒等, 不建滤波器（executePipeline 直接旁路）
+    if (params_.erodeSize > 1) {
+        kernel_erode_ = cv::getStructuringElement(
+            cv::MORPH_ELLIPSE,
+            cv::Size(params_.erodeSize, params_.erodeSize)
+        );
+        filter_erode_ = cv::cuda::createMorphologyFilter(
+            cv::MORPH_ERODE, CV_8UC1, kernel_erode_
+        );
+    } else {
+        kernel_erode_.release();
+        filter_erode_.release();
+    }
 
-    // 创建膨胀核（恢复激光形状）
+    if (params_.morphApprox == 1) {
+        // 线核两趟近似: 横一趟 + 竖一趟（矩形和, 大核下远快于 2D 椭圆核）
+        const int d = params_.laserDilateSize;
+        filter_dilate_h_ = cv::cuda::createMorphologyFilter(
+            cv::MORPH_DILATE, CV_8UC1,
+            cv::getStructuringElement(cv::MORPH_RECT, cv::Size(d, 1)));
+        filter_dilate_v_ = cv::cuda::createMorphologyFilter(
+            cv::MORPH_DILATE, CV_8UC1,
+            cv::getStructuringElement(cv::MORPH_RECT, cv::Size(1, d)));
+        if (params_.postErodeSize > 0) {
+            const int e = params_.postErodeSize;
+            filter_post_h_ = cv::cuda::createMorphologyFilter(
+                cv::MORPH_ERODE, CV_8UC1,
+                cv::getStructuringElement(cv::MORPH_RECT, cv::Size(e, 1)));
+            filter_post_v_ = cv::cuda::createMorphologyFilter(
+                cv::MORPH_ERODE, CV_8UC1,
+                cv::getStructuringElement(cv::MORPH_RECT, cv::Size(1, e)));
+        } else {
+            filter_post_h_.release();
+            filter_post_v_.release();
+        }
+        // 2D 大核路径不再使用
+        kernel_dilate_.release();
+        filter_dilate_.release();
+        kernel_post_erode_.release();
+        filter_post_erode_.release();
+        return;
+    }
+
+    // 精确 2D 椭圆核路径（默认）
+    filter_dilate_h_.release();
+    filter_dilate_v_.release();
+    filter_post_h_.release();
+    filter_post_v_.release();
+
     kernel_dilate_ = cv::getStructuringElement(
         cv::MORPH_ELLIPSE,
         cv::Size(params_.laserDilateSize, params_.laserDilateSize)
     );
-
-    // 创建 CUDA 滤波器
-    filter_erode_ = cv::cuda::createMorphologyFilter(
-        cv::MORPH_ERODE, CV_8UC1, kernel_erode_
-    );
-
     filter_dilate_ = cv::cuda::createMorphologyFilter(
         cv::MORPH_DILATE, CV_8UC1, kernel_dilate_
     );
+
+    if (params_.postErodeSize > 0) {
+        kernel_post_erode_ = cv::getStructuringElement(
+            cv::MORPH_ELLIPSE,
+            cv::Size(params_.postErodeSize, params_.postErodeSize)
+        );
+        filter_post_erode_ = cv::cuda::createMorphologyFilter(
+            cv::MORPH_ERODE, CV_8UC1, kernel_post_erode_
+        );
+    } else {
+        kernel_post_erode_.release();
+        filter_post_erode_.release();
+    }
+}
+
+// ============================================================
+// allocateBuffers() - 统一缓冲分配（Warmup 与 Execute 重分配共用）
+// ============================================================
+void MaskExtractCUDA::Impl::allocateBuffers(int rows, int cols) {
+    cv::cuda::createContinuous(rows, cols, CV_8UC1, d_inputBuffer);
+    cv::cuda::createContinuous(rows, cols, CV_8UC1, d_thresholded);
+    cv::cuda::createContinuous(rows, cols, CV_8UC1, d_eroded);
+    cv::cuda::createContinuous(rows, cols, CV_8UC1, d_laserMask);
+    cv::cuda::createContinuous(rows, cols, CV_8UC1, d_cleanedMask);
+    if (params_.postErodeSize > 0)
+        cv::cuda::createContinuous(rows, cols, CV_8UC1, d_postMask);
+    else
+        d_postMask.release();
+    if (params_.morphApprox == 1)
+        cv::cuda::createContinuous(rows, cols, CV_8UC1, d_morphTmp);
+    else
+        d_morphTmp.release();
+    for (int p = 0; p < 2; ++p)
+        for (int k = 0; k < 3; ++k)
+            cv::cuda::createContinuous(rows, cols, CV_8UC1, d_resPool_[p][k]);
+    resIdx_ = 0;
+    warmup_rows_ = rows;
+    warmup_cols_ = cols;
+    warmed_up_ = true;
 }
 
 // ============================================================
@@ -80,57 +151,40 @@ void MaskExtractCUDA::Impl::executePipeline(
     cv::cuda::GpuMat& dst,
     cv::cuda::Stream& stream)
 {
-    // Step 1: Host→Device 上传（已在 extract() 中完成）
-    // d_inputBuffer 已包含上传的图像
-
     // Step 2: GPU 二值化
     cv::cuda::threshold(d_inputBuffer, d_thresholded,
                         params_.threshold, 255.0,
                         cv::THRESH_BINARY, stream);
 
-    // Step 3: GPU 腐蚀（去噪）
-    filter_erode_->apply(d_thresholded, d_eroded, stream);
-
-    // Step 4: GPU 膨胀（恢复激光形状）
-    filter_dilate_->apply(d_eroded, d_laserMask, stream);
-
-    // Step 5: 面积过滤
-    // （原为 TODO：碎块（如 5px 噪声）进入下游，恰好穿过 4-3 中心行的碎块会被
-    //  编号成假激光线——实测 pose_10 R 出 26 条。按 minArea/maxArea 过滤：
-    //  GPU mask 下载→CCLWithStats→LUT 重建掩膜→回写成员缓冲。每帧 ~5ms，标定场景可接受。）
-    if (params_.minArea > 0 || params_.maxArea < 1000000) {
-        cv::Mat h_mask;
-        d_laserMask.download(h_mask, stream);
-        cudaStreamSynchronize(cv::cuda::StreamAccessor::getStream(stream));
-        if (!h_mask.empty()) {
-            cv::Mat labels, stats, centroids;
-            int nlab = cv::connectedComponentsWithStats(
-                h_mask > 0, labels, stats, centroids, CV_32SC1);
-            // 候选 label：面积在 [minArea, maxArea]
-            std::vector<std::pair<int, int>> cands;   // (area, label)
-            for (int i = 1; i < nlab; ++i) {
-                int area = stats.at<int>(i, cv::CC_STAT_AREA);
-                if (area >= params_.minArea && area <= params_.maxArea)
-                    cands.emplace_back(area, i);
-            }
-            // keepTopK>0：只保留面积前 K 大（产线规格固定条数；断线段面积
-            // 通常小于完整线，Top-K 天然丢弃断头/边缘截段的冗余）
-            if (params_.keepTopK > 0 && (int)cands.size() > params_.keepTopK) {
-                std::sort(cands.begin(), cands.end(),
-                          [](const auto& a, const auto& b) { return a.first > b.first; });
-                cands.resize(params_.keepTopK);
-            }
-            cv::Mat kept(h_mask.size(), CV_8UC1, cv::Scalar(0));
-            for (const auto& [area, lb] : cands)
-                kept.setTo(255, labels == lb);
-            d_kept_tmp.upload(kept, stream);     // 专用暂存，不动成员缓冲布局
-            d_kept_tmp.copyTo(d_cleanedMask, stream);
-        } else {
-            d_laserMask.copyTo(d_cleanedMask, stream);
-        }
-    } else {
-        d_laserMask.copyTo(d_cleanedMask, stream);
+    // Step 3: GPU 腐蚀（去噪; erodeSize<=1 恒等, 旁路）
+    const cv::cuda::GpuMat* afterErode = &d_thresholded;
+    if (params_.erodeSize > 1 && filter_erode_) {
+        filter_erode_->apply(d_thresholded, d_eroded, stream);
+        afterErode = &d_eroded;
     }
+
+    // Step 4: GPU 膨胀（恢复激光形状; 线核两趟或 2D 椭圆核）
+    if (params_.morphApprox == 1) {
+        filter_dilate_h_->apply(*afterErode, d_morphTmp, stream);
+        filter_dilate_v_->apply(d_morphTmp, d_laserMask, stream);
+    } else {
+        filter_dilate_->apply(*afterErode, d_laserMask, stream);
+    }
+
+    // Step 4b: 膨胀后二次腐蚀（收边, 可选）
+    cv::cuda::GpuMat* mask_after_morph = &d_laserMask;
+    if (params_.postErodeSize > 0) {
+        if (params_.morphApprox == 1) {
+            filter_post_h_->apply(d_laserMask, d_morphTmp, stream);
+            filter_post_v_->apply(d_morphTmp, d_postMask, stream);
+        } else if (filter_post_erode_) {
+            filter_post_erode_->apply(d_laserMask, d_postMask, stream);
+        }
+        mask_after_morph = &d_postMask;
+    }
+
+    // Step 5: 输出清理后掩膜（面积过滤职责在 4-2 region_analyze，本算子不做）
+    mask_after_morph->copyTo(d_cleanedMask, stream);
 
     // 输出到目标
     dst = d_cleanedMask;
@@ -144,7 +198,12 @@ void MaskExtractCUDA::Impl::releaseBuffers() {
     d_thresholded.release();
     d_eroded.release();
     d_laserMask.release();
+    d_postMask.release();
     d_cleanedMask.release();
+    d_morphTmp.release();
+    for (int p = 0; p < 2; ++p)
+        for (int k = 0; k < 3; ++k)
+            d_resPool_[p][k].release();
     warmed_up_ = false;
 }
 
@@ -153,25 +212,13 @@ void MaskExtractCUDA::Impl::releaseBuffers() {
 // ============================================================
 void MaskExtractCUDA::Impl::Warmup(int rows, int cols) {
     // 预分配所有缓冲区（使用 createContinuous 确保显存连续分配，§2.3）
-    cv::cuda::createContinuous(rows, cols, CV_8UC1, d_inputBuffer);
-    cv::cuda::createContinuous(rows, cols, CV_8UC1, d_thresholded);
-    cv::cuda::createContinuous(rows, cols, CV_8UC1, d_eroded);
-    cv::cuda::createContinuous(rows, cols, CV_8UC1, d_laserMask);
-    cv::cuda::createContinuous(rows, cols, CV_8UC1, d_cleanedMask);
+    allocateBuffers(rows, cols);
 
-    warmup_rows_ = rows;
-    warmup_cols_ = cols;
-
-    // 创建测试图像（全黑）
+    // 创建测试图像（全黑）并空跑一次完整流水线（不计时）
     cv::Mat test_image = cv::Mat::zeros(rows, cols, CV_8UC1);
-    cv::cuda::GpuMat d_test;
-    d_test.upload(test_image);
-
-    // 执行一次空跑（不计时）
+    d_inputBuffer.upload(test_image);
     cv::cuda::Stream stream;
-    cv::cuda::threshold(d_test, d_thresholded, params_.threshold, 255.0, cv::THRESH_BINARY, stream);
-    filter_erode_->apply(d_thresholded, d_eroded, stream);
-    filter_dilate_->apply(d_eroded, d_laserMask, stream);
+    executePipeline(d_cleanedMask, stream);
     stream.waitForCompletion();
 
 #ifndef NDEBUG
@@ -245,15 +292,7 @@ MaskExtractResult MaskExtractCUDA::Impl::Execute(
             // 注意：此处分配违反 §2.3 "process()内禁止 cudaMalloc" 规范
             // 建议在正式使用前调用 warmup() 预分配
             CALIB_LOG_WARN("GPU buffer allocation during extract() - call warmup() beforehand for production use");
-            cv::cuda::createContinuous(rows, cols, CV_8UC1, d_inputBuffer);
-            cv::cuda::createContinuous(rows, cols, CV_8UC1, d_thresholded);
-            cv::cuda::createContinuous(rows, cols, CV_8UC1, d_eroded);
-            cv::cuda::createContinuous(rows, cols, CV_8UC1, d_laserMask);
-            cv::cuda::createContinuous(rows, cols, CV_8UC1, d_cleanedMask);
-
-            warmup_rows_ = rows;
-            warmup_cols_ = cols;
-            warmed_up_ = true;
+            allocateBuffers(rows, cols);
         }
 
         // Step 1: Host→Device 上传
@@ -262,13 +301,20 @@ MaskExtractResult MaskExtractCUDA::Impl::Execute(
         // Step 2-5: 执行形态学流水线
         executePipeline(d_cleanedMask, stream);
 
-        // 填充结果（使用 shared_ptr 管理 GpuMat，clone 确保结果独立于内部缓冲区）
+        // 填充结果: ping-pong 池流式拷贝（预分配缓冲, 免 clone 的
+        // 临时 cudaMalloc + 默认流屏障; 结果至再执行两次 Execute 前有效）
+        cv::cuda::GpuMat* pool = d_resPool_[resIdx_];
+        d_inputBuffer.copyTo(pool[0], stream);
+        d_laserMask.copyTo(pool[1], stream);
+        d_cleanedMask.copyTo(pool[2], stream);
+        resIdx_ = (resIdx_ + 1) % 2;
+
         result.success = true;
         result.message = "Extraction successful";
         result.qualityFlag = calib::QualityFlag::Normal;
-        result.d_grayImage = std::make_shared<cv::cuda::GpuMat>(d_inputBuffer.clone());
-        result.d_laserMask = std::make_shared<cv::cuda::GpuMat>(d_laserMask.clone());
-        result.d_cleanedMask = std::make_shared<cv::cuda::GpuMat>(d_cleanedMask.clone());
+        result.d_grayImage = std::make_shared<cv::cuda::GpuMat>(pool[0]);
+        result.d_laserMask = std::make_shared<cv::cuda::GpuMat>(pool[1]);
+        result.d_cleanedMask = std::make_shared<cv::cuda::GpuMat>(pool[2]);
 
     } catch (const cv::Exception& e) {
         result.success = false;

@@ -13,3 +13,6 @@ data_bak/
 # 调试诊断文件（ofstream/spdlog file sink 生成，不入库）
 debug.txt
 factory_calib.log
+
+module1_camera/test_data/
+module2_laser/test_data/

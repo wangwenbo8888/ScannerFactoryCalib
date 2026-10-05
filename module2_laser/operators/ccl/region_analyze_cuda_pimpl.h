@@ -60,6 +60,8 @@ struct RegionAnalyzerCUDA::Impl {
     int*                d_max_y_     = nullptr;
     int*                d_remap_     = nullptr;  // 稀疏->稠密标签映射表
     int*                d_num_valid_ = nullptr;  // 过滤后有效连通域计数
+    int*                d_valid_areas_ = nullptr;  // topX 用：有效域面积紧凑缓冲
+    int*                d_valid_count_ = nullptr;  // topX 用：有效域面积计数
     GPUComponentResult* d_compact_   = nullptr;  // 压缩后的统计结果
 
     // ── Pinned host memory（降低 D2H 延迟）──

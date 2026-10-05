@@ -6,9 +6,13 @@
 #include "chessboard_corner.h"
 
 #include <spdlog/spdlog.h>
+#include <nlohmann/json.hpp>
 
+#include <fstream>
+#include <filesystem>
 #include <sstream>
 #include <utility>
+#include <vector>
 
 namespace fc {
 
@@ -42,7 +46,7 @@ calib::IntrinsicCalibParams makeIntrinParams(const CameraCalibConfig& c) {
     return p;
 }
 
-calib::ExtrinsicCalibCpuParams makeExtrinParams(const CameraCalibConfig& c,
+calib::ExtrinsicCalibCpuParams makeExtrinParams(const CameraCalibConfig& c, const CameraOpParams& ops,
     const std::vector<std::vector<cv::Point2f>>& lpts,
     const std::vector<std::vector<cv::Point2f>>& rpts)
 {
@@ -62,12 +66,46 @@ calib::ExtrinsicCalibCpuParams makeExtrinParams(const CameraCalibConfig& c,
     p.imageSize = cv::Size(c.imageWidth, c.imageHeight);
     p.patternSize = cv::Size(c.chessWidth, c.chessHeight);
     p.squareSize = static_cast<float>(c.squareSizeMm);
-    p.maxReprojError = c.reprojErrorThreshold * 100.0;
-    p.minViewCount = 4;
+    p.maxReprojError = c.reprojErrorThreshold * ops.extrinsicMaxReprojFactor;
+    p.minViewCount = ops.extrinsicMinViewCount;
     return p;
 }
 
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// 加载输入（主控参数库合并，等价 camera_calib_cli 的四层合并前三层）
+// ---------------------------------------------------------------------------
+std::optional<CameraInput> loadCameraInputMerged(const std::string& dir) {
+    CameraCalibConfig baseCfg;
+    CameraOpParams    baseOps;
+    std::string paramSource = "builtin defaults (master json not found)";
+    {
+        namespace fs = std::filesystem;
+        std::vector<std::filesystem::path> cand;
+        cand.push_back(std::filesystem::path("camera_calib_params.json"));
+        cand.push_back(std::filesystem::path(
+            "module1_camera/camera_calib_params.json"));  // cwd=工程根（GUI 约定启动处）
+        cand.push_back(std::filesystem::path(
+            "E:/JEAMMWARE2601001/factory_calib/module1_camera/camera_calib_params.json"));
+        for (const auto& p : cand) {
+            std::error_code ec2;
+            if (!std::filesystem::exists(p, ec2)) continue;
+            std::ifstream ifs(p);
+            if (!ifs.is_open()) continue;
+            try {
+                nlohmann::json jm = nlohmann::json::parse(ifs, nullptr, true);
+                fc::applyCameraParamsJson(jm, baseCfg, baseOps);
+                paramSource = p.string();
+            } catch (const std::exception& e) {
+                spdlog::warn("master params parse failed ({}), fallback to builtin", e.what());
+            }
+            break;
+        }
+    }
+    spdlog::info("params source: {}", paramSource);
+    return loadCameraInput(dir, &baseCfg, &baseOps);
+}
 
 // ---------------------------------------------------------------------------
 // Step 1: 角点提取
@@ -99,7 +137,7 @@ CornerExtractionResult extractCorners(const CameraInput& input,
     }
     out.validFrames = static_cast<int>(out.leftPoints.size());
 
-    if (out.validFrames < 4) {
+    if (out.validFrames < input.ops.framesMinValidFrames) {
         std::ostringstream os;
         os << "[error] too few valid frames: " << out.validFrames;
         log(cb, os.str());
@@ -144,12 +182,13 @@ calib::IntrinsicCalibResult calibrateIntrinsic(
 // ---------------------------------------------------------------------------
 calib::ExtrinsicCalibCpuResult calibrateExtrinsic(
     const CameraCalibConfig& cfg,
+    const CameraOpParams& ops,
     const CornerExtractionResult& corners,
     const calib::IntrinsicCalibResult& intrin,
     const CalibCallbacks& cb)
 {
     log(cb, "[step 3/5] 外参标定...");
-    auto ep = makeExtrinParams(cfg, corners.leftPoints, corners.rightPoints);
+    auto ep = makeExtrinParams(cfg, ops, corners.leftPoints, corners.rightPoints);
     calib::ExtrinsicCalibCpu extrin(ep);
     auto res = extrin.Execute(
         intrin.left.camera_matrix, intrin.left.dist_coeffs,
@@ -264,9 +303,10 @@ bool runCameraCalib(const std::string& inputDir,
                     const std::string& outputPath,
                     const CalibCallbacks& cb) {
     log(cb, std::string("--- 加载输入: ") + inputDir);
-    auto input = loadCameraInput(inputDir);
+    auto input = loadCameraInputMerged(inputDir);
     if (!input) { log(cb, "[error] load input failed"); return false; }
     const auto& cfg = input->config;
+    const auto& ops = input->ops;
 
     auto corners = extractCorners(*input, cb);
     if (!corners.success) return false;
@@ -274,7 +314,7 @@ bool runCameraCalib(const std::string& inputDir,
     auto intrin = calibrateIntrinsic(cfg, corners, cb);
     if (!intrin.success) return false;
 
-    auto extrin = calibrateExtrinsic(cfg, corners, intrin, cb);
+    auto extrin = calibrateExtrinsic(cfg, ops, corners, intrin, cb);
     if (!extrin.success) return false;
 
     auto rect = stereoRectify(cfg, intrin, extrin, cb);
@@ -291,13 +331,6 @@ bool runCameraCalib(const std::string& inputDir,
         return false;
     }
     log(cb, std::string("--- camera_calib done -> ") + outputPath);
-
-    std::string processPath = deriveProcessPath(outputPath);
-    if (writeJson(processPath, buildCameraCalibProcessJson(cfg, intrin, extrin))) {
-        log(cb, std::string("--- process data -> ") + processPath);
-    } else {
-        log(cb, std::string("[warn] process json write failed: ") + processPath);
-    }
     return true;
 }
 

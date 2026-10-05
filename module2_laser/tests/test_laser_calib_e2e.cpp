@@ -1,9 +1,9 @@
-// test_laser_calib_e2e.cpp — 模块2 端到端冒烟测试
+﻿// test_laser_calib_e2e.cpp 鈥?妯″潡2 绔埌绔啋鐑熸祴璇?
 //
-// 主工程无完整 4-1~4-13 串联 fixture → 降级为冒烟测试（Task 6.3 Step 2）
-// 策略：构造最小合法 handoff + config + 全黑小图, 调 laser_calib.exe,
-//      校验: 不崩、输出 JSON 存在、schema 正确、build 字段 = 6.2-e
-// 不验证精度（全黑图没有激光线，绝大多数帧会 skip，haveVirtualPose=false 退 1）
+// 涓诲伐绋嬫棤瀹屾暣 4-1~4-14 涓茶仈 fixture 鈫?闄嶇骇涓哄啋鐑熸祴璇曪紙Task 6.3 Step 2锛?
+// 绛栫暐锛氭瀯閫犳渶灏忓悎娉?handoff + config + 鍏ㄩ粦灏忓浘, 璋?laser_calib.exe,
+//      鏍￠獙: 涓嶅穿銆佽緭鍑?JSON 瀛樺湪銆乻chema 姝ｇ‘銆乥uild 瀛楁 = 6.3-cmtt
+// 涓嶉獙璇佺簿搴︼紙鍏ㄩ粦鍥炬病鏈夋縺鍏夌嚎锛岀粷澶у鏁板抚浼?skip锛宧aveVirtualPose=false 閫€ 1锛?
 
 #include <gtest/gtest.h>
 #include <opencv2/core.hpp>
@@ -24,8 +24,8 @@ namespace {
 constexpr int kW = 128;
 constexpr int kH = 128;
 
-// 构造最小合法 camera_calib.json（与模块1 buildCameraCalibJson 输出 schema 对齐）
-// 内参用单位矩阵, 畸变全 0, R=I, T=[100,0,0], Q 标准三角化矩阵
+// 鏋勯€犳渶灏忓悎娉?camera_calib.json锛堜笌妯″潡1 buildCameraCalibJson 杈撳嚭 schema 瀵归綈锛?
+// 鍐呭弬鐢ㄥ崟浣嶇煩闃? 鐣稿彉鍏?0, R=I, T=[100,0,0], Q 鏍囧噯涓夎鍖栫煩闃?
 std::string makeHandoffJson() {
     json j;
     j["schema"]        = "factory_calib.camera_calib.v1";
@@ -39,7 +39,7 @@ std::string makeHandoffJson() {
     auto I3 = json::array({{1.0,0.0,0.0},{0.0,1.0,0.0},{0.0,0.0,1.0}});
     auto D1x5 = json::array({0.0,0.0,0.0,0.0,0.0});
 
-    // intrinsic.left/right（MonocularCalibResult::toJson 字段）
+    // intrinsic.left/right锛圡onocularCalibResult::toJson 瀛楁锛?
     auto mono = [&]() {
         json m;
         m["camera_matrix"]     = I3;
@@ -60,7 +60,7 @@ std::string makeHandoffJson() {
     intr["total_frames_input"]  = 4;
     j["intrinsic"] = intr;
 
-    // extrinsic（ExtrinsicCalibCpuResult::toJson 字段）
+    // extrinsic锛圗xtrinsicCalibCpuResult::toJson 瀛楁锛?
     json ext;
     ext["success"]               = true;
     ext["message"]               = "";
@@ -78,7 +78,7 @@ std::string makeHandoffJson() {
     ext["perViewEpipolarErrors"] = std::vector<double>{};
     j["extrinsic"] = ext;
 
-    // rectify（StereoRectifyCpuResult::toJson 字段）
+    // rectify锛圫tereoRectifyCpuResult::toJson 瀛楁锛?
     json rec;
     rec["success"]      = true;
     rec["message"]      = "";
@@ -108,7 +108,7 @@ std::string makeConfigJson() {
                       {"depthMax", 500.0f},
                       {"depthSamples", 10},
                       {"epipolarStep", 1.0f}};
-    j["lineIds"] = std::vector<int>{0, 1};  // 显式提供, 避免依赖反推
+    j["lineIds"] = std::vector<int>{0, 1};  // 鏄惧紡鎻愪緵, 閬垮厤渚濊禆鍙嶆帹
     j["temperature"] = {{"cte", 23.6e-6},
                         {"referenceTemp", 22.5},
                         {"tempRangeMin", -10.0},
@@ -118,9 +118,9 @@ std::string makeConfigJson() {
     return j.dump(2);
 }
 
-// review I5: lineIds 缺省 (config 不提供) 全黑图也无 4-11 lineCurves
-// 期望: 进入 4-13 时 effectiveLineIds 仍空 → 跳过 4-13 (而非崩溃)
-//       输出 JSON status=partial, 不抛异常
+// review I5: lineIds 缂虹渷 (config 涓嶆彁渚? 鍏ㄩ粦鍥句篃鏃?4-11 lineCurves)
+// 鏈熸湜: 杩涘叆 4-14 鏃?effectiveLineIds 浠嶇┖ 鈫?璺宠繃 4-14 (鑰岄潪宕╂簝)
+//       杈撳嚭 JSON status=partial, 涓嶆姏寮傚父
 std::string makeConfigJsonNoLineIds() {
     json j;
     j["deviceId"] = 0;
@@ -129,7 +129,7 @@ std::string makeConfigJsonNoLineIds() {
                       {"depthMax", 500.0f},
                       {"depthSamples", 10},
                       {"epipolarStep", 1.0f}};
-    // 故意不提供 lineIds
+    // 鏁呮剰涓嶆彁渚?lineIds
     j["temperature"] = {{"cte", 23.6e-6},
                         {"referenceTemp", 22.5},
                         {"tempRangeMin", -10.0},
@@ -153,14 +153,14 @@ void writeBlackPng(const fs::path& p) {
 } // namespace
 
 // ============================================================================
-// TEST 1: 完整 smoke —— 调 laser_calib.exe, 校验不崩 + schema
+// TEST 1: 瀹屾暣 smoke 鈥斺€?璋?laser_calib.exe, 鏍￠獙涓嶅穿 + schema
 // ============================================================================
 TEST(LaserCalibE2E, SmokeDoesNotCrash) {
     const char* exe = std::getenv("LASER_CALIB_EXE");
     ASSERT_NE(exe, nullptr) << "LASER_CALIB_EXE env must be set (CMakeLists sets it)";
     ASSERT_TRUE(fs::exists(exe)) << "exe not found: " << exe;
 
-    // 临时数据目录
+    // 涓存椂鏁版嵁鐩綍
     fs::path root = fs::temp_directory_path() / "laser_smoke_e2e";
     fs::remove_all(root);
     fs::create_directories(root);
@@ -179,28 +179,28 @@ TEST(LaserCalibE2E, SmokeDoesNotCrash) {
 
     int rc = std::system(cmd.c_str());
 
-    // 冒烟: exit 0 或 1 都接受 (全黑图 → 多数 frame skip → haveVirtualPose=false → exit 1)
-    // 关键是不崩 (rc 不应该是 -1 / 0xC0000005 等)
+    // 鍐掔儫: exit 0 鎴?1 閮芥帴鍙?(鍏ㄩ粦鍥?鈫?澶氭暟 frame skip 鈫?haveVirtualPose=false 鈫?exit 1)
+    // 鍏抽敭鏄笉宕?(rc 涓嶅簲璇ユ槸 -1 / 0xC0000005 绛?
     EXPECT_GE(rc, 0);
     EXPECT_LE(rc, 1);
 
-    // 输出 JSON 存在 + schema 正确
+    // 杈撳嚭 JSON 瀛樺湪 + schema 姝ｇ‘
     EXPECT_TRUE(fs::exists(outJson)) << "output json missing";
     if (fs::exists(outJson)) {
         std::ifstream ifs(outJson);
         ASSERT_TRUE(ifs.is_open());
         json j;
         ifs >> j;
-        EXPECT_EQ(j.value("schema", ""), "factory_calib.laser_calib.v1");
-        EXPECT_EQ(j.value("build", ""),  "6.2-e");
+        EXPECT_EQ(j.value("schema", ""), "factory_calib.laser_calib.v2");
+        EXPECT_EQ(j.value("build", ""), "6.3-cmtt");
         EXPECT_EQ(j.value("posesProcessed", -1), 1);
-        // 全黑图无激光线 → 累积点应为 0, virtualPose=false
+        // 鍏ㄩ粦鍥炬棤婵€鍏夌嚎 鈫?绱Н鐐瑰簲涓?0, virtualPose=false
         EXPECT_FALSE(j.value("haveVirtualPose", true));
     }
 }
 
 // ============================================================================
-// TEST 2: 缺 handoff 文件 → 应当 graceful exit 1, 不崩
+// TEST 2: 缂?handoff 鏂囦欢 鈫?搴斿綋 graceful exit 1, 涓嶅穿
 // ============================================================================
 TEST(LaserCalibE2E, MissingHandoffGracefulExit) {
     const char* exe = std::getenv("LASER_CALIB_EXE");
@@ -210,20 +210,20 @@ TEST(LaserCalibE2E, MissingHandoffGracefulExit) {
     fs::remove_all(root);
     fs::create_directories(root);
     writeFile(root / "config.json", makeConfigJson());
-    // 故意不写 camera_calib.json
+    // 鏁呮剰涓嶅啓 camera_calib.json
 
     fs::path outJson = root / "out.json";
     std::string cmd = std::string(exe) + " " + root.string() + " " + outJson.string();
     int rc = std::system(cmd.c_str());
 
-    EXPECT_EQ(rc, 1);              // loadLaserInput 失败 → return 1
-    EXPECT_FALSE(fs::exists(outJson)); // 不应该写输出
+    EXPECT_EQ(rc, 1);              // loadLaserInput 澶辫触 鈫?return 1
+    EXPECT_FALSE(fs::exists(outJson)); // 涓嶅簲璇ュ啓杈撳嚭
 }
 
 // ============================================================================
-// TEST 3: review C1/I5 防回归 — lineIds 缺省 + 全黑图, 不应崩溃
-//   之前 bug: lineIds 空 → PlaneMapTempTable 构造抛 invalid_argument → terminate
-//   修复后期望: effectiveLineIds 空 → 跳过 4-13 → status=partial, exit=1, 不崩
+// TEST 3: review C1/I5 闃插洖褰?鈥?lineIds 缂虹渷 + 鍏ㄩ粦鍥? 涓嶅簲宕╂簝
+//   涔嬪墠 bug: lineIds 绌?鈫?PlaneMapTempTable 鏋勯€犳姏 invalid_argument 鈫?terminate
+//   淇鍚庢湡鏈? effectiveLineIds 绌?鈫?璺宠繃 4-14 鈫?status=partial, exit=1, 涓嶅穿
 // ============================================================================
 TEST(LaserCalibE2E, LineIdsEmptyDoesNotCrash) {
     const char* exe = std::getenv("LASER_CALIB_EXE");
@@ -234,7 +234,7 @@ TEST(LaserCalibE2E, LineIdsEmptyDoesNotCrash) {
     fs::remove_all(root);
     fs::create_directories(root);
 
-    writeFile(root / "config.json",       makeConfigJsonNoLineIds());  // 不提供 lineIds
+    writeFile(root / "config.json",       makeConfigJsonNoLineIds());  // 涓嶆彁渚?lineIds
     writeFile(root / "camera_calib.json", makeHandoffJson());
 
     fs::path pose = root / "pose_00";
@@ -248,25 +248,25 @@ TEST(LaserCalibE2E, LineIdsEmptyDoesNotCrash) {
 
     int rc = std::system(cmd.c_str());
 
-    // 关键断言: 不崩溃 (rc 0 或 1, 而非 0xC0000005 等)
+    // 鍏抽敭鏂█: 涓嶅穿婧?(rc 0 鎴?1, 鑰岄潪 0xC0000005 绛?
     EXPECT_GE(rc, 0);
     EXPECT_LE(rc, 1);
 
-    // 输出文件存在 + status=partial (全黑图无 4-11 lineCurves → 跳过 4-13)
+    // 杈撳嚭鏂囦欢瀛樺湪 + status=partial (鍏ㄩ粦鍥炬棤 4-11 lineCurves 鈫?璺宠繃 4-14)
     EXPECT_TRUE(fs::exists(outJson));
     if (fs::exists(outJson)) {
         std::ifstream ifs(outJson);
         ASSERT_TRUE(ifs.is_open());
         json j;
         ifs >> j;
-        EXPECT_EQ(j.value("schema", ""), "factory_calib.laser_calib.v1");
-        EXPECT_EQ(j.value("status", ""), "partial");  // review I1: status 字段
-        EXPECT_FALSE(j.value("havePlaneTable", true));
+        EXPECT_EQ(j.value("schema", ""), "factory_calib.laser_calib.v2");
+        EXPECT_EQ(j.value("status", ""), "partial");  // review I1: status 瀛楁
+        EXPECT_FALSE(j.value("haveCurveMapTable", true));
     }
 }
 
 // ============================================================================
-// TEST 4: review I3 防回归 — imageSize 缺失, loadCameraCalibHandoff 应拒绝
+// TEST 4: review I3 闃插洖褰?鈥?imageSize 缂哄け, loadCameraCalibHandoff 搴旀嫆缁?
 // ============================================================================
 TEST(LaserCalibE2E, RejectsHandoffWithoutImageSize) {
     const char* exe = std::getenv("LASER_CALIB_EXE");
@@ -277,7 +277,7 @@ TEST(LaserCalibE2E, RejectsHandoffWithoutImageSize) {
     fs::create_directories(root);
     writeFile(root / "config.json", makeConfigJson());
 
-    // handoff 故意删 imageSize
+    // handoff 鏁呮剰鍒?imageSize
     json hj = json::parse(makeHandoffJson());
     hj.erase("imageSize");
     writeFile(root / "camera_calib.json", hj.dump(2));
@@ -291,6 +291,6 @@ TEST(LaserCalibE2E, RejectsHandoffWithoutImageSize) {
     std::string cmd = std::string(exe) + " " + root.string() + " " + outJson.string();
     int rc = std::system(cmd.c_str());
 
-    EXPECT_EQ(rc, 1);  // loadCameraCalibHandoff 返回 nullopt
+    EXPECT_EQ(rc, 1);  // loadCameraCalibHandoff 杩斿洖 nullopt
     EXPECT_FALSE(fs::exists(outJson));
 }

@@ -1,0 +1,22 @@
+{
+  "chessboard": {
+    "width": 11,
+    "height": 8,
+    "square_size_mm": 15.0
+  },
+  "image_size": [2048, 1536],
+  "intrinsic_flags": 0,
+  "use_calibrateCameraRO": true,
+  "reproj_error_threshold": 0.012,
+  "temperature": {
+    "cte": 23.6e-6,
+    "referenceTemp": 22.5,
+    "tempRangeMin": -15.0,
+    "tempRangeMax": 15.0,
+    "tempStep": 0.5
+  },
+  "rectify": {
+    "alpha": 1.0,
+    "flags": 1024
+  }
+}

@@ -39,9 +39,9 @@ namespace calib {
  * 参数复用 02 算子�?ExtrinsicCompensateCPUParams�? * 同时用于 virtual-to-left �?virtual-to-right 两组补偿计算�? */
 struct LaserExtrinsicCompensateCPUParams {
     double cte = 23.6e-6;         ///< 材料线膨胀系数 (/°C)
-    double tempStep = 0.2;        ///< 温度步距 (°C)
-    double tempRangeMin = -10.0;  ///< 参考温度下方范�?(°C)
-    double tempRangeMax = 10.0;   ///< 参考温度上方范�?(°C)
+    double tempStep = 0.5;        ///< 温度步距 (°C)
+    double tempRangeMin = -15.0;  ///< 参考温度下方范�?(°C)
+    double tempRangeMax = 15.0;   ///< 参考温度上方范�?(°C)
 
     void validate() const {
         if (cte <= 0.0)

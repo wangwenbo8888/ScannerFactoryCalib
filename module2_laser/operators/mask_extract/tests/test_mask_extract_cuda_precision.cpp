@@ -113,8 +113,6 @@ protected:
         params_.threshold = 80;
         params_.erodeSize = 5;
         params_.laserDilateSize = 3;
-        params_.minArea = 100;
-        params_.maxArea = 100000;
     }
 
     MaskExtractParams params_;

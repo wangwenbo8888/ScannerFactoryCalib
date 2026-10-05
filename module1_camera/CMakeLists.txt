@@ -11,7 +11,7 @@ file(GLOB_RECURSE M1_OP_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/operators/*.h")
 set(M1_SOURCES "")
 set(M1_TESTS "")
 foreach(f ${M1_OP_CPP} ${M1_TESTS_CPP})
-    if(f MATCHES "tests[\\\\/]test_[^/\\\\]*\\.cpp$")
+    if(f MATCHES "tests[\\\\/].*test_[^/\\\\]*\\.cpp$")
         list(APPEND M1_TESTS ${f})
     elseif(f MATCHES "tests[\\\\/]")
         # 跳过 tests 目录内非 test_ 文件
@@ -46,7 +46,7 @@ add_library(fc1_chess STATIC chessboard_corner.cpp chessboard_corner.h)
 target_include_directories(fc1_chess PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(fc1_chess PUBLIC ${OpenCV_LIBS} spdlog::spdlog)
 
-# === 模块1 I/O（calib_io 读 config/温度/图像 + 写交接 json） ===
+# === 模块1 I/O（calib_io 读 config/温度/图像 + 写交接 json；calib_runner=GUI 分步 API） ===
 add_library(fc1_io STATIC calib_io.cpp calib_io.h calib_runner.cpp calib_runner.h)
 target_include_directories(fc1_io PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(fc1_io PUBLIC fc1_ops ${OpenCV_LIBS} nlohmann_json::nlohmann_json spdlog::spdlog)
@@ -57,13 +57,20 @@ target_link_libraries(camera_calib PRIVATE fc1_ops fc1_chess fc1_io ${OpenCV_LIB
 fc_deploy_crt(camera_calib)
 fc_deploy_opencv_dlls(camera_calib)
 fc_setup_vs_debugger(camera_calib "${CMAKE_SOURCE_DIR}")
+# 主控参数库随 exe 部署（四层合并中间层; 缺失时 CLI 回退内置同值默认）
+add_custom_command(TARGET camera_calib POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/camera_calib_params.json"
+        "$<TARGET_FILE_DIR:camera_calib>/camera_calib_params.json"
+    COMMENT "copy camera_calib_params.json -> exe dir")
 
 # === 测试 ===
 if(FC_BUILD_TESTS)
     foreach(t ${M1_TESTS})
         get_filename_component(tname ${t} NAME_WE)
         add_executable(${tname} ${t})
-        target_link_libraries(${tname} PRIVATE fc1_ops fc1_chess GTest::gtest_main)
+        # fc1_io: 仅 test_camera_chain_analysis 需要（handoff 组装输出），其余测试多链无害
+        target_link_libraries(${tname} PRIVATE fc1_ops fc1_chess fc1_io GTest::gtest_main)
         target_include_directories(${tname} PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}                         # chessboard_corner.h
             ${CMAKE_CURRENT_SOURCE_DIR}/operators ${M1_INC_DIRS})

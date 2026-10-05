@@ -1,0 +1,29 @@
+{
+  "image":       { "width": 1280, "height": 960 },
+  "chessboard":  { "squaresX": 9, "squaresY": 7, "squarePx": 100 },
+  "groundTruth": { "fx": 1200.0, "fy": 1200.0, "cx": 640.0, "cy": 480.0 },
+  "baselineX":   100.0,
+  "poses": [
+    { "yawDeg":   0, "pitchDeg":   0, "z": 1800 },
+    { "yawDeg":  15, "pitchDeg":   0, "z": 1800 },
+    { "yawDeg": -15, "pitchDeg":   0, "z": 1800 },
+    { "yawDeg":   0, "pitchDeg":  15, "z": 1800 },
+    { "yawDeg":   0, "pitchDeg": -15, "z": 1800 },
+    { "yawDeg":  22, "pitchDeg":   0, "z": 2000 },
+    { "yawDeg": -22, "pitchDeg":   0, "z": 2000 },
+    { "yawDeg":   0, "pitchDeg":  22, "z": 2000 },
+    { "yawDeg":   0, "pitchDeg": -22, "z": 2000 },
+    { "yawDeg":  18, "pitchDeg":  12, "z": 1900 },
+    { "yawDeg": -18, "pitchDeg": -12, "z": 1900 },
+    { "yawDeg":  12, "pitchDeg":  18, "z": 1950 },
+    { "yawDeg": -12, "pitchDeg": -18, "z": 1950 },
+    { "yawDeg":  25, "pitchDeg":   0, "z": 2200 },
+    { "yawDeg": -25, "pitchDeg":   0, "z": 2200 },
+    { "yawDeg":   0, "pitchDeg":  25, "z": 2200 },
+    { "yawDeg":   8, "pitchDeg":   8, "z": 1700 },
+    { "yawDeg":  -8, "pitchDeg":  -8, "z": 1700 }
+  ],
+  "frames":      { "targetGood": 12, "minDetected": 10 },
+  "intrinsic":   { "useCalibrateCameraRO": false, "reprojErrorThreshold": 1.0 },
+  "gates":       { "reprojMeanMax": 1.0, "validFramesMin": 10, "fxTolerance": 60.0 }
+}

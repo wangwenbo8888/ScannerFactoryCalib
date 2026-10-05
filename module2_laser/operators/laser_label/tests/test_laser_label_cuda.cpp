@@ -255,6 +255,123 @@ TEST_F(LaserLabelTest, RelabelingByCenterColumnMinY) {
     EXPECT_EQ(h_output.at<int>(152, center_x), 3);
 }
 
+TEST_F(LaserLabelTest, NegativeRealLineToleranceThrows) {
+    params_.realLineTolerance = -1;
+    EXPECT_THROW(params_.validate(), std::invalid_argument);
+}
+
+TEST_F(LaserLabelTest, RealLineToleranceJsonRoundtrip) {
+    params_.realLineTolerance = 5;
+    auto restored = LaserLabelParams::fromJson(params_.toJson());
+    EXPECT_EQ(restored.realLineTolerance, 5);
+}
+
+#ifdef WITH_CUDA_TESTS
+// 等距平行线全保留
+TEST_F(LaserLabelTest, RealLineEquallySpacedAllKept) {
+    params_.realLineTolerance = 3;
+    LaserLabelerCUDA labeler(params_);
+    labeler.Warmup(200, 200);
+
+    cv::Mat labels_cpu = cv::Mat::zeros(200, 200, CV_32SC1);
+    const int ys[5] = {40, 70, 100, 130, 160};
+    for (int i = 0; i < 5; ++i)
+        cv::rectangle(labels_cpu, cv::Point(10, ys[i]), cv::Point(190, ys[i] + 5),
+                      cv::Scalar(i + 1), -1);
+
+    cv::cuda::GpuMat d_labels;
+    d_labels.upload(labels_cpu);
+    auto result = labeler.Execute(d_labels);
+
+    EXPECT_TRUE(result.success);
+    EXPECT_EQ(result.componentCount, 5);
+}
+
+// 等距线族 + 孤立噪声域 → 噪声被剔（判据失配且无真线邻居认领）
+TEST_F(LaserLabelTest, RealLineNoiseRemoved) {
+    params_.realLineTolerance = 3;
+    LaserLabelerCUDA labeler(params_);
+    labeler.Warmup(200, 200);
+
+    cv::Mat labels_cpu = cv::Mat::zeros(200, 200, CV_32SC1);
+    const int ys[3] = {50, 80, 110};                    // 等距 30
+    for (int i = 0; i < 3; ++i)
+        cv::rectangle(labels_cpu, cv::Point(10, ys[i]), cv::Point(190, ys[i] + 5),
+                      cv::Scalar(i + 1), -1);
+    cv::rectangle(labels_cpu, cv::Point(10, 160), cv::Point(190, 165),  // 噪声: 距离 50
+                  cv::Scalar(9), -1);
+
+    cv::cuda::GpuMat d_labels;
+    d_labels.upload(labels_cpu);
+    auto result = labeler.Execute(d_labels);
+
+    EXPECT_TRUE(result.success);
+    EXPECT_EQ(result.componentCount, 3);                // 噪声被剔
+    cv::Mat h_output;
+    result.d_labeledMask->download(h_output);
+    EXPECT_EQ(h_output.at<int>(162, 100), 0);           // 噪声域置 0
+    EXPECT_EQ(h_output.at<int>(82, 100), 2);            // 真线保留
+}
+
+// 渐变间距（透视模拟）: 差分仍小 → 全保留
+TEST_F(LaserLabelTest, RealLineGradientSpacingKept) {
+    params_.realLineTolerance = 3;
+    LaserLabelerCUDA labeler(params_);
+    labeler.Warmup(200, 200);
+
+    cv::Mat labels_cpu = cv::Mat::zeros(200, 200, CV_32SC1);
+    const int ys[4] = {30, 60, 88, 114};                // 间距 30,28,26 → 差分 2
+    for (int i = 0; i < 4; ++i)
+        cv::rectangle(labels_cpu, cv::Point(10, ys[i]), cv::Point(190, ys[i] + 5),
+                      cv::Scalar(i + 1), -1);
+
+    cv::cuda::GpuMat d_labels;
+    d_labels.upload(labels_cpu);
+    auto result = labeler.Execute(d_labels);
+
+    EXPECT_TRUE(result.success);
+    EXPECT_EQ(result.componentCount, 4);
+}
+
+// 域数 <3 不甄别（不构成左-中-右）
+TEST_F(LaserLabelTest, RealLineFewerThan3SkipsFilter) {
+    params_.realLineTolerance = 3;
+    LaserLabelerCUDA labeler(params_);
+    labeler.Warmup(200, 200);
+
+    cv::Mat labels_cpu = cv::Mat::zeros(200, 200, CV_32SC1);
+    cv::rectangle(labels_cpu, cv::Point(10, 50), cv::Point(190, 55), cv::Scalar(1), -1);
+    cv::rectangle(labels_cpu, cv::Point(10, 130), cv::Point(190, 135), cv::Scalar(2), -1);
+
+    cv::cuda::GpuMat d_labels;
+    d_labels.upload(labels_cpu);
+    auto result = labeler.Execute(d_labels);
+
+    EXPECT_TRUE(result.success);
+    EXPECT_EQ(result.componentCount, 2);                // 不甄别, 全保留
+}
+
+// 默认 tolerance=0 功能关闭
+TEST_F(LaserLabelTest, RealLineOffByDefault) {
+    LaserLabelerCUDA labeler(params_);
+    labeler.Warmup(200, 200);
+
+    cv::Mat labels_cpu = cv::Mat::zeros(200, 200, CV_32SC1);
+    const int ys[3] = {50, 80, 110};
+    for (int i = 0; i < 3; ++i)
+        cv::rectangle(labels_cpu, cv::Point(10, ys[i]), cv::Point(190, ys[i] + 5),
+                      cv::Scalar(i + 1), -1);
+    cv::rectangle(labels_cpu, cv::Point(10, 160), cv::Point(190, 165), cv::Scalar(9), -1);
+
+    cv::cuda::GpuMat d_labels;
+    d_labels.upload(labels_cpu);
+    auto result = labeler.Execute(d_labels);
+
+    EXPECT_TRUE(result.success);
+    EXPECT_EQ(result.componentCount, 4);                // 未启用 → 全保留
+}
+#endif // WITH_CUDA_TESTS
+
 // ============================================================================
 // label 测试 - 空输入
 // ============================================================================

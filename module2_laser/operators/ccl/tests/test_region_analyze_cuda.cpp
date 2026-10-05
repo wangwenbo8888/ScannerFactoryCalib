@@ -341,6 +341,72 @@ TEST_F(RegionAnalyzerTest, AreaFiltering) {
     EXPECT_EQ(result.componentCount, 1);
 }
 
+TEST_F(RegionAnalyzerTest, NegativeTopXCountThrows) {
+    params_.topXCount = -1;
+    EXPECT_THROW(params_.validate(), std::invalid_argument);
+}
+
+TEST_F(RegionAnalyzerTest, TopXCountJsonRoundtrip) {
+    params_.topXCount = 25;
+    auto restored = RegionAnalyzerParams::fromJson(params_.toJson());
+    EXPECT_EQ(restored.topXCount, 25);
+}
+
+#ifdef WITH_CUDA_TESTS
+TEST_F(RegionAnalyzerTest, TopXFiltering) {
+    RegionAnalyzerParams p;
+    p.minArea = 1;          // 三个块都过面积门禁
+    p.maxArea = 100000;
+    p.topXCount = 2;        // 只留最大的 2 个
+
+    RegionAnalyzerCUDA analyzer(p);
+    analyzer.Warmup(200, 200);
+
+    cv::Mat mask = cv::Mat::zeros(200, 200, CV_8UC1);
+    cv::rectangle(mask, cv::Point(0, 0), cv::Point(30, 30), cv::Scalar(255), -1);    // 31x31=961
+    cv::rectangle(mask, cv::Point(50, 50), cv::Point(80, 80), cv::Scalar(255), -1);  // 31x31=961
+    cv::rectangle(mask, cv::Point(120, 120), cv::Point(150, 150), cv::Scalar(255), -1); // 31x31=961 → 并列全留
+    // 面积互不并列版本：
+    cv::Mat mask2 = cv::Mat::zeros(200, 200, CV_8UC1);
+    cv::rectangle(mask2, cv::Point(0, 0), cv::Point(30, 30), cv::Scalar(255), -1);   // 961
+    cv::rectangle(mask2, cv::Point(50, 50), cv::Point(70, 70), cv::Scalar(255), -1); // 21x21=441
+    cv::rectangle(mask2, cv::Point(120, 120), cv::Point(150, 150), cv::Scalar(255), -1); // 961
+
+    cv::cuda::GpuMat d_mask;
+    d_mask.upload(mask);
+    auto r1 = analyzer.Execute(d_mask);
+    ASSERT_TRUE(r1.success);
+    // 三块面积并列 961 == 第2大阈值 → 全部保留（>=X）
+    EXPECT_EQ(r1.componentCount, 3);
+
+    d_mask.upload(mask2);
+    auto r2 = analyzer.Execute(d_mask);
+    ASSERT_TRUE(r2.success);
+    // 961/961/441, topX=2 → 阈值 961, 441 被删 → 2 个
+    EXPECT_EQ(r2.componentCount, 2);
+    for (const auto& c : r2.components) {
+        EXPECT_GE(c.boundingBoxWidth * c.boundingBoxHeight, 30 * 30);
+    }
+}
+
+TEST_F(RegionAnalyzerTest, TopXOffByDefault) {
+    RegionAnalyzerParams p;
+    p.minArea = 1;
+    RegionAnalyzerCUDA analyzer(p);
+    analyzer.Warmup(200, 200);
+
+    cv::Mat mask = cv::Mat::zeros(200, 200, CV_8UC1);
+    cv::rectangle(mask, cv::Point(0, 0), cv::Point(30, 30), cv::Scalar(255), -1);
+    cv::rectangle(mask, cv::Point(50, 50), cv::Point(70, 70), cv::Scalar(255), -1);
+
+    cv::cuda::GpuMat d_mask;
+    d_mask.upload(mask);
+    auto r = analyzer.Execute(d_mask);
+    ASSERT_TRUE(r.success);
+    EXPECT_EQ(r.componentCount, 2);   // topXCount=0 不生效
+}
+#endif // WITH_CUDA_TESTS
+
 TEST_F(RegionAnalyzerTest, AnalyzeEmptyInputReturnsError) {
     RegionAnalyzerCUDA analyzer(params_);
     cv::cuda::GpuMat d_empty;
@@ -939,6 +1005,69 @@ TEST_F(RegionAnalyzerTest, MinAreaBoundaryExact) {
         EXPECT_EQ(result.componentCount, 1);
     } else {
         EXPECT_EQ(result.componentCount, 0);
+    }
+}
+
+// ============================================================
+// topX GPU 收集路径（2026-08 优化）回归测试
+// ============================================================
+
+// 大量连通域压力测试（标签空间稀疏，116964 域 >> 常规图）；计数与质量标记仍正确
+TEST_F(RegionAnalyzerTest, ManyComponentsStress) {
+    RegionAnalyzerParams p;
+    p.minArea = 1;
+    p.maxArea = 100000;
+
+    RegionAnalyzerCUDA analyzer(p);
+    analyzer.Warmup(1024, 1024);
+
+    // 1×1 孤立点阵，周期 3px（互不连通）：x,y ∈ {0,3,...,1023} → 342×342 个
+    cv::Mat mask = cv::Mat::zeros(1024, 1024, CV_8UC1);
+    for (int y = 0; y < 1024; y += 3)
+        for (int x = 0; x < 1024; x += 3)
+            mask.at<uchar>(y, x) = 255;
+
+    cv::cuda::GpuMat d_mask;
+    d_mask.upload(mask);
+
+    const int expected = 342 * 342;  // = 116964
+    auto result = analyzer.Execute(d_mask);
+
+    EXPECT_TRUE(result.success);
+    EXPECT_GT(expected, 65536);
+    EXPECT_EQ(result.componentCount, expected);
+    EXPECT_EQ(result.components.size(), static_cast<size_t>(expected));
+    EXPECT_EQ(result.qualityFlag, calib::QualityFlag::Degraded);
+}
+
+// topX 并列语义：面积==阈值的域全部保留（结果数可 >= topXCount）
+TEST_F(RegionAnalyzerTest, TopXKeepsTiedAreas) {
+    RegionAnalyzerParams p;
+    p.minArea = 1;
+    p.maxArea = 100000;
+    p.topXCount = 2;
+
+    RegionAnalyzerCUDA analyzer(p);
+    analyzer.Warmup(100, 100);
+
+    // 三个等面积（11×11）互不连通的块
+    cv::Mat mask = cv::Mat::zeros(100, 100, CV_8UC1);
+    cv::rectangle(mask, cv::Point(5, 5), cv::Point(15, 15), cv::Scalar(255), -1);
+    cv::rectangle(mask, cv::Point(40, 5), cv::Point(50, 15), cv::Scalar(255), -1);
+    cv::rectangle(mask, cv::Point(75, 5), cv::Point(85, 15), cv::Scalar(255), -1);
+
+    cv::cuda::GpuMat d_mask;
+    d_mask.upload(mask);
+
+    auto result = analyzer.Execute(d_mask);
+
+    EXPECT_TRUE(result.success);
+    // 第 2 大面积 = 121，三个域并列 → 全保留（语义与旧版一致）
+    EXPECT_EQ(result.componentCount, 3);
+    EXPECT_EQ(result.components.size(), 3u);
+    for (const auto& comp : result.components) {
+        EXPECT_EQ(comp.boundingBoxWidth, 11);
+        EXPECT_EQ(comp.boundingBoxHeight, 11);
     }
 }
 

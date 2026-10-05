@@ -71,20 +71,6 @@ TEST_F(MaskExtractTest, EvenDilateSizeThrows) {
     EXPECT_THROW(params_.validate(), std::invalid_argument);
 }
 
-TEST_F(MaskExtractTest, NegativeMinAreaThrows) {
-    params_.minArea = -1;
-    EXPECT_THROW(params_.validate(), std::invalid_argument);
-}
-
-TEST_F(MaskExtractTest, MaxAreaLessThanOrEqualMinAreaThrows) {
-    params_.minArea = 100;
-    params_.maxArea = 100;
-    EXPECT_THROW(params_.validate(), std::invalid_argument);
-
-    params_.maxArea = 50;
-    EXPECT_THROW(params_.validate(), std::invalid_argument);
-}
-
 // ============================================================
 // JSON 序列化测试
 // ============================================================
@@ -95,8 +81,6 @@ TEST_F(MaskExtractTest, JsonRoundtrip) {
     EXPECT_EQ(restored.threshold, params_.threshold);
     EXPECT_EQ(restored.erodeSize, params_.erodeSize);
     EXPECT_EQ(restored.laserDilateSize, params_.laserDilateSize);
-    EXPECT_EQ(restored.minArea, params_.minArea);
-    EXPECT_EQ(restored.maxArea, params_.maxArea);
 }
 
 TEST_F(MaskExtractTest, JsonPartialDeserialization) {
@@ -211,8 +195,6 @@ TEST_F(MaskExtractTest, SetParamsAndGetParams) {
     newParams.threshold = 120;
     newParams.erodeSize = 7;
     newParams.laserDilateSize = 5;
-    newParams.minArea = 50;
-    newParams.maxArea = 200000;
 
     extractor.SetParams(newParams);
     const auto& current = extractor.GetParams();

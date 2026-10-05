@@ -294,7 +294,7 @@ void CameraCalibTab::onRunStep(int step) {
         try {
             // 加载 input（如果还没加载或第一步）
             if (!input_ || requestedStep <= 1) {
-                input_ = loadCameraInput(inputDirStr);
+                input_ = loadCameraInputMerged(inputDirStr);
                 if (!input_) {
                     spdlog::error("[camera tab] 加载输入失败");
                     return false;
@@ -320,7 +320,7 @@ void CameraCalibTab::onRunStep(int step) {
             }
             if (requestedStep >= 3) {
                 if (!extrin_ || !extrin_->success) {
-                    extrin_ = calibrateExtrinsic(input_->config, *corners_, *intrin_, cb);
+                    extrin_ = calibrateExtrinsic(input_->config, input_->ops, *corners_, *intrin_, cb);
                     if (!extrin_->success) return false;
                 }
             }
@@ -337,9 +337,8 @@ void CameraCalibTab::onRunStep(int step) {
                 std::string outPath = outputEdit_->text().trimmed().toStdString();
                 if (outPath.empty()) outPath = "camera_calib.json";
                 if (!writeJson(outPath, j)) return false;
-                std::string processPath = fc::deriveProcessPath(outPath);
-                writeJson(processPath,
-                          fc::buildCameraCalibProcessJson(input_->config, *intrin_, *extrin_));
+                // 注：2026-10 算法线同步后不再拆「结果/过程」两文件——
+                // 结果 JSON 自带全部逐视角数据（与 camera_calib.exe 产物一致）
             }
             return true;
         } catch (const std::exception& e) {

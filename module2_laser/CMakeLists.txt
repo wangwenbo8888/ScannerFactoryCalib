@@ -2,6 +2,11 @@
 find_package(OpenCV 4.13 REQUIRED COMPONENTS
     core imgproc calib3d cudaimgproc cudaarithm cudafilters flann)
 find_package(Eigen3 3.4 REQUIRED)
+# E(2026-09-03): 链接 OpenMP——此前 curve_map 行级 #pragma omp 被静默忽略（61 档生成串行）；
+# 写法对齐 09 侧（modules/09_operatorlib/CMakeLists.txt:49,65）。
+# 注：限定 COMPONENTS CXX——本树 CUDA 语言已启用，不限定时 FindOpenMP 会连带要求
+# OpenMP_CUDA（MSVC 无 CUDA OpenMP 实现而误报失败）；模块仅消费 OpenMP::OpenMP_CXX。
+find_package(OpenMP REQUIRED COMPONENTS CXX)
 
 file(GLOB_RECURSE M2_OP_CPP "${CMAKE_CURRENT_SOURCE_DIR}/operators/*.cpp")
 file(GLOB_RECURSE M2_OP_CU  "${CMAKE_CURRENT_SOURCE_DIR}/operators/*.cu")
@@ -32,7 +37,8 @@ if(M2_SOURCES)
         ${CMAKE_CURRENT_SOURCE_DIR}/operators
         ${M2_INC_DIRS})
     target_link_libraries(fc2_ops PUBLIC
-        ${OpenCV_LIBS} Eigen3::Eigen spdlog::spdlog nlohmann_json::nlohmann_json)
+        ${OpenCV_LIBS} Eigen3::Eigen spdlog::spdlog nlohmann_json::nlohmann_json
+        OpenMP::OpenMP_CXX)
     target_compile_definitions(fc2_ops PUBLIC BUILD_CUDA=1)
     target_compile_definitions(fc2_ops PRIVATE LM_ENABLE_TIMING=1)
     if(MSVC)
@@ -54,7 +60,8 @@ elseif(EXISTS "${OpenCV_DIR}/lib/opencv_imgcodecs4130.lib")
 endif()
 
 if(TARGET fc2_ops AND FC2_IMGCODECS_LIB)
-    # 把 laser_calib_cli.cpp 也编进 fc2_io（FC2_BUILDING_LIB 让它跳过 main()）
+    # 把 laser_calib_cli.cpp 也编进 fc2_io（FC2_BUILDING_LIB 让它跳过 main()），
+    # calib_runner 三件套 = GUI 进程内调用入口（与产线 GUI 库链接约定一致）
     add_library(fc2_io STATIC calib_io.cpp calib_io.h
                             calib_runner.cpp calib_runner.h
                             laser_calib_cli.cpp
@@ -76,7 +83,31 @@ if(TARGET fc2_ops AND FC2_IMGCODECS_LIB)
     fc_deploy_crt(laser_calib)
     fc_deploy_opencv_dlls(laser_calib)
     fc_setup_vs_debugger(laser_calib "${CMAKE_SOURCE_DIR}")
-    message(STATUS "fc2_io + laser_calib: ENABLED (imgcodecs at ${FC2_IMGCODECS_LIB})")
+    # 主控参数库随 exe 部署（三层合并中间层; 缺失时 CLI 回退内置同值默认）
+    add_custom_command(TARGET laser_calib POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/laser_calib_params.json"
+            "$<TARGET_FILE_DIR:laser_calib>/laser_calib_params.json"
+        COMMENT "copy laser_calib_params.json -> exe dir")
+
+    add_executable(fcstepdump tools/fcstepdump.cpp tools/mask_bench.cpp tools/interp_bench.cu)
+    target_link_libraries(fcstepdump PRIVATE fc2_ops fc2_io)
+    if(MSVC)
+        target_compile_options(fcstepdump PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:/bigobj>
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
+    endif()
+    fc_deploy_crt(fcstepdump)
+
+    add_executable(fcscan_e2e tools/fcscan_e2e.cpp)
+    add_executable(fcchain_v3 tools/fcchain_v3.cpp)
+    target_link_libraries(fcscan_e2e PRIVATE fc2_ops fc2_io)
+    target_link_libraries(fcchain_v3 PRIVATE fc2_ops fc2_io)
+    if(MSVC)
+        target_compile_options(fcscan_e2e PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/bigobj>)
+    endif()
+    fc_deploy_crt(fcscan_e2e)
+    message(STATUS "fc2_io + laser_calib + fcstepdump(+mask_bench) + fcscan_e2e: ENABLED (imgcodecs at ${FC2_IMGCODECS_LIB})")
 else()
     message(WARNING
         "fc2_io + laser_calib: SKIPPED (imgcodecs not found; "
@@ -87,7 +118,7 @@ endif()
 if(FC_BUILD_TESTS)
     foreach(t ${M2_TESTS})
         get_filename_component(tname ${t} NAME_WE)
-        set(tname "fc2_${tname}")  # 加 fc2_ 前缀避免与模块1 测试同名冲突
+        set(tname "fc2_${tname}")  # 加 fc2_ 前缀避免与模块1 测试同名冲突（合建 build_fc_all）
         add_executable(${tname} ${t})
         if(TARGET fc2_ops)
             target_link_libraries(${tname} PRIVATE fc2_ops GTest::gtest_main)

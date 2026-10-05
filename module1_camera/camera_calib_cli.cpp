@@ -9,10 +9,13 @@
 #include "stereo_rectify_temp_table_cpu.h"
 
 #include <spdlog/spdlog.h>
+#include <nlohmann/json.hpp>
 #include <iostream>
 #include <string>
 #include <utility>
 #include <vector>
+#include <filesystem>
+#include <fstream>
 
 using namespace fc;
 using namespace calib;
@@ -37,27 +40,26 @@ IntrinsicCalibParams makeIntrinParams(const CameraCalibConfig& c) {
 // 注意: ExtrinsicCalibCpuParams 不持有 cameraMatrixL/distCoeffsL/R —— 这些通过
 // Execute(KL,DL,KR,DR) 重载在调用点直接传入（见 step 3）。本函数只填观测点+板参数。
 ExtrinsicCalibCpuParams makeExtrinParams(const CameraCalibConfig& c,
+    const CameraOpParams& ops,
     const std::vector<std::vector<cv::Point2f>>& lpts,
     const std::vector<std::vector<cv::Point2f>>& rpts)
 {
     ExtrinsicCalibCpuParams p;
     p.leftPointsPerView = lpts;
     p.rightPointsPerView = rpts;
-    // 物点：与 IntrinsicCalibCPU::generateObjectPoints 同一约定（行主序 + 温度膨胀修正），
-    // 保证内/外参尺度一致。validate() 要求 objectPoints 数 == 每视角角点数。
-    double actualSize = c.squareSizeMm * (1.0 + c.plateTempCoeff * (c.plateTemp - 20.0));
-    p.objectPoints.reserve(static_cast<size_t>(c.chessWidth) * c.chessHeight);
+    p.imageSize = cv::Size(c.imageWidth, c.imageHeight);
+    p.patternSize = cv::Size(c.chessWidth, c.chessHeight);
+    p.squareSize = static_cast<float>(c.squareSizeMm);
+    p.maxReprojError = c.reprojErrorThreshold * ops.extrinsicMaxReprojFactor;
+    p.minViewCount = ops.extrinsicMinViewCount;
+    // 物点网格与 IntrinsicCalibCPU::generateObjectPoints 同约定（行主序+板热膨胀）
+    const double actualSize = c.squareSizeMm *
+        (1.0 + c.plateTempCoeff * (c.plateTemp - 20.0));
     for (int i = 0; i < c.chessHeight; ++i)
         for (int j = 0; j < c.chessWidth; ++j)
             p.objectPoints.emplace_back(
                 static_cast<float>(j * actualSize),
-                static_cast<float>(i * actualSize),
-                0.0f);
-    p.imageSize = cv::Size(c.imageWidth, c.imageHeight);
-    p.patternSize = cv::Size(c.chessWidth, c.chessHeight);
-    p.squareSize = static_cast<float>(c.squareSizeMm);
-    p.maxReprojError = c.reprojErrorThreshold * 100.0;
-    p.minViewCount = 4;
+                static_cast<float>(i * actualSize), 0.0f);
     return p;
 }
 
@@ -72,9 +74,46 @@ int main(int argc, char** argv) {
     std::string inDir = argv[1];
     std::string outPath = argc >= 3 ? argv[2] : "camera_calib.json";
 
-    auto input = loadCameraInput(inDir);
+    // ------------------------------------------------------------------
+    // 0. 参数四层合并: 编译内置 ← camera_calib_params.json(主库) ← 数据集 config.json
+    //    ← temps.txt(ref_temp)
+    //    主库定位: exe 旁(POST_BUILD 拷贝) → cwd → 源码树兜底; 全缺＝内置(等值, warn)
+    // ------------------------------------------------------------------
+    CameraCalibConfig baseCfg;
+    CameraOpParams    baseOps;
+    std::string paramSource = "builtin defaults (master json not found)";
+    {
+        namespace fs = std::filesystem;
+        std::vector<std::filesystem::path> cand;
+        std::error_code ec;
+        if (argc > 0) {
+            auto exeDir = std::filesystem::absolute(std::filesystem::path(argv[0]), ec).parent_path();
+            if (!ec) cand.push_back(exeDir / "camera_calib_params.json");
+        }
+        cand.push_back(std::filesystem::path("camera_calib_params.json"));
+        cand.push_back(std::filesystem::path(
+            "E:/JEAMMWARE2601001/factory_calib/module1_camera/camera_calib_params.json"));
+        for (const auto& p : cand) {
+            std::error_code ec2;
+            if (!std::filesystem::exists(p, ec2)) continue;
+            std::ifstream ifs(p);
+            if (!ifs.is_open()) continue;
+            try {
+                nlohmann::json jm = nlohmann::json::parse(ifs, nullptr, true);
+                fc::applyCameraParamsJson(jm, baseCfg, baseOps);
+                paramSource = p.string();
+            } catch (const std::exception& e) {
+                spdlog::warn("master params parse failed ({}), fallback to builtin", e.what());
+            }
+            break;
+        }
+    }
+    spdlog::info("params source: {}", paramSource);
+
+    auto input = loadCameraInput(inDir, &baseCfg, &baseOps);
     if (!input) { spdlog::error("load input failed"); return 1; }
     const auto& cfg = input->config;
+    const auto& ops = input->ops;
 
     // 1. 逐帧提取棋盘角点
     ChessboardCornerParams cp;
@@ -92,7 +131,9 @@ int main(int argc, char** argv) {
         lpts.push_back(std::move(rl.corners));
         rpts.push_back(std::move(rr.corners));
     }
-    if (lpts.size() < 4) { spdlog::error("too few valid frames: {}", lpts.size()); return 1; }
+    if (lpts.size() < static_cast<size_t>(ops.framesMinValidFrames)) {
+        spdlog::error("too few valid frames: {}", lpts.size()); return 1;
+    }
 
     // 2. 内参
     IntrinsicCalibCPU intrin(makeIntrinParams(cfg));
@@ -103,7 +144,7 @@ int main(int argc, char** argv) {
     spdlog::info("intrinsic OK, reproj_mean={}", intrinRes.reproj_error_mean);
 
     // 3. 外参
-    ExtrinsicCalibCpuParams ep = makeExtrinParams(cfg, lpts, rpts);
+    ExtrinsicCalibCpuParams ep = makeExtrinParams(cfg, ops, lpts, rpts);
     ExtrinsicCalibCpu extrin(ep);
     ExtrinsicCalibCpuResult extrinRes = extrin.Execute(
         intrinRes.left.camera_matrix, intrinRes.left.dist_coeffs,
@@ -111,7 +152,6 @@ int main(int argc, char** argv) {
     if (!extrinRes.success) { spdlog::error("extrinsic failed: {}", extrinRes.message); return 1; }
 
     // 4. 立体矫正
-    spdlog::info("[step 4/5] stereo rectify...");
     StereoRectifyCpuParams rp;
     rp.cameraMatrixL = intrinRes.left.camera_matrix;
     rp.distCoeffsL   = intrinRes.left.dist_coeffs;
@@ -120,19 +160,11 @@ int main(int argc, char** argv) {
     rp.imageSize     = cv::Size(cfg.imageWidth, cfg.imageHeight);
     rp.R = extrinRes.R; rp.T = extrinRes.T;
     rp.alpha = cfg.rectifyAlpha; rp.flags = cfg.rectifyFlags;
-    StereoRectifyCpuResult rectifyRes;
-    try {
-        StereoRectifyCpu rectify(rp);
-        rectifyRes = rectify.Execute();
-    } catch (const std::exception& e) {
-        spdlog::error("step 4 exception: {}", e.what());
-        return 1;
-    }
+    StereoRectifyCpu rectify(rp);
+    StereoRectifyCpuResult rectifyRes = rectify.Execute();
     if (!rectifyRes.success) { spdlog::error("rectify failed: {}", rectifyRes.message); return 1; }
-    spdlog::info("[step 4/5] rectify OK");
 
     // 5. 三张温度表
-    spdlog::info("[step 5/5] temp tables...");
     CameraIntrinsics cL{intrinRes.left.camera_matrix.at<double>(0,0),
                         intrinRes.left.camera_matrix.at<double>(1,1),
                         intrinRes.left.camera_matrix.at<double>(0,2),
@@ -166,19 +198,11 @@ int main(int argc, char** argv) {
     strp.alpha=cfg.rectifyAlpha; strp.flags=cfg.rectifyFlags;
     StereoRectifyTempTableCpu strtab(strp);
     auto tableR2 = strtab.Execute();
-    spdlog::info("[step 5/5] temp tables OK");
 
-    // 6. 写交接文件（结果 + 过程分开）
-    spdlog::info("writing json -> {}", outPath);
+    // 6. 写交接文件
     auto j = buildCameraCalibJson(cfg, intrinRes, extrinRes, rectifyRes,
                                   tableL, tableR, tableE, tableR2);
     if (!writeJson(outPath, j)) return 1;
     spdlog::info("camera_calib done -> {}", outPath);
-    std::string processPath = deriveProcessPath(outPath);
-    if (writeJson(processPath, buildCameraCalibProcessJson(cfg, intrinRes, extrinRes))) {
-        spdlog::info("process data -> {}", processPath);
-    } else {
-        spdlog::warn("process json write failed: {} (结果文件不受影响)", processPath);
-    }
     return 0;
 }

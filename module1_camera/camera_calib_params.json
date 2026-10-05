@@ -1,0 +1,14 @@
+{
+  "_doc": "camera_calib 主控参数库：四层合并中间层。上层=数据集 config.json 逐叶覆盖、temps.txt ref_temp 最高层。本库已对齐本机产线基准（CESHI260831 config：15mm 方格/alpha 1.0；其余＝编译默认）；全缺时 CLI 回退编译内置默认。",
+  "chessboard": { "width": 11, "height": 8, "square_size_mm": 15.0 },
+  "image_size": [2048, 1536],
+  "intrinsic_flags": 0,
+  "use_calibrateCameraRO": true,
+  "reproj_error_threshold": 0.012,
+  "plateTempCoeff": 5e-06,
+  "plateTemp": 21.0,
+  "temperature": { "cte": 2.36e-05, "referenceTemp": 22.5, "tempRangeMin": -15.0, "tempRangeMax": 15.0, "tempStep": 0.5 },
+  "rectify": { "alpha": 1.0, "flags": 1024 },
+  "extrinsic": { "maxReprojFactor": 100.0, "minViewCount": 4 },
+  "frames": { "minValidFrames": 4 }
+}

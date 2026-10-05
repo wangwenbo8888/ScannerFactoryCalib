@@ -56,9 +56,10 @@ TEST(IntrinsicCompensateCPUParamsTest, DefaultValuesAreValid) {
     IntrinsicCompensateCPUParams params;
     EXPECT_NO_THROW(params.validate());
     EXPECT_DOUBLE_EQ(params.cte, 23.6e-6);
-    EXPECT_DOUBLE_EQ(params.tempStep, 0.2);
-    EXPECT_DOUBLE_EQ(params.tempRangeMin, -10.0);
-    EXPECT_DOUBLE_EQ(params.tempRangeMax, 10.0);
+    // 2026-09-02 温度表统一口径：±15℃/0.5 步距＝61 档（见 factory_calib/AGENTS.md）
+    EXPECT_DOUBLE_EQ(params.tempStep, 0.5);
+    EXPECT_DOUBLE_EQ(params.tempRangeMin, -15.0);
+    EXPECT_DOUBLE_EQ(params.tempRangeMax, 15.0);
 }
 
 TEST(IntrinsicCompensateCPUParamsTest, ValidateRejectsZeroStep) {

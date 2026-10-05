@@ -4,9 +4,19 @@
  *
  * 算法步骤：
  *   Step 1: 量化左右点集行索引 (kernelQuantizeRowIdx)
- *   Step 2: 构建左点哈希表 (kernelBuildHash)
- *   Step 3: 探测右点匹配 (kernelProbeMatch)
+ *   Step 2: 构建左点排序键 (kernelBuildSortKeys) + CUB 基数排序
+ *   Step 3: 右点二分探测匹配 (kernelProbeMatchSorted)
  *   Step 4: CUB DeviceSelect::Flagged 压缩输出
+ *
+ * 2026-09-04 确定性重写（AGENTS 已知限制 #9 根治）：原实现为并行开放寻址哈希
+ * （kernelBuildHash/kernelProbeMatch），slot 布局与 >max_probe 丢弃点随线程
+ * 调度逐次变化——输入逐位相同、匹配成员集合每跑一变（test_frontend_ab_compare
+ * 逐级量化哈希实锤）。本版改排序＋二分：排序键 (复合键<<32)|左点下标 全唯一，
+ * 排序结果与调度序无关；**代表点＝同键段坐标字典序最小（序无关）**——曾用
+ * "组内最小 idx"仍隐依赖输入点序（steger_fast 原子 scatter 输出序随执行环境
+ * 变化, 跨 exe 实测 matched +64/+109）, 字典序准则使输出唯一确定于点集本身。
+ * 不再有链上撞 empty 误失配与超深丢弃——召回 ≥ 原实现。⚠ 与 09 侧逐字拷贝
+ * 分歧，同步债务见 AGENTS。
  */
 
 #include "laser_match_cuda_pimpl.h"
@@ -28,18 +38,10 @@ CALIB_DEFINE_LOG_TAG(07, LaserMatchCuda);
 // ============================================================================
 
 static constexpr int BLOCK_SIZE = 256;
-static constexpr unsigned int HASH_EMPTY_KEY = 0xFFFFFFFFu;
 
 // ============================================================================
 // Device Helpers
 // ============================================================================
-
-__device__ __forceinline__ unsigned int hashFunc(unsigned int key, unsigned int capacity) {
-    key = ((key >> 16) ^ key) * 0x45d9f3bu;
-    key = ((key >> 16) ^ key) * 0x45d9f3bu;
-    key = (key >> 16) ^ key;
-    return key & (capacity - 1);
-}
 
 __device__ __forceinline__ unsigned int makeCompositeKey(int row_idx, int frame_id) {
     return (static_cast<unsigned int>(row_idx) << 16) | (static_cast<unsigned int>(frame_id) & 0xFFFF);
@@ -62,43 +64,33 @@ __global__ void __launch_bounds__(256, 4) kernelQuantizeRowIdx(
     d_rowidx[idx] = static_cast<int>(roundf(d_points[idx].y / step));
 }
 
-__global__ void __launch_bounds__(256, 4) kernelBuildHash(
+__global__ void __launch_bounds__(256, 4) kernelBuildSortKeys(
     const int* __restrict__ d_rowidx,
     const int* __restrict__ d_fids,
     int count,
-    unsigned int* __restrict__ d_hash_keys,
-    int* __restrict__ d_hash_vals,
-    unsigned int capacity,
-    int max_probe)
+    unsigned long long* __restrict__ d_sort_keys)
 {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count) {
         return;
     }
-
-    unsigned int key = makeCompositeKey(d_rowidx[idx], d_fids[idx]);
-    unsigned int slot = hashFunc(key, capacity);
-
-    for (int probe = 0; probe < max_probe; ++probe) {
-        unsigned int prev = atomicCAS(&d_hash_keys[slot], HASH_EMPTY_KEY, key);
-        if (prev == HASH_EMPTY_KEY || prev == key) {
-            d_hash_vals[slot] = idx;
-            return;
-        }
-        slot = (slot + 1u) & (capacity - 1u);
-    }
+    // 排序键 = (复合键<<32) | 左点下标——键全唯一 → 排序结果与调度序/稳定性
+    // 无关（确定）。同键段在排序后连续（代表点选取见 kernelProbeMatchSorted,
+    // 为序无关的坐标字典序）。
+    d_sort_keys[idx] =
+        (static_cast<unsigned long long>(
+             makeCompositeKey(d_rowidx[idx], d_fids[idx])) << 32)
+        | static_cast<unsigned long long>(idx);
 }
 
-__global__ void __launch_bounds__(256, 4) kernelProbeMatch(
+__global__ void __launch_bounds__(256, 4) kernelProbeMatchSorted(
     const int* __restrict__ d_right_rowidx,
     const int* __restrict__ d_right_fids,
     const float2* __restrict__ d_right_points,
     const float2* __restrict__ d_left_points,
-    const unsigned int* __restrict__ d_hash_keys,
-    const int* __restrict__ d_hash_vals,
+    const unsigned long long* __restrict__ d_sorted_keys,
     int right_count,
-    unsigned int capacity,
-    int max_probe,
+    int left_count,
     float min_disp,
     float max_disp,
     int* __restrict__ d_flags,
@@ -111,34 +103,52 @@ __global__ void __launch_bounds__(256, 4) kernelProbeMatch(
         return;
     }
 
-    unsigned int key = makeCompositeKey(d_right_rowidx[idx], d_right_fids[idx]);
-    unsigned int slot = hashFunc(key, capacity);
+    const unsigned int key32 = makeCompositeKey(d_right_rowidx[idx], d_right_fids[idx]);
 
-    for (int probe = 0; probe < max_probe; ++probe) {
-        unsigned int stored_key = d_hash_keys[slot];
-        if (stored_key == HASH_EMPTY_KEY) {
-            d_flags[idx] = 0;
-            return;
+    // lower_bound 二分：首个复合键 >= key32 的元素 = 该键组组首（最小左点下标）。
+    // 注意比较基准两侧同为 32 位复合键（排序键高 32 位）
+    int lo = 0, hi = left_count;
+    while (lo < hi) {
+        const int mid = lo + (hi - lo) / 2;
+        if (static_cast<unsigned int>(d_sorted_keys[mid] >> 32) < key32) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
         }
-        if (stored_key == key) {
-            int left_idx = d_hash_vals[slot];
-            float2 lp = d_left_points[left_idx];
-            float2 rp = d_right_points[idx];
-            float disparity = lp.x - rp.x;
-            if (disparity >= min_disp && disparity <= max_disp) {
-                d_flags[idx] = 1;
-                d_match_left[idx] = lp;
-                d_match_right[idx] = rp;
-                d_match_fids[idx] = d_right_fids[idx];
-            } else {
-                d_flags[idx] = 0;
-            }
-            return;
-        }
-        slot = (slot + 1u) & (capacity - 1u);
     }
 
     d_flags[idx] = 0;
+    if (lo >= left_count || static_cast<unsigned int>(d_sorted_keys[lo] >> 32) != key32) {
+        return;   // 无同键左点
+    }
+
+    // 代表点选择（2026-09-04 二次修正: 序无关）: 扫描同键段取坐标字典序最小
+    // (x, tie y) 的点。原"组内最小 idx"依赖输入点序——steger_fast 的原子 scatter
+    // 输出序随执行环境变化（集合不变序变, 跨 exe 实测 matched +64/+109）, 造成
+    // 同算法不同 exe 结果不同; 字典序准则使代表点唯一确定于点集本身。
+    int rep = static_cast<int>(d_sorted_keys[lo] & 0xFFFFFFFFull);
+    float2 repP = d_left_points[rep];
+    for (int j = lo + 1; j < left_count; ++j) {
+        if (static_cast<unsigned int>(d_sorted_keys[j] >> 32) != key32) {
+            break;
+        }
+        const int cand = static_cast<int>(d_sorted_keys[j] & 0xFFFFFFFFull);
+        const float2 cp = d_left_points[cand];
+        if (cp.x < repP.x || (cp.x == repP.x && cp.y < repP.y)) {
+            rep = cand;
+            repP = cp;
+        }
+    }
+
+    const float2 lp = repP;
+    const float2 rp = d_right_points[idx];
+    const float disparity = lp.x - rp.x;
+    if (disparity >= min_disp && disparity <= max_disp) {
+        d_flags[idx] = 1;
+        d_match_left[idx] = lp;
+        d_match_right[idx] = rp;
+        d_match_fids[idx] = d_right_fids[idx];
+    }
 }
 
 // ============================================================================
@@ -211,16 +221,6 @@ LaserMatchCuda::Impl::~Impl() {
     last_max_count_ = 0;
 }
 
-/*static*/ int LaserMatchCuda::Impl::nextPowerOf2(int v) {
-    v--;
-    v |= v >> 1;
-    v |= v >> 2;
-    v |= v >> 4;
-    v |= v >> 8;
-    v |= v >> 16;
-    return v + 1;
-}
-
 bool LaserMatchCuda::Impl::allocateBuffers(int leftCount, int rightCount) {
     const int maxCount = (leftCount > rightCount) ? leftCount : rightCount;
 
@@ -229,33 +229,32 @@ bool LaserMatchCuda::Impl::allocateBuffers(int leftCount, int rightCount) {
     }
 
     if (maxCount <= last_max_count_ &&
-        leftCount <= left_capacity_ &&
-        rightCount <= right_capacity_ &&
-        !d_hash_keys_.empty() &&
+        !d_sort_keys_.empty() &&
         !d_flags_.empty()) {
         return true;
     }
 
     CALIB_LOG_DEBUG("Allocating GPU buffers for left={}, right={}", leftCount, rightCount);
 
-    hash_capacity_ = nextPowerOf2(2 * leftCount);
-    if (hash_capacity_ < 16) {
-        hash_capacity_ = 16;
-    }
+    // 2026-09-04 越界修复：缓冲统一按 maxCount 分配。原 d_sort_keys_/d_sort_alt_
+    // 按 leftCount、d_temp_*/d_flags_ 按 rightCount 分配，且 early-return 只看
+    // maxCount —— 当本帧 left/right 单侧超过历史分配尺寸而 maxCount 未增长时
+    // （实例: p5 分配 right=27637, p6 right=27834 而 maxCount 28859>28517 不重建），
+    // kernel 写越界踩相邻显存（实测: flags 尾部被踩 → 上一帧残留点混入输出＝
+    // "幽灵线号"点, 踩法随堆布局而变＝环境依赖之谜）。原哈希实现同病（matched
+    // 抖动史上即有）。排序/压缩仅消费前 left/right_count 个元素, 按 maxCount
+    // 分配不影响数值。
+    // CV_32SC2 = 8B/元素, 复用为 unsigned long long 排序键
+    d_sort_keys_.create(1, maxCount, CV_32SC2);
+    d_sort_alt_.create(1, maxCount, CV_32SC2);
 
-    d_hash_keys_.create(1, hash_capacity_, CV_32SC1);
-    d_hash_vals_.create(1, hash_capacity_, CV_32SC1);
+    d_left_rowidx_.create(1, maxCount, CV_32SC1);
+    d_right_rowidx_.create(1, maxCount, CV_32SC1);
 
-    d_left_rowidx_.create(1, leftCount, CV_32SC1);
-    d_right_rowidx_.create(1, rightCount, CV_32SC1);
-    left_capacity_ = leftCount;    // GpuMat::create 只扩不缩：容量按实际分配记录，
-    right_capacity_ = rightCount;  // 复用条件必须比对容量而非 last_max_count_（L/R
-                                   // 数量逐帧互换时右缓冲可能不足 → 越界写）
-
-    d_flags_.create(1, rightCount, CV_32SC1);
-    d_temp_left_.create(1, rightCount, CV_32FC2);
-    d_temp_right_.create(1, rightCount, CV_32FC2);
-    d_temp_fids_.create(1, rightCount, CV_32SC1);
+    d_flags_.create(1, maxCount, CV_32SC1);
+    d_temp_left_.create(1, maxCount, CV_32FC2);
+    d_temp_right_.create(1, maxCount, CV_32FC2);
+    d_temp_fids_.create(1, maxCount, CV_32SC1);
 
     d_out_left_.create(1, maxCount, CV_32FC2);
     d_out_right_.create(1, maxCount, CV_32FC2);
@@ -321,16 +320,6 @@ LaserMatchResult LaserMatchCuda::Impl::Execute(
 
         cudaStream_t cuda_stream = cv::cuda::StreamAccessor::getStream(stream);
 
-        cudaError_t memset_err = cudaMemset(
-            d_hash_keys_.ptr<unsigned int>(), 0xFF,
-            hash_capacity_ * sizeof(unsigned int));
-        if (memset_err != cudaSuccess) {
-            result.success = false;
-            result.message = std::string("cudaMemset hash failed: ") + cudaGetErrorString(memset_err);
-            CALIB_LOG_ERROR("process(): {}", result.message);
-            return result;
-        }
-
         const float2* d_left_ptr = d_left_points.ptr<float2>();
         const int* d_left_fid_ptr = d_left_line_ids.ptr<int>();
         const float2* d_right_ptr = d_right_points.ptr<float2>();
@@ -338,7 +327,11 @@ LaserMatchResult LaserMatchCuda::Impl::Execute(
 
         const int left_grid = (leftCount + BLOCK_SIZE - 1) / BLOCK_SIZE;
         const int right_grid = (rightCount + BLOCK_SIZE - 1) / BLOCK_SIZE;
-        const int max_probe = (leftCount < 128) ? leftCount : 128;
+
+        unsigned long long* d_keys_in =
+            reinterpret_cast<unsigned long long*>(d_sort_keys_.ptr<int>());
+        unsigned long long* d_keys_out =
+            reinterpret_cast<unsigned long long*>(d_sort_alt_.ptr<int>());
 
         kernelQuantizeRowIdx<<<left_grid, BLOCK_SIZE, 0, cuda_stream>>>(
             d_left_ptr, leftCount, params_.epipolar_row_step,
@@ -348,10 +341,8 @@ LaserMatchResult LaserMatchCuda::Impl::Execute(
             d_right_ptr, rightCount, params_.epipolar_row_step,
             d_right_rowidx_.ptr<int>());
 
-        kernelBuildHash<<<left_grid, BLOCK_SIZE, 0, cuda_stream>>>(
-            d_left_rowidx_.ptr<int>(), d_left_fid_ptr, leftCount,
-            d_hash_keys_.ptr<unsigned int>(), d_hash_vals_.ptr<int>(),
-            static_cast<unsigned int>(hash_capacity_), max_probe);
+        kernelBuildSortKeys<<<left_grid, BLOCK_SIZE, 0, cuda_stream>>>(
+            d_left_rowidx_.ptr<int>(), d_left_fid_ptr, leftCount, d_keys_in);
 
         cudaError_t kernel_err = cudaGetLastError();
         if (kernel_err != cudaSuccess) {
@@ -361,23 +352,11 @@ LaserMatchResult LaserMatchCuda::Impl::Execute(
             return result;
         }
 
-        kernelProbeMatch<<<right_grid, BLOCK_SIZE, 0, cuda_stream>>>(
-            d_right_rowidx_.ptr<int>(), d_right_fid_ptr, d_right_ptr,
-            d_left_ptr,
-            d_hash_keys_.ptr<unsigned int>(), d_hash_vals_.ptr<int>(),
-            rightCount, static_cast<unsigned int>(hash_capacity_), max_probe,
-            params_.min_disparity, params_.max_disparity,
-            d_flags_.ptr<int>(),
-            d_temp_left_.ptr<float2>(), d_temp_right_.ptr<float2>(),
-            d_temp_fids_.ptr<int>());
-
-        kernel_err = cudaGetLastError();
-        if (kernel_err != cudaSuccess) {
-            result.success = false;
-            result.message = std::string("Kernel launch failed: ") + cudaGetErrorString(kernel_err);
-            CALIB_LOG_ERROR("process(): {}", result.message);
-            return result;
-        }
+        // CUB 基数排序（升序, 全 64 位）——键全唯一, 结果与调度序无关（确定）
+        size_t temp_bytes_sort = 0;
+        cub::DeviceRadixSort::SortKeys(
+            nullptr, temp_bytes_sort, d_keys_in, d_keys_out,
+            leftCount, 0, sizeof(unsigned long long) * 8, cuda_stream);
 
         size_t temp_bytes_left = 0;
         cub::DeviceSelect::Flagged(
@@ -400,7 +379,8 @@ LaserMatchResult LaserMatchCuda::Impl::Execute(
             d_out_fids_.ptr<int>(), d_out_count_.ptr<int>(),
             rightCount, cuda_stream);
 
-        size_t max_temp_bytes = temp_bytes_left;
+        size_t max_temp_bytes = temp_bytes_sort;
+        if (temp_bytes_left > max_temp_bytes) max_temp_bytes = temp_bytes_left;
         if (temp_bytes_right > max_temp_bytes) max_temp_bytes = temp_bytes_right;
         if (temp_bytes_fids > max_temp_bytes) max_temp_bytes = temp_bytes_fids;
 
@@ -417,7 +397,43 @@ LaserMatchResult LaserMatchCuda::Impl::Execute(
             cub_temp_size_ = max_temp_bytes;
         }
 
-        cudaError_t cub_err = cub::DeviceSelect::Flagged(
+        cudaError_t cub_err = cub::DeviceRadixSort::SortKeys(
+            d_cub_temp_, cub_temp_size_, d_keys_in, d_keys_out,
+            leftCount, 0, sizeof(unsigned long long) * 8, cuda_stream);
+        if (cub_err != cudaSuccess) {
+            result.success = false;
+            result.message = std::string("CUB::SortKeys failed: ") + cudaGetErrorString(cub_err);
+            CALIB_LOG_ERROR("process(): {}", result.message);
+            return result;
+        }
+
+        kernel_err = cudaGetLastError();
+        if (kernel_err != cudaSuccess) {
+            result.success = false;
+            result.message = std::string("Kernel launch failed: ") + cudaGetErrorString(kernel_err);
+            CALIB_LOG_ERROR("process(): {}", result.message);
+            return result;
+        }
+
+        kernelProbeMatchSorted<<<right_grid, BLOCK_SIZE, 0, cuda_stream>>>(
+            d_right_rowidx_.ptr<int>(), d_right_fid_ptr, d_right_ptr,
+            d_left_ptr,
+            d_keys_out,
+            rightCount, leftCount,
+            params_.min_disparity, params_.max_disparity,
+            d_flags_.ptr<int>(),
+            d_temp_left_.ptr<float2>(), d_temp_right_.ptr<float2>(),
+            d_temp_fids_.ptr<int>());
+
+        kernel_err = cudaGetLastError();
+        if (kernel_err != cudaSuccess) {
+            result.success = false;
+            result.message = std::string("Kernel launch failed: ") + cudaGetErrorString(kernel_err);
+            CALIB_LOG_ERROR("process(): {}", result.message);
+            return result;
+        }
+
+        cub_err = cub::DeviceSelect::Flagged(
             d_cub_temp_, cub_temp_size_,
             d_temp_left_.ptr<float2>(), d_flags_.ptr<int>(),
             d_out_left_.ptr<float2>(), d_out_count_.ptr<int>(),

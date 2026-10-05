@@ -114,6 +114,79 @@ SyntheticScene makeScene(int numPoses, int pointsPerPose, double noiseSigma, uin
 
 } // namespace
 
+// ============================================================================
+// 多线联合求解测试
+// ============================================================================
+
+namespace {
+
+// 多线场景生成器: 共享 t_true, L 条不同偏置的抛物线发射曲线（模拟 25 线扇面投影机）
+struct MultiScene {
+    MultiLineInput input;
+    cv::Vec3d t_true;
+};
+
+MultiScene makeMultiScene(int numPoses, int pointsPerPose, double noiseSigma,
+                          uint32_t seed, int numLines) {
+    MultiScene sc;
+    sc.t_true = cv::Vec3d(80.0, 3.0, 3.0);
+    sc.input.f = 1500.0;
+    sc.input.principalPoint = cv::Point2d(1024.0, 768.0);
+
+    std::mt19937 rng(seed);
+    const bool addNoise = noiseSigma > 0.0;
+    std::normal_distribution<double> noiseDist(0.0, addNoise ? noiseSigma : 1.0);
+    auto noise = [&]() -> double { return addNoise ? noiseDist(rng) : 0.0; };
+
+    struct PoseSpec { double nx, ny, nz, depth; };
+    std::vector<PoseSpec> specs = {
+        {0.00, 0.00, 1.00, 200.0}, {0.00, 0.00, 1.00, 500.0},
+        {0.15, 0.00, 0.989, 300.0}, {0.00, 0.20, 0.980, 350.0},
+        {-0.18, 0.10, 0.978, 250.0}, {0.12, -0.15, 0.981, 450.0},
+        {-0.10, 0.08, 0.992, 280.0}, {0.20, 0.12, 0.973, 400.0},
+    };
+
+    const double cx = sc.input.principalPoint.x;
+    const double cy = sc.input.principalPoint.y;
+    const double f  = sc.input.f;
+
+    sc.input.lines.resize(static_cast<size_t>(numLines));
+    for (int k = 0; k < numPoses; ++k) {
+        const PoseSpec& sp = specs[k % specs.size()];
+        Eigen::Vector3d n(sp.nx, sp.ny, sp.nz);
+        n.normalize();
+        for (int l = 0; l < numLines; ++l) {
+            // 每线曲线: 弧矢高 20~40px 递变 + 垂直偏置（25 线在虚拟像面错开）
+            const double sag = 20.0 + 20.0 * l / std::max(1, numLines - 1);
+            const double vOff = (l - numLines / 2.0) * 40.0;
+            const double halfSpan = 780.0 / std::max(1, numLines);
+
+            PosePointSet pset;
+            for (int i = 0; i < pointsPerPose; ++i) {
+                const double u = cx - halfSpan + (2.0 * halfSpan) * i / (pointsPerPose - 1);
+                const double v = cy + vOff + sag * std::pow((u - cx) / halfSpan, 2.0);
+                Eigen::Vector3d r(u - cx, v - cy, f);
+                r.normalize();
+                const double ndotr = n.dot(r);
+                if (ndotr < 1e-6) continue;
+                const double s = sp.depth / ndotr;
+                const Eigen::Vector3d P(sc.t_true[0] + s * r.x() + noise(),
+                                        sc.t_true[1] + s * r.y() + noise(),
+                                        sc.t_true[2] + s * r.z() + noise());
+                pset.points3d.push_back(cv::Vec3f(static_cast<float>(P.x()),
+                                                  static_cast<float>(P.y()),
+                                                  static_cast<float>(P.z())));
+                pset.lineIds.push_back(l + 1);
+            }
+            if (static_cast<int>(pset.points3d.size()) >= 10)
+                sc.input.lines[static_cast<size_t>(l)].push_back(std::move(pset));
+        }
+    }
+    sc.input.initialT = sc.t_true + cv::Vec3d(5.0, -3.0, 8.0);
+    return sc;
+}
+
+} // namespace
 
 class ProjectorJointCalibTest : public ::testing::Test {
 protected:
@@ -506,4 +579,91 @@ TEST_F(ProjectorJointCalibTest, QualityFlagValidation) {
                   << " flag=" << static_cast<int>(r.qualityFlag) << "\n";
     }
     SUCCEED() << "Quality flag validation done";
+}
+
+// ============================================================================
+// 多线联合求解（ExecuteMultiLine）
+// ============================================================================
+
+TEST_F(ProjectorJointCalibTest, MultiLineEmptyInput) {
+    MultiLineInput in;
+    in.f = 1500.0;
+    in.principalPoint = cv::Point2d(1024.0, 768.0);
+    auto r = op_->ExecuteMultiLine(in);
+    EXPECT_TRUE(r.success);
+    EXPECT_EQ(r.lineCount, 0);
+}
+
+TEST_F(ProjectorJointCalibTest, MultiLineInsufficientPoses) {
+    auto sc = makeMultiScene(2, 51, 0.0, 1, 5);   // 每线仅 2 姿态
+    auto r = op_->ExecuteMultiLine(sc.input);
+    EXPECT_FALSE(r.success);
+}
+
+TEST_F(ProjectorJointCalibTest, MultiLineSyntheticExact) {
+    auto sc = makeMultiScene(8, 800, 0.0, 42, 5); // 5 线 × 8 姿态 无噪声
+    auto r = op_->ExecuteMultiLine(sc.input);
+    ASSERT_TRUE(r.success) << r.message;
+    EXPECT_EQ(r.lineCount, 5);
+    EXPECT_NEAR(r.projectorT[0], sc.t_true[0], 1.0);
+    EXPECT_NEAR(r.projectorT[1], sc.t_true[1], 1.0);
+    EXPECT_NEAR(r.projectorT[2], sc.t_true[2], 5.0);
+    EXPECT_LT(r.finalSampsonRms, r.initialSampsonRms);
+    EXPECT_EQ(r.emissionCurves.size(), static_cast<size_t>(5));
+}
+
+TEST_F(ProjectorJointCalibTest, MultiLineSyntheticWithNoise) {
+    auto sc = makeMultiScene(8, 800, 0.2, 7, 5);
+    auto r = op_->ExecuteMultiLine(sc.input);
+    ASSERT_TRUE(r.success) << r.message;
+    EXPECT_NEAR(r.projectorT[0], sc.t_true[0], 3.0);
+    EXPECT_NEAR(r.projectorT[1], sc.t_true[1], 3.0);
+    EXPECT_NEAR(r.projectorT[2], sc.t_true[2], 8.0);
+}
+
+// 对照: 同一多线数据混喂单线 Execute 应崩坏（rms 高）, ExecuteMultiLine 应正常
+TEST_F(ProjectorJointCalibTest, MultiLineVsMixedSingleLine) {
+    auto sc = makeMultiScene(8, 800, 0.2, 7, 5);
+    // 混喂: 全部线点并进同一姿态组
+    ProjectorJointCalibInput mixed;
+    mixed.f = sc.input.f;
+    mixed.principalPoint = sc.input.principalPoint;
+    mixed.initialT = sc.input.initialT;
+    const size_t nPoses = sc.input.lines[0].size();
+    for (size_t p = 0; p < nPoses; ++p) {
+        PosePointSet all;
+        for (const auto& line : sc.input.lines) {
+            if (p < line.size())
+                for (const auto& pt : line[p].points3d)
+                    all.points3d.push_back(pt);
+        }
+        mixed.poses.push_back(std::move(all));
+    }
+    auto rMixed = run(mixed);
+    auto rMulti = op_->ExecuteMultiLine(sc.input);
+    ASSERT_TRUE(rMulti.success) << rMulti.message;
+    EXPECT_LT(rMulti.finalSampsonRms, rMixed.finalSampsonRms)
+        << "多线联合 rms 应显著低于混线单线版";
+    EXPECT_NEAR(rMulti.projectorT[2], sc.t_true[2],
+                std::fabs(rMixed.projectorT[2] - sc.t_true[2]) + 1.0);
+}
+
+// 多线对 t_z 的增强: 单线（仅线0）vs 多线（5 线）误差对比
+TEST_F(ProjectorJointCalibTest, MultiLineImprovesTz) {
+    auto sc = makeMultiScene(8, 800, 0.2, 7, 5);
+    // 单线: 只喂线 0
+    ProjectorJointCalibInput single;
+    single.f = sc.input.f;
+    single.principalPoint = sc.input.principalPoint;
+    single.initialT = sc.input.initialT;
+    single.poses = sc.input.lines[0];
+    auto rSingle = run(single);
+    auto rMulti = op_->ExecuteMultiLine(sc.input);
+    ASSERT_TRUE(rSingle.success);
+    ASSERT_TRUE(rMulti.success) << rMulti.message;
+    const double eSingle = std::fabs(rSingle.projectorT[2] - sc.t_true[2]);
+    const double eMulti = std::fabs(rMulti.projectorT[2] - sc.t_true[2]);
+    std::cerr << "[multi-tz] single err=" << eSingle
+              << " multi err=" << eMulti << "\n";
+    EXPECT_LE(eMulti, eSingle + 1.0);   // 多线不劣于单线
 }

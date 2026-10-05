@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <optional>
 
 #include "calib_io.h"
 #include "intrinsic_calib_cpu.h"
@@ -34,6 +35,11 @@ struct CalibCallbacks {
     // GUI 取消按钮；返回 true 时业务尽早退出
     std::function<bool()> shouldCancel;
 };
+
+// ---- 加载输入（含主控参数库合并；GUI 用这个，别直接调 loadCameraInput）----
+// 等价 camera_calib_cli 的参数定位：cwd ← 源码树兜底（全缺＝编译内置同值默认）
+// （CLI exe 侧另有 exe 旁定位，在 camera_calib_cli.cpp 内）
+std::optional<CameraInput> loadCameraInputMerged(const std::string& dir);
 
 // ---- Step 1: 棋盘格角点提取 ----
 struct CornerExtractionResult {
@@ -56,6 +62,7 @@ calib::IntrinsicCalibResult calibrateIntrinsic(
 // ---- Step 3: 外参（立体 R/T + E/F）----
 calib::ExtrinsicCalibCpuResult calibrateExtrinsic(
     const CameraCalibConfig& cfg,
+    const CameraOpParams& ops,
     const CornerExtractionResult& corners,
     const calib::IntrinsicCalibResult& intrin,
     const CalibCallbacks& cb = {});

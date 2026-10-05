@@ -11,14 +11,10 @@ namespace fc {
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
-CameraCalibConfig CameraCalibConfig::fromJson(const std::string& path) {
-    CameraCalibConfig c;
-    std::ifstream ifs(path);
-    if (!ifs.is_open()) {
-        spdlog::warn("config not found: {}, using defaults", path);
-        return c;
-    }
-    json j = json::parse(ifs, nullptr, true);
+// applyCameraParamsJson —— 统一参数解析器（主库与数据集 config 共用）
+// present-key 覆盖：键出现才覆盖，未出现保持入参现值（层叠合并的基础）。
+void applyCameraParamsJson(const nlohmann::json& j,
+                           CameraCalibConfig& c, CameraOpParams& ops) {
     if (j.contains("chessboard")) {
         const auto& cb = j["chessboard"];
         if (cb.contains("width"))        c.chessWidth = cb["width"];
@@ -45,12 +41,53 @@ CameraCalibConfig CameraCalibConfig::fromJson(const std::string& path) {
         if (r.contains("alpha")) c.rectifyAlpha = r["alpha"];
         if (r.contains("flags")) c.rectifyFlags = r["flags"];
     }
+    // 平铺键（2026-10-04 补上解析；此前字段存在但不可配）
+    if (j.contains("plateTempCoeff")) c.plateTempCoeff = j["plateTempCoeff"];
+    if (j.contains("plateTemp"))      c.plateTemp      = j["plateTemp"];
+    // 算子层组（编译默认＝CLI 原硬编码）
+    if (j.contains("extrinsic") && j["extrinsic"].is_object()) {
+        const auto& e = j["extrinsic"];
+        if (e.contains("maxReprojFactor"))
+            ops.extrinsicMaxReprojFactor = e["maxReprojFactor"].get<double>();
+        if (e.contains("minViewCount"))
+            ops.extrinsicMinViewCount = e["minViewCount"].get<int>();
+    }
+    if (j.contains("frames") && j["frames"].is_object()) {
+        const auto& f = j["frames"];
+        if (f.contains("minValidFrames"))
+            ops.framesMinValidFrames = f["minValidFrames"].get<int>();
+    }
+}
+
+// 薄壳（兼容旧调用；新组解析后丢弃）
+CameraCalibConfig CameraCalibConfig::fromJson(const std::string& path) {
+    CameraCalibConfig c;
+    CameraOpParams ops;
+    std::ifstream ifs(path);
+    if (!ifs.is_open()) {
+        spdlog::warn("config not found: {}, using defaults", path);
+        return c;
+    }
+    applyCameraParamsJson(nlohmann::json::parse(ifs, nullptr, true), c, ops);
     return c;
 }
 
-std::optional<CameraInput> loadCameraInput(const std::string& dir) {
+std::optional<CameraInput> loadCameraInput(const std::string& dir,
+                                           const CameraCalibConfig* baseCfg,
+                                           const CameraOpParams* baseOps) {
     CameraInput in;
-    in.config = CameraCalibConfig::fromJson(dir + "/config.json");
+    // 四层合并：内置 ← 主库 ← 数据集 config.json ← temps.txt(ref_temp)
+    in.config = baseCfg ? *baseCfg : CameraCalibConfig{};
+    in.ops    = baseOps ? *baseOps : CameraOpParams{};
+    {
+        std::ifstream ifs(dir + "/config.json");
+        if (ifs.is_open())
+            applyCameraParamsJson(nlohmann::json::parse(ifs, nullptr, true),
+                                  in.config, in.ops);
+        else
+            spdlog::warn("config not found: {}, keep base/master values",
+                         dir + "/config.json");
+    }
 
     // 参考温度：优先 temps.txt 的 ref_temp 行，否则用 config.referenceTemp
     std::ifstream tf(dir + "/temps.txt");
@@ -91,10 +128,7 @@ std::optional<CameraInput> loadCameraInput(const std::string& dir) {
     return in;
 }
 
-namespace {
-
-// 完整组装（含过程数据）——两个公开 build*Json 的单一数据源
-nlohmann::json assembleFull(
+nlohmann::json fc::buildCameraCalibJson(
     const CameraCalibConfig& cfg,
     const calib::IntrinsicCalibResult& intrin,
     const calib::ExtrinsicCalibCpuResult& extrin,
@@ -120,97 +154,6 @@ nlohmann::json assembleFull(
     j["extrinsicTempTable"] = extrinTable.toJson();
     j["stereoRectifyTempTable"] = rectifyTable.toJson();
     return j;
-}
-
-// intrinsic.left/right 里属于过程数据的键
-constexpr const char* kIntrinsicProcessKeys[] = {"rvecs", "tvecs", "per_view_errors"};
-// extrinsic 里属于过程数据的键（K/D 副本与 intrinsic 节重复）
-constexpr const char* kExtrinsicProcessKeys[] = {
-    "perViewErrors", "perViewEpipolarErrors", "message",
-    "camera_matrix_l", "dist_coeffs_l", "camera_matrix_r", "dist_coeffs_r"};
-
-} // namespace
-
-nlohmann::json fc::buildCameraCalibJson(
-    const CameraCalibConfig& cfg,
-    const calib::IntrinsicCalibResult& intrin,
-    const calib::ExtrinsicCalibCpuResult& extrin,
-    const calib::StereoRectifyCpuResult& rectify,
-    const calib::IntrinsicCompensateCPUResult& intrinTableL,
-    const calib::IntrinsicCompensateCPUResult& intrinTableR,
-    const calib::ExtrinsicCompensateCPUResult& extrinTable,
-    const calib::StereoRectifyTempTableResult& rectifyTable)
-{
-    nlohmann::json j = assembleFull(cfg, intrin, extrin, rectify,
-                                    intrinTableL, intrinTableR, extrinTable, rectifyTable);
-    // 结果文件只留下游需要的矩阵 + 汇总指标，剔除过程/诊断数据
-    if (j.contains("intrinsic") && j["intrinsic"].is_object()) {
-        for (const char* side : {"left", "right"}) {
-            if (j["intrinsic"].contains(side) && j["intrinsic"][side].is_object()) {
-                for (const char* k : kIntrinsicProcessKeys)
-                    j["intrinsic"][side].erase(k);
-            }
-        }
-    }
-    if (j.contains("extrinsic") && j["extrinsic"].is_object()) {
-        for (const char* k : kExtrinsicProcessKeys)
-            j["extrinsic"].erase(k);
-    }
-    return j;
-}
-
-nlohmann::json fc::buildCameraCalibProcessJson(
-    const CameraCalibConfig& cfg,
-    const calib::IntrinsicCalibResult& intrin,
-    const calib::ExtrinsicCalibCpuResult& extrin)
-{
-    nlohmann::json p;
-    p["schema"] = "factory_calib.camera_calib_process.v1";
-
-    // 运行配置复述（问题追溯用）
-    p["config"] = {
-        {"chessboard", {{"width", cfg.chessWidth},
-                        {"height", cfg.chessHeight},
-                        {"square_size_mm", cfg.squareSizeMm}}},
-        {"image_size", {cfg.imageWidth, cfg.imageHeight}},
-        {"intrinsic", {{"flags", cfg.intrinsicFlags},
-                       {"use_calibrateCameraRO", cfg.useCalibrateCameraRO},
-                       {"reproj_error_threshold", cfg.reprojErrorThreshold}}},
-        {"plate", {{"tempCoeff", cfg.plateTempCoeff}, {"temp", cfg.plateTemp}}},
-        {"temperature", {{"referenceTemp", cfg.referenceTemp},
-                         {"cte", cfg.cte},
-                         {"tempRangeMin", cfg.tempRangeMin},
-                         {"tempRangeMax", cfg.tempRangeMax},
-                         {"tempStep", cfg.tempStep}}},
-        {"rectify", {{"alpha", cfg.rectifyAlpha},
-                     {"flags", cfg.rectifyFlags}}},
-    };
-
-    // 逐视角过程数据
-    nlohmann::json intr = intrin.toJson();
-    for (const char* side : {"left", "right"}) {
-        if (intr.contains(side) && intr[side].is_object()) {
-            nlohmann::json ps = nlohmann::json::object();
-            for (const char* k : kIntrinsicProcessKeys) {
-                if (intr[side].contains(k))
-                    ps[k] = std::move(intr[side][k]);
-            }
-            if (!ps.empty()) p["intrinsic"][side] = std::move(ps);
-        }
-    }
-    nlohmann::json ext = extrin.toJson();
-    nlohmann::json pe = nlohmann::json::object();
-    for (const char* k : kExtrinsicProcessKeys) {
-        if (ext.contains(k))
-            pe[k] = std::move(ext[k]);
-    }
-    if (!pe.empty()) p["extrinsic"] = std::move(pe);
-    return p;
-}
-
-std::string fc::deriveProcessPath(const std::string& outputPath) {
-    fs::path p(outputPath);
-    return (p.parent_path() / (p.stem().string() + "_process.json")).string();
 }
 
 bool fc::writeJson(const std::string& path, const nlohmann::json& j) {
