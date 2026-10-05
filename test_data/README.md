@@ -17,7 +17,8 @@ test_data/
 │       └── curve_map_temp_table.bin        # CMTT sidecar 金标准（2.2GB，SHA=00C90B6D…）
 └── camera261003/
     ├── config.json                         # 真实链分析测试参数（test_camera_chain_analysis）
-    └── images/                             #（可选放置）52 对 bmp；放入后 chain 测试由 SKIP 转实跑
+    └── images/                             # 52 对 L{n}/R{n}.bmp（源侧原名 `1 (k).bmp`，迁入时归一重命名；
+                                            #   2026-10-05 起链测试实跑，首次 PASS）
 ```
 
 ## 入库策略（.gitignore）
