@@ -1,0 +1,27 @@
+{
+  "plane_map": {
+    "gridStep": 16.0,
+    "depthMin": 100.0,
+    "depthMax": 5000.0,
+    "depthSamples": 100,
+    "epipolarStep": 0.7
+  },
+  "deviceId": 0,
+  "cmttThreads": 16,
+  "lineIds": [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25],
+  "temperature": {
+    "cte": 23.6e-6,
+    "referenceTemp": 22.5,
+    "tempRangeMin": -15.0,
+    "tempRangeMax": 15.0,
+    "tempStep": 0.5
+  },
+  "rectify": {
+    "alpha": 1.0,
+    "flags": 1024
+  },
+  "laser_label": {
+    "scanDirection": 1,
+    "centerRowOffset": 0
+  }
+}
