@@ -4,11 +4,11 @@
 #   只跑一侧：-Only camera 或 -Only laser
 #   ctest 注册名：test_camera_baseline / test_laser_baseline（顶层 CMakeLists 注册）
 #
-# 做的事（全部与固化基线逐位比对）：
-#   ① 相机标定：camera_calib.exe 按标准参数跑 module1_camera/test_data/camera
-#      → 与 verify_baseline/camera_calib.F430.json（本机 F: OpenCV 基线）比对
-#   ② 激光标定：laser_calib.exe 按标准参数跑 module2_laser/test_data/LASER
-#      → laser_calib.json 与 test_data 金标准比对 + sidecar SHA256 比对
+# 做的事（全部与固化基线逐位比对；资产位于仓库根 test_data/，见 test_data/README.md）：
+#   ① 相机标定：camera_calib.exe 按标准参数跑 test_data/camera/input
+#      → 与 test_data/camera/gold/camera_calib.F430.json（本机 F: OpenCV 基线）比对
+#   ② 激光标定：laser_calib.exe 按标准参数跑 test_data/laser/input
+#      → 与 test_data/laser/gold/laser_calib.json 金标准比对 + sidecar SHA256 比对
 #   ＋ 关键数值抽查（accum/verdict/projectorT 等，哈希失败时给定位线索）
 #
 # 守护范围：算法代码、主控参数库（camera/laser_calib_params.json）、数据集 config、
@@ -54,11 +54,11 @@ Write-Host "== 基线验证 $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  模式=[$
 
 $camExe  = Join-Path $BuildDir 'module1_camera\Release\camera_calib.exe'
 $lasExe  = Join-Path $BuildDir 'module2_laser\Release\laser_calib.exe'
-$camData = Join-Path $repo 'module1_camera\test_data\camera'
-$lasData = Join-Path $repo 'module2_laser\test_data\LASER'
-$camBase = Join-Path $repo 'verify_baseline\camera_calib.F430.json'
-$lasGold = Join-Path $repo 'module2_laser\test_data\laser_calib.json'
-$binGold = Join-Path $repo 'module2_laser\test_data\curve_map_temp_table.bin'
+$camData = Join-Path $repo 'test_data\camera\input'
+$lasData = Join-Path $repo 'test_data\laser\input'
+$camBase = Join-Path $repo 'test_data\camera\gold\camera_calib.F430.json'
+$lasGold = Join-Path $repo 'test_data\laser\gold\laser_calib.json'
+$binGold = Join-Path $repo 'test_data\laser\gold\curve_map_temp_table.bin'
 
 $fail = 0
 

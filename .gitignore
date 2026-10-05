@@ -14,5 +14,7 @@ data_bak/
 debug.txt
 factory_calib.log
 
-module1_camera/test_data/
-module2_laser/test_data/
+# test assets unified under the root directory (2026-10-05): binary images and sidecar stay on disk, gold-standard JSON/parameters are checked into the repo
+/test_data/**/*.png
+/test_data/**/*.bmp
+/test_data/**/*.bin

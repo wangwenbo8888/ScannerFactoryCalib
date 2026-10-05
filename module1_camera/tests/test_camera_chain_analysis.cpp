@@ -182,14 +182,32 @@ struct FrameRecord {
 
 fs::path findDataDir() {
     const std::vector<fs::path> cands = {
-        fs::path("factory_calib/data_in/CAMERA261003"),                // repo 根直跑
-        fs::path("../../factory_calib/data_in/CAMERA261003"),           // ctest cwd=build_fc1_rel/module1_camera
+        // 2026-10-05 起统一资产位：仓库根 test_data/camera261003/images（独立仓库布局）
+        fs::path("test_data/camera261003/images"),                       // repo 根直跑
+        fs::path("../../test_data/camera261003/images"),                 // ctest cwd=<repo>/build_*/module1_camera
+        fs::path("../../../test_data/camera261003/images"),              // 更深构建目录
+        // 兼容旧布局（factory_calib 为仓库子目录的工作区/作者机）
+        fs::path("factory_calib/data_in/CAMERA261003"),                  // 工作区根直跑
+        fs::path("../../factory_calib/data_in/CAMERA261003"),            // ctest cwd=build_fc1_rel/module1_camera
         fs::path("../../../factory_calib/data_in/CAMERA261003"),
         fs::path("E:/JEAMMWARE2601001/factory_calib/data_in/CAMERA261003"),  // 绝对兜底
     };
     for (const auto& c : cands) {
         std::error_code ec;
         if (fs::exists(c / "L1.bmp", ec) && fs::exists(c / "R1.bmp", ec)) return c;
+    }
+    return {};
+}
+
+// config 探测：新布局（config.json 与 images 同级）优先，回退旧 CONFIG/ 布局
+fs::path findChainConfig(const fs::path& dataDir) {
+    const std::vector<fs::path> cands = {
+        dataDir.parent_path() / "config.json",                            // test_data/camera261003/config.json
+        dataDir.parent_path().parent_path() / "CONFIG" / "camera261003.json",  // 旧布局
+    };
+    for (const auto& c : cands) {
+        std::error_code ec;
+        if (fs::exists(c, ec)) return c;
     }
     return {};
 }
@@ -221,17 +239,21 @@ TEST(CameraChainAnalysis, FullChainOnCAMERA261003) {
     if (dataDir.empty()) {
         GTEST_SKIP() << "CAMERA261003 data not found; skip full chain analysis";
     }
-    fs::path outDir = dataDir.parent_path().parent_path() / "data_out" / "camera261003";
+    // 输出目录：推导仓库根（新布局 test_data/camera261003/images 上溯 3 级；旧布局 data_in/X 上溯 2 级）
+    fs::path repoRoot = (dataDir.parent_path().filename() == "camera261003")
+        ? dataDir.parent_path().parent_path().parent_path()   // 新统一资产布局
+        : dataDir.parent_path().parent_path();                // 旧 data_in 布局
+    fs::path outDir = repoRoot / "data_out" / "camera261003";
     std::error_code ec;
     fs::create_directories(outDir, ec);
     if (ec) {
         ADD_FAILURE() << "create_directories failed: " << ec.message();
         return;
     }
-    // 参数：CONFIG/camera261003.json 优先，缺失回退内置默认
+    // 参数：test_data/camera261003/config.json（新布局）或旧 CONFIG/camera261003.json 优先，缺失回退内置默认
     ChainConfig cfg;
-    const fs::path cfgPath = dataDir.parent_path().parent_path() / "CONFIG" / "camera261003.json";
-    const bool cfgLoaded = loadChainConfig(cfgPath, cfg);
+    const fs::path cfgPath = findChainConfig(dataDir);
+    const bool cfgLoaded = !cfgPath.empty() && loadChainConfig(cfgPath, cfg);
     std::cout << "[chain] data=" << dataDir.string() << "\n[chain] out=" << outDir.string() << "\n";
     std::cout << "[chain] config=" << (cfgLoaded ? cfgPath.string() : "BUILT-IN DEFAULTS")
               << (cfgLoaded ? "" : " (file missing/corrupt)") << "\n";
