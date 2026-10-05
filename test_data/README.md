@@ -17,8 +17,12 @@ test_data/
 │       └── curve_map_temp_table.bin        # CMTT sidecar 金标准（2.2GB，SHA=00C90B6D…）
 └── camera261003/
     ├── config.json                         # 真实链分析测试参数（test_camera_chain_analysis）
-    └── images/                             # 52 对 L{n}/R{n}.bmp（源侧原名 `1 (k).bmp`，迁入时归一重命名；
-                                            #   2026-10-05 起链测试实跑，首次 PASS）
+    ├── images/                             # 52 对 L{n}/R{n}.bmp（源侧原名 `1 (k).bmp`，迁入时归一重命名；
+    │                                       #   2026-10-05 起链测试实跑，首次 PASS）
+    └── calib_input/                        # ★ CLI 在线标定就绪数据集（camera_calib.exe 直接消费）：
+                                            #   left/01..52.png + right/01..52.png（bmp→png 转换＋同名配对）
+                                            #   ＋config.json（11×8/15mm 装机口径）；实测 52 对装载、
+                                            #   51 有效（frame 35 角点未检出），基线 131.2mm，33s 跑通
 ```
 
 ## 入库策略（.gitignore）
