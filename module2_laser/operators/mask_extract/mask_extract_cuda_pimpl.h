@@ -53,6 +53,15 @@ struct MaskExtractCUDA::Impl {
     cv::Ptr<cv::cuda::Filter> filter_post_v_;
     cv::cuda::GpuMat d_morphTmp;          ///< 线核两趟的中间缓冲
 
+    // 高光分离路径（highlightErodeSize>0 时生效）
+    cv::Mat kernel_hl_erode_;             ///< 高光探测腐蚀核（吃细线留粗斑）
+    cv::Mat kernel_hl_dilate_;            ///< 高光模板回膨胀核
+    cv::Ptr<cv::cuda::Filter> filter_hl_erode_;
+    cv::Ptr<cv::cuda::Filter> filter_hl_dilate_;
+    cv::cuda::GpuMat d_hlEroded;          ///< mask3: 仅高光斑
+    cv::cuda::GpuMat d_hlDilated;         ///< mask4: 高光模板（回膨胀）
+    cv::cuda::GpuMat d_laserNoHl;         ///< mask5: mask2 & ~mask4（激光减高光）
+
     // 结果输出池（ping-pong ×2, [gray, laserMask, cleanedMask]）:
     // 预分配+流式 copyTo, 替代每次 clone 的临时 cudaMalloc+默认流屏障。
     // 有效性语义: 返回结果至少到「再执行两次 Execute」前有效

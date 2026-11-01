@@ -55,8 +55,6 @@ target_link_libraries(fc1_io PUBLIC fc1_ops ${OpenCV_LIBS} nlohmann_json::nlohma
 add_executable(camera_calib camera_calib_cli.cpp)
 target_link_libraries(camera_calib PRIVATE fc1_ops fc1_chess fc1_io ${OpenCV_LIBS} nlohmann_json::nlohmann_json spdlog::spdlog)
 fc_deploy_crt(camera_calib)
-fc_deploy_opencv_dlls(camera_calib)
-fc_setup_vs_debugger(camera_calib "${CMAKE_SOURCE_DIR}")
 # 主控参数库随 exe 部署（四层合并中间层; 缺失时 CLI 回退内置同值默认）
 add_custom_command(TARGET camera_calib POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different

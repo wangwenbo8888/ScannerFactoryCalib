@@ -26,6 +26,7 @@
 #include "projector_joint_calib.h"   // PJC: 替代旧 4-9/4-10/4-11 端点链路
 #include "laser_extrinsic_compensate_cpu.h"
 #include "curve_map_temp_table.h"
+#include "cmtt_cuda.h"               // 4-14 CUDA 主引擎（2026-10-08 转正; CPU 版备用可切）
 #include "cmtt_container.h"      // CmttReader 复核（meta 头字段取复核值）
 
 #include <opencv2/core/cuda.hpp>
@@ -153,9 +154,8 @@ bool sha256FileImpl(const std::filesystem::path& path, std::string& out) {
 } // namespace
 
 // 库化主体：CLI main 与 GUI runner（经 calib_runner.cpp）共用；
-// 行为与纯 CLI 版逐语句一致（仅 argv 解析移至文件末尾的 main 包装）。
+// 行为与纯 CLI 版逐语句一致（仅 argv 解析移至文件末尾 main 包装）
 int fc::runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
-
     spdlog::info("=== laser_calib (build 6.3-cmtt) ===");
 
     // review C1/I3 防御: main 顶层 try/catch 把算子可能抛的 std::invalid_argument
@@ -239,9 +239,15 @@ int fc::runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
     maskParams.erodeSize       = ops.maskErodeSize;
     maskParams.laserDilateSize = ops.maskLaserDilateSize;
     maskParams.postErodeSize   = ops.maskPostErodeSize;
+    maskParams.highlightErodeSize  = ops.maskHighlightErodeSize;
+    maskParams.highlightDilateSize = ops.maskHighlightDilateSize;
     MaskExtractCUDA maskL(maskParams);
     MaskExtractCUDA maskR(maskParams);
-    spdlog::info("4-1 MaskExtractCUDA x2 (L/R) constructed");
+    spdlog::info("4-1 MaskExtractCUDA x2 (L/R) constructed "
+                 "(thr={}, e={}, d={}, post={}, hlE={}, hlD={})",
+                 maskParams.threshold, maskParams.erodeSize,
+                 maskParams.laserDilateSize, maskParams.postErodeSize,
+                 maskParams.highlightErodeSize, maskParams.highlightDilateSize);
     RegionAnalyzerParams cclParams;
     cclParams.deviceId = cfg.deviceId;
     cclParams.minArea   = ops.cclMinArea;
@@ -255,11 +261,14 @@ int fc::runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
     labelParams.scanDirection = cfg.labelScanDirection;
     labelParams.centerRowOffset = cfg.labelCenterRowOffset;
     labelParams.realLineTolerance = ops.labelRealLineTolerance;
+    labelParams.expectedLineCount = ops.labelExpectedLineCount;
+    labelParams.maxRunWidth = ops.labelMaxRunWidth;
     LaserLabelerCUDA labelL(labelParams);
     LaserLabelerCUDA labelR(labelParams);
     spdlog::info("4-3 LaserLabelerCUDA x2 (L/R) constructed "
-                 "(scanDirection={}, centerRowOffset={})",
-                 labelParams.scanDirection, labelParams.centerRowOffset);
+                 "(scanDirection={}, centerRowOffset={}, expectedLineCount={}, maxRunWidth={})",
+                 labelParams.scanDirection, labelParams.centerRowOffset,
+                 labelParams.expectedLineCount, labelParams.maxRunWidth);
 
     // ----- 4-4 Steger（steger_fast, 2026-09-04 起产线）-----
     // 与原版逐位等价（全 22 帧全精度对拍 n=0; 容量越界修复后两链全流程逐字节一致,
@@ -272,9 +281,12 @@ int fc::runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
     stegerParams.lowThreshold = ops.stegerLowThreshold;
     stegerParams.highThreshold= ops.stegerHighThreshold;
     stegerParams.maxLabels    = ops.stegerMaxLabels;
+    stegerParams.maxLineWidth = ops.stegerMaxLineWidth;
+    stegerParams.dedupMode    = ops.stegerDedupMode;
     StegerExtractorFast stegerL(stegerParams);
     StegerExtractorFast stegerR(stegerParams);
-    spdlog::info("4-4 StegerExtractorFast x2 (L/R) constructed");
+    spdlog::info("4-4 StegerExtractorFast x2 (L/R) constructed (maxLineWidth={}, dedupMode={})",
+                 stegerParams.maxLineWidth, stegerParams.dedupMode);
 
     // ----- 4-5 UndistortPoints -----
     // 参数 K/D/R/P 来自 handoff（模块1 输出的内参 + 立体矫正）。
@@ -440,6 +452,16 @@ int fc::runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
             if (!labelResL.success || !labelResR.success) {
                 spdlog::warn("pose {} tube {}: 4-3 label failed (L={}, R={}), skip",
                              pi, ti, labelResL.success, labelResR.success);
+                ++framesSkip;
+                continue;
+            }
+            // 门禁拒绝（过曝粘连/线数不符 → 编号错位风险）: 任一目触发即整帧弃
+            // （L+R 同时不参与下游, 与既有帧级跳过语义一致）
+            if (labelResL.frameRejected || labelResR.frameRejected) {
+                spdlog::warn("pose {} tube {}: 4-3 frame gate rejected (L: {}, R: {}), skip",
+                             pi, ti,
+                             labelResL.frameRejected ? labelResL.rejectReason : "ok",
+                             labelResR.frameRejected ? labelResR.rejectReason : "ok");
                 ++framesSkip;
                 continue;
             }
@@ -668,6 +690,12 @@ int fc::runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
         const cv::Vec3d tMech = R1m * cv::Vec3d(80.0, 3.0, 3.0);
         mlIn.initialT = tMech;
 
+        // —— F8 右目重投影残差：从 handoff P2 提取基线 B ＋ 启用右目项 ——
+        // B = |P2(0,3)| / fx（矫正系右基线，mm）——与 fcstepdump --pjc-multiline 同口径
+        mlIn.baseline = std::fabs(h.P2.at<double>(0, 3)) / mlIn.f;
+        mlIn.enableRightTerm = true;
+        mlIn.rightTermWeight = 1.0;
+
         // —— 阶段1: 逐线共识 median（rms<1 且 cond<1e15 的线）——
         std::vector<double> xs, ys, zs;
         {
@@ -829,6 +857,14 @@ int fc::runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
             pjcJson["poseCount"] = mlRes.poseCount;
             pjcJson["totalPointCount"] = mlRes.totalPointCount;
             pjcJson["epipolarRowStep"] = cfg.epipolarStep;   // R5: 步距随表走
+            // F8 右目重投影残差诊断
+            pjcJson["rightTermUsed"] = mlRes.rightTermUsed;
+            pjcJson["urBiasPreRms"] = mlRes.urBiasPreRms;
+            pjcJson["urBiasPostRms"] = mlRes.urBiasPostRms;
+            pjcJson["urGateCount"] = mlRes.urGateCount;
+            pjcJson["urRowCount"] = mlRes.urRowCount;
+            pjcJson["urCrossAngleMedianDeg"] = mlRes.urCrossAngleMedianDeg;
+            pjcJson["baseline"] = mlIn.baseline;
             // 盆地探针决策落盘（2026-10-04；近平局时此选择是关键诊断信息）
             if (basinMedianRms >= 0.0)
                 pjcJson["basinProbe"] = {{"medianRms", basinMedianRms},
@@ -1123,16 +1159,30 @@ int fc::runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
             calib::CurveMapTempTableGenParams cmp;
             cmp.referenceTemp = cfg.referenceTemp;
             cmp.tempHalfRange = static_cast<float>(ops.cmttTempHalfRange);  // 主库可调（源表覆盖对齐, 设计硬规则 #5）
-            cmp.tempStep      = 0.5f;
+            cmp.tempStep      = ops.cmttTempStep;     // 2026-10-13 外置（原硬编码 0.5）
+            cmp.tiersBelow    = ops.cmttTiersBelow;   // 非对称档位（0=对称半范围）
+            cmp.tiersAbove    = ops.cmttTiersAbove;
             cmp.rowStep       = cfg.epipolarStep;   // 红线: rowStep 随标定参数走, 禁硬编码
             cmp.depthMin      = cfg.depthMin;       // 全档统一（设计硬规则 #2）
             cmp.depthMax      = cfg.depthMax;
             cmp.tierThreads   = cfg.cmttThreads;    // 档级并行（0=自动; 线程数无关确定性）
             try {
-                calib::CurveMapTempTableGenerator cmGen(cmp);
-                cmResult = cmGen.Generate(pjcCurves,
-                                          input->handoff.rectifyTempTable,
-                                          laserExtrinTable, h.imageSize);
+                // 引擎选择: CUDA 主（2026-10-08 转正, 61 档 ~95s vs CPU ~30min）;
+                // cmtt.cudaEnabled=false 回落 CPU 备用（产物结构一致, 参考档逐条目一致）
+                if (ops.cmttCudaEnabled) {
+                    spdlog::info("4-14 engine: CUDA (cmtt.cudaEnabled=true; "
+                                 "CPU backup via cmtt.cudaEnabled=false)");
+                    calib::CmttCudaGenerator cmGen(cmp);
+                    cmResult = cmGen.Generate(pjcCurves,
+                                              input->handoff.rectifyTempTable,
+                                              laserExtrinTable, h.imageSize);
+                } else {
+                    spdlog::info("4-14 engine: CPU (backup)");
+                    calib::CurveMapTempTableGenerator cmGen(cmp);
+                    cmResult = cmGen.Generate(pjcCurves,
+                                              input->handoff.rectifyTempTable,
+                                              laserExtrinTable, h.imageSize);
+                }
                 if (!cmResult.success) {
                     // 红线: 参考档 FAIL 整体不出产物（生成器已保证 sidecarBytes 空）
                     spdlog::error("4-14 curve_map_temp_table failed (ref-tier red line): {}",
@@ -1322,7 +1372,8 @@ int fc::runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: laser_calib <input_dir> [output_json]\n"
-                  << "  input_dir 含 config.json + camera_calib.json + pose_*/L_tube*.png + R_tube*.png\n";
+                  << "  input_dir 含 config.json + camera_calib.json + pose_*/L_tube*.png + R_tube*.png\n"
+                  << "  或 left/ + right/ 同名顺序帧（无 pose_* 时自动回退, 每对 = 1 pose）\n";
         return 2;
     }
     std::string inDir = argv[1];

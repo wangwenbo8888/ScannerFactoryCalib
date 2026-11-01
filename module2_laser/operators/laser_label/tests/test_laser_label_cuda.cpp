@@ -538,4 +538,152 @@ TEST_F(LaserLabelTest, RelabelingIsConsecutive) {
     EXPECT_EQ(h_output.at<int>(162, center_x), 4);
 }
 
+// ============================================================================
+// 门禁测试（2026-10-07 laser261006-1668 过曝粘连编号错位事故）
+// 门1: expectedLineCount 线数门禁; 门2: maxRunWidth 切割游程展布门禁
+// ============================================================================
+
+// 横切辅助: 画 N 条竖直排列的"斜线形态"水平条带(横切中心行求 minX)
+static cv::Mat makeHorizontalLines(int rows, int cols,
+                                   const std::vector<int>& xs,
+                                   const std::vector<int>& widths,
+                                   const std::vector<int>& labels) {
+    cv::Mat m = cv::Mat::zeros(rows, cols, CV_32SC1);
+    const int row = rows / 2;
+    for (size_t i = 0; i < xs.size(); ++i)
+        cv::rectangle(m, cv::Point(xs[i], row - 40),
+                      cv::Point(xs[i] + widths[i] - 1, row + 40),
+                      cv::Scalar(labels[i]), -1);
+    return m;
+}
+
+TEST_F(LaserLabelTest, GatePassesCleanFrame) {
+    params_.scanDirection = 1;
+    params_.expectedLineCount = 5;
+    params_.maxRunWidth = 30;
+    LaserLabelerCUDA labeler(params_);
+    labeler.Warmup(200, 400);
+
+    // 5 条正常宽度(12px)等距竖带, 中心行 y=100 切割
+    cv::Mat labels_cpu = makeHorizontalLines(
+        200, 400, {10, 80, 150, 220, 290}, {12, 12, 12, 12, 12}, {1, 2, 3, 4, 5});
+    cv::cuda::GpuMat d_labels;
+    d_labels.upload(labels_cpu);
+
+    auto result = labeler.Execute(d_labels);
+
+    EXPECT_TRUE(result.success);
+    EXPECT_FALSE(result.frameRejected);
+    EXPECT_TRUE(result.rejectReason.empty());
+    EXPECT_EQ(result.lineCount, 5);
+    EXPECT_EQ(result.componentCount, 5);
+}
+
+TEST_F(LaserLabelTest, GateRejectsMergedWideRun) {
+    params_.scanDirection = 1;
+    params_.maxRunWidth = 30;
+    LaserLabelerCUDA labeler(params_);
+    labeler.Warmup(200, 400);
+
+    // 第 3 条带宽度 132px(模拟过曝多线融合), 其余正常 12px
+    cv::Mat labels_cpu = makeHorizontalLines(
+        200, 400, {10, 80, 150, 320}, {12, 12, 132, 12}, {1, 2, 3, 5});
+    cv::cuda::GpuMat d_labels;
+    d_labels.upload(labels_cpu);
+
+    auto result = labeler.Execute(d_labels);
+
+    EXPECT_TRUE(result.success);            // 执行成功(非错误)
+    EXPECT_TRUE(result.frameRejected);      // 门禁拒绝
+    EXPECT_NE(result.rejectReason.find("runWidth=132"), std::string::npos);
+}
+
+TEST_F(LaserLabelTest, GateRejectsMultiRunLabelSpan) {
+    params_.scanDirection = 1;
+    params_.maxRunWidth = 30;
+    params_.splitMergedRuns = false;        // 关拆分, 直接验展布门禁
+    LaserLabelerCUDA labeler(params_);
+    labeler.Warmup(200, 400);
+
+    // 同一标签两段游程(12px + 间隙 + 12px), 展布 112px > 30 → 拒
+    cv::Mat labels_cpu = makeHorizontalLines(
+        200, 400, {10, 80, 150, 250}, {12, 12, 12, 12}, {1, 2, 3, 3});
+    cv::cuda::GpuMat d_labels;
+    d_labels.upload(labels_cpu);
+
+    auto result = labeler.Execute(d_labels);
+
+    EXPECT_TRUE(result.success);
+    EXPECT_TRUE(result.frameRejected);
+    EXPECT_NE(result.rejectReason.find("runWidth="), std::string::npos);
+}
+
+TEST_F(LaserLabelTest, GateRejectsWrongLineCount) {
+    params_.scanDirection = 1;
+    params_.expectedLineCount = 5;
+    LaserLabelerCUDA labeler(params_);
+    labeler.Warmup(200, 400);
+
+    // 只有 4 条线(缺 1 条 → 后段编号错位风险)
+    cv::Mat labels_cpu = makeHorizontalLines(
+        200, 400, {10, 80, 150, 220}, {12, 12, 12, 12}, {1, 2, 3, 4});
+    cv::cuda::GpuMat d_labels;
+    d_labels.upload(labels_cpu);
+
+    auto result = labeler.Execute(d_labels);
+
+    EXPECT_TRUE(result.success);
+    EXPECT_TRUE(result.frameRejected);
+    EXPECT_EQ(result.lineCount, 4);
+    EXPECT_NE(result.rejectReason.find("lineCount=4!=expectedLineCount(5)"),
+              std::string::npos);
+}
+
+TEST_F(LaserLabelTest, GateVerticalRejectsWideRun) {
+    params_.scanDirection = 0;              // 竖切中心列
+    params_.maxRunWidth = 30;
+    LaserLabelerCUDA labeler(params_);
+    labeler.Warmup(400, 200);
+
+    // 中心列 x=100 处一条高 132px 的竖带(模拟粘连)
+    cv::Mat labels_cpu = cv::Mat::zeros(400, 200, CV_32SC1);
+    cv::rectangle(labels_cpu, cv::Point(95, 134), cv::Point(105, 265),
+                  cv::Scalar(1), -1);
+    cv::cuda::GpuMat d_labels;
+    d_labels.upload(labels_cpu);
+
+    auto result = labeler.Execute(d_labels);
+
+    EXPECT_TRUE(result.success);
+    EXPECT_TRUE(result.frameRejected);
+    EXPECT_NE(result.rejectReason.find("runWidth=132"), std::string::npos);
+}
+
+TEST_F(LaserLabelTest, GateParamsJsonRoundtrip) {
+    params_.expectedLineCount = 25;
+    params_.maxRunWidth = 30;
+    auto restored = LaserLabelParams::fromJson(params_.toJson());
+    EXPECT_EQ(restored.expectedLineCount, 25);
+    EXPECT_EQ(restored.maxRunWidth, 30);
+}
+
+TEST_F(LaserLabelTest, GateParamsValidation) {
+    params_.expectedLineCount = -1;
+    EXPECT_THROW(params_.validate(), std::invalid_argument);
+
+    params_.expectedLineCount = 25;
+    params_.maxRunWidth = -5;
+    EXPECT_THROW(params_.validate(), std::invalid_argument);
+
+    params_.maxRunWidth = 30;
+    EXPECT_NO_THROW(params_.validate());
+}
+
+TEST_F(LaserLabelTest, GateOffByDefault) {
+    // 默认 0=off: 宽游程/线数不符均不拒绝(向后兼容)
+    EXPECT_EQ(params_.expectedLineCount, 0);
+    EXPECT_EQ(params_.maxRunWidth, 0);
+    EXPECT_NO_THROW(params_.validate());
+}
+
 #endif // WITH_CUDA_TESTS

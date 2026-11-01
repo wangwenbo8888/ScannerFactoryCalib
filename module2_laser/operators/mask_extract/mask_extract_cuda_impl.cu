@@ -115,6 +115,29 @@ void MaskExtractCUDA::Impl::rebuildFilters() {
         kernel_post_erode_.release();
         filter_post_erode_.release();
     }
+
+    // 高光分离路径滤波器（2D 椭圆核; 与 morphApprox 正交）
+    if (params_.highlightErodeSize > 0) {
+        kernel_hl_erode_ = cv::getStructuringElement(
+            cv::MORPH_ELLIPSE,
+            cv::Size(params_.highlightErodeSize, params_.highlightErodeSize)
+        );
+        filter_hl_erode_ = cv::cuda::createMorphologyFilter(
+            cv::MORPH_ERODE, CV_8UC1, kernel_hl_erode_
+        );
+        kernel_hl_dilate_ = cv::getStructuringElement(
+            cv::MORPH_ELLIPSE,
+            cv::Size(params_.highlightDilateSize, params_.highlightDilateSize)
+        );
+        filter_hl_dilate_ = cv::cuda::createMorphologyFilter(
+            cv::MORPH_DILATE, CV_8UC1, kernel_hl_dilate_
+        );
+    } else {
+        kernel_hl_erode_.release();
+        kernel_hl_dilate_.release();
+        filter_hl_erode_.release();
+        filter_hl_dilate_.release();
+    }
 }
 
 // ============================================================
@@ -134,6 +157,15 @@ void MaskExtractCUDA::Impl::allocateBuffers(int rows, int cols) {
         cv::cuda::createContinuous(rows, cols, CV_8UC1, d_morphTmp);
     else
         d_morphTmp.release();
+    if (params_.highlightErodeSize > 0) {
+        cv::cuda::createContinuous(rows, cols, CV_8UC1, d_hlEroded);
+        cv::cuda::createContinuous(rows, cols, CV_8UC1, d_hlDilated);
+        cv::cuda::createContinuous(rows, cols, CV_8UC1, d_laserNoHl);
+    } else {
+        d_hlEroded.release();
+        d_hlDilated.release();
+        d_laserNoHl.release();
+    }
     for (int p = 0; p < 2; ++p)
         for (int k = 0; k < 3; ++k)
             cv::cuda::createContinuous(rows, cols, CV_8UC1, d_resPool_[p][k]);
@@ -163,12 +195,27 @@ void MaskExtractCUDA::Impl::executePipeline(
         afterErode = &d_eroded;
     }
 
+    // Step 3H: 高光分离（highlightErodeSize>0 时）:
+    //   mask3 = erode(mask2, highlightErodeSize)  — 细激光线被吃掉, 仅剩粗高光斑
+    //   mask4 = dilate(mask3, highlightDilateSize) — 高光模板（回扩覆盖原边界）
+    //   mask5 = mask2 & ~mask4                     — 激光掩膜, 高光区被扣除
+    // 后续 dilate/postErode 闭运算作用对象从 mask2 切换为 mask5
+    const cv::cuda::GpuMat* laserSrc = afterErode;
+    if (params_.highlightErodeSize > 0 && filter_hl_erode_ && filter_hl_dilate_) {
+        filter_hl_erode_->apply(*afterErode, d_hlEroded, stream);
+        filter_hl_dilate_->apply(d_hlEroded, d_hlDilated, stream);
+        // mask5 = mask2 & ~mask4（bitwise_not 复用 d_hlEroded 作中间缓冲）
+        cv::cuda::bitwise_not(d_hlDilated, d_hlEroded, cv::noArray(), stream);
+        cv::cuda::bitwise_and(*afterErode, d_hlEroded, d_laserNoHl, cv::noArray(), stream);
+        laserSrc = &d_laserNoHl;
+    }
+
     // Step 4: GPU 膨胀（恢复激光形状; 线核两趟或 2D 椭圆核）
     if (params_.morphApprox == 1) {
-        filter_dilate_h_->apply(*afterErode, d_morphTmp, stream);
+        filter_dilate_h_->apply(*laserSrc, d_morphTmp, stream);
         filter_dilate_v_->apply(d_morphTmp, d_laserMask, stream);
     } else {
-        filter_dilate_->apply(*afterErode, d_laserMask, stream);
+        filter_dilate_->apply(*laserSrc, d_laserMask, stream);
     }
 
     // Step 4b: 膨胀后二次腐蚀（收边, 可选）
@@ -201,6 +248,9 @@ void MaskExtractCUDA::Impl::releaseBuffers() {
     d_postMask.release();
     d_cleanedMask.release();
     d_morphTmp.release();
+    d_hlEroded.release();
+    d_hlDilated.release();
+    d_laserNoHl.release();
     for (int p = 0; p < 2; ++p)
         for (int k = 0; k < 3; ++k)
             d_resPool_[p][k].release();

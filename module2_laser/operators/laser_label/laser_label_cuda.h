@@ -47,6 +47,18 @@ struct LaserLabelParams {
     /// 确认的真线其左右紧邻域也判定为真线(端点传播)。
     /// 域数 <3 时不甄别(无法构成左-中-右)。剔除域在输出掩膜中置 0。
     int realLineTolerance = 0;
+    /// 期望激光线条数门禁(0=off, >0 启用):
+    /// 编号后有效线数(componentCount) != 该值 → result.frameRejected=true。
+    /// 防护: 编号按交点位置顺序分配(无绝对锚定), 中部缺线/粘连将导致
+    /// 后续线整体错位——线数不符的帧必须整帧弃用(调用方按帧跳过 L+R)。
+    int expectedLineCount = 0;
+    /// 扫描线切割游程宽度门禁(像素, 0=off, >0 启用):
+    /// 任一标签在扫描线上的展布(末游程末端-首游程起点, 含游程间隙)
+    /// > 该值 → 判定多条激光线粘连(如高光过曝融合) → frameRejected=true。
+    /// 测量在 splitMergedRuns 拆分之前(原始游程), 防粘连被拆分"凑回"
+    /// 正确线数而漏检。正常线宽 ~12-22px(1688x1400 斜线形态实测),
+    /// 双线粘连 >=38px, 建议阈值 30。
+    int maxRunWidth = 0;
     int deviceId = 0;
 
     void validate() const {
@@ -60,6 +72,10 @@ struct LaserLabelParams {
             throw std::invalid_argument("LaserLabelParams::centerRowOffset must be [-500, 500]");
         if (realLineTolerance < 0)
             throw std::invalid_argument("LaserLabelParams::realLineTolerance must be >= 0 (0=off)");
+        if (expectedLineCount < 0 || expectedLineCount > maxLabels)
+            throw std::invalid_argument("LaserLabelParams::expectedLineCount must be [0, maxLabels] (0=off)");
+        if (maxRunWidth < 0)
+            throw std::invalid_argument("LaserLabelParams::maxRunWidth must be >= 0 (0=off)");
         if (deviceId < 0)
             throw std::invalid_argument("LaserLabelParams::deviceId must be >= 0");
     }
@@ -72,6 +88,8 @@ struct LaserLabelParams {
             {"centerRowOffset", centerRowOffset},
             {"splitMergedRuns", splitMergedRuns},
             {"realLineTolerance", realLineTolerance},
+            {"expectedLineCount", expectedLineCount},
+            {"maxRunWidth", maxRunWidth},
             {"deviceId", deviceId}
         };
     }
@@ -84,6 +102,8 @@ struct LaserLabelParams {
         if (j.contains("centerRowOffset")) p.centerRowOffset = j.at("centerRowOffset").get<int>();
         if (j.contains("splitMergedRuns")) p.splitMergedRuns = j.at("splitMergedRuns").get<bool>();
         if (j.contains("realLineTolerance")) p.realLineTolerance = j.at("realLineTolerance").get<int>();
+        if (j.contains("expectedLineCount")) p.expectedLineCount = j.at("expectedLineCount").get<int>();
+        if (j.contains("maxRunWidth")) p.maxRunWidth = j.at("maxRunWidth").get<int>();
         if (j.contains("deviceId")) p.deviceId = j.at("deviceId").get<int>();
         p.validate();
         return p;
@@ -101,6 +121,14 @@ struct LaserLabelResult {
 
     std::shared_ptr<cv::cuda::GpuMat> d_labeledMask;
     int componentCount = 0;
+
+    /// 门禁诊断: 编号后有效激光线条数(与 componentCount 同值, 语义化字段)
+    int lineCount = 0;
+    /// 数据质量门禁拒绝标志(非执行错误, success 仍为 true):
+    /// expectedLineCount/maxRunWidth 门禁任一触发时置 true, 调用方应整帧弃用
+    bool frameRejected = false;
+    /// 拒绝原因(多原因以 "; " 连接, 如 "runWidth=132>30 label=5; lineCount=23!=25")
+    std::string rejectReason;
 
     LaserLabelResult() = default;
     ~LaserLabelResult() = default;

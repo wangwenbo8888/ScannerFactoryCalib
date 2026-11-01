@@ -51,6 +51,7 @@ struct CameraOpParams {
     double extrinsicMaxReprojFactor = 100.0;  // maxReproj = reproj_error_threshold × 此系数
     int    extrinsicMinViewCount    = 4;
     int    framesMinValidFrames     = 4;      // 角点有效帧下限
+    int    cornerWorkers            = 1;      // 角点提取帧级并行数（1=串行=现役回滚口径）
 };
 
 // 统一解析器：对一份 JSON 文档做 present-key 覆盖（主库与数据集 config 共用）
@@ -60,6 +61,8 @@ void applyCameraParamsJson(const nlohmann::json& j,
 struct FramePair {
     cv::Mat leftGray;
     cv::Mat rightGray;
+    std::string leftFile;
+    std::string rightFile;
 };
 
 struct CameraInput {

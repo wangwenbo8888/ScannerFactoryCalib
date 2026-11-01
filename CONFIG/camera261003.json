@@ -1,0 +1,88 @@
+{
+  "_comment": "CAMERA261003 全链标定测试参数（factory_calib/module1_camera/tests/test_camera_chain_analysis.cpp 消费）；单键缺失自动回退内置默认值；_前缀键为注释，解析器忽略。来源文件均相对仓库根 E:/JEAMMWARE2601001",
+
+  "chessboard": {
+    "_note": "标定板规格（人工给定）",
+    "width": 11,
+    "_width": "棋盘内角点列数。来源：人工给定（2026-10-03 会话确认），记录于 docs/plans/2026-10-03-fc1-camera261003-fullchain-test-design.md §3.3；测试内置默认同名值见 test_camera_chain_analysis.cpp ChainConfig",
+    "height": 8,
+    "_height": "棋盘内角点行数。来源：同 width（人工给定＋设计文档 §3.3）",
+    "square_size_mm": 15.0,
+    "_square_size_mm": "单格物理尺寸 mm，决定内参/外参物理尺度（基线单位 mm 即由此来）。来源：人工给定＋设计文档 §3.3；算子默认值同 15.0（operators/intrinsic_calib/intrinsic_calib_cpu.h:19）"
+  },
+
+  "image_size": [2048, 1536],
+  "_image_size": "[宽, 高] 像素，装载时按此校验每帧尺寸。来源：数据集 BMP 实测（factory_calib/data_in/CAMERA261003/L1.bmp 等文件头 2048x1536 8bpp）；与装机默认一致（factory_calib/module1_camera/calib_io.h:23-24 imageWidth/imageHeight）",
+
+  "dataset": {
+    "_note": "数据集文件约定",
+    "max_frame_num": 52,
+    "_max_frame_num": "扫描帧号上限（L{n}.bmp/R{n}.bmp 平铺命名）。来源：数据集目录实测（factory_calib/data_in/CAMERA261003/ 共 52 对）",
+    "swap_lr": false,
+    "_swap_lr": "false=按文件名直接装载。背景：该数据集原始采集时 L/R 文件名与物理左右对调（A 类事故：仅接线/命名反、物理结构未动；证据：原文件名直接标定得 T_x=+131/P2[0][3]=+168942，与 left_skew 基线 T_x=−131 符号相反，矫正视差全负导致激光匹配 0）。2026-10-04 已对 data_in/CAMERA261003 与 data_in/laser1003-2 两数据集的 BMP 完成 L/R 文件名物理互换（52+11 对，尺寸交叉校验通过），文件名即物理真实，swap_lr 退役置 false。此前互换补救期间（2026-10-03~04）置 true 产出的 handoff 及全套标定产物持续有效，无需重标"
+  },
+
+  "temperature": {
+    "_note": "温度补偿参数（键名与 CLI camera config.json 保持一致）",
+    "cte": 23.6e-6,
+    "_cte": "镜头筒材料线膨胀系数 /℃（6061-T6 铝合金）。来源：factory_calib/module1_camera/calib_io.h:30（CameraCalibConfig.cte 默认）；算子侧默认同值（operators/intrinsic_compensate/intrinsic_compensate_cpu.h:81）",
+    "referenceTemp": 22.5,
+    "_referenceTemp": "参考温度 ℃，温表锚点档（deltaT=0 处 fx 精确还原）。来源：factory_calib/module1_camera/calib_io.h:31 默认；数据集无 temps.txt 时即用此回退（temps.txt 约定见同文件 loadCameraInput）",
+    "tempRangeMin": -15.0,
+    "_tempRangeMin": "参考温下方范围 ℃。来源：factory_calib/module1_camera/calib_io.h:32 默认；±15/0.5=61 档为 260902 统一口径（factory_calib/AGENTS.md 已知限制/输出 schema 节，commit 87c8f7f）",
+    "tempRangeMax": 15.0,
+    "_tempRangeMax": "参考温上方范围 ℃。来源：factory_calib/module1_camera/calib_io.h:33 默认；口径同上",
+    "tempStep": 0.5,
+    "_tempStep": "温度步距 ℃，档数 =(Max-Min)/Step+1 须与 gates.expectedTempTiers 一致。来源：factory_calib/module1_camera/calib_io.h:34 默认；口径同上"
+  },
+
+  "operator": {
+    "_note": "算子入参（非门禁；与 camera_calib_cli.cpp 调用口径对齐）",
+    "use_calibrateCameraRO": true,
+    "_use_calibrateCameraRO": "内参用 calibrateCameraRO 模式（保留最外角点不参与拟合）。来源：factory_calib/module1_camera/calib_io.h:27 默认（CLI 透传点 camera_calib_cli.cpp:29）",
+    "intrinsic_flags": 0,
+    "_intrinsic_flags": "内参标定开关位（0=无特殊标志）。来源：factory_calib/module1_camera/calib_io.h:26 默认（CLI 透传点 camera_calib_cli.cpp:30）",
+    "intrinsic_log_reproj": 1.0,
+    "_intrinsic_log_reproj": "内参算子重投影日志阈值 px——算子内只打 WARN 不影响 success（operators/intrinsic_calib/intrinsic_calib_cpu.cpp:342）。来源：CLI config 同名口径为 0.012（factory_calib/data_in/camera/config.json:10 与 calib_io.h:28），本测试首跑起放宽为 1.0（docs/plans/2026-10-03-...-design.md §3.3）",
+    "plate_temp_coeff": 5.0e-6,
+    "_plate_temp_coeff": "标定板热膨胀系数（内参 temperature_coeff 与外参物点网格实际格宽都吃这个）。来源：factory_calib/module1_camera/calib_io.h:39 默认（CLI 消费点 camera_calib_cli.cpp:32 与 :52-53）",
+    "plate_temp": 21.0,
+    "_plate_temp": "标定板温度 ℃（与 20℃ 基准差用于板热膨胀修正）。来源：factory_calib/module1_camera/calib_io.h:40 默认（CLI 消费点 camera_calib_cli.cpp:33 与 :53）",
+    "extrinsic_max_reproj": 100.0,
+    "_extrinsic_max_reproj": "外参 maxReprojError。来源：同 CLI 公式 reprojErrorThreshold×100（factory_calib/module1_camera/camera_calib_cli.cpp:49）",
+    "extrinsic_min_view_count": 4,
+    "_extrinsic_min_view_count": "外参最少视图数。来源：factory_calib/module1_camera/camera_calib_cli.cpp:50（硬编码 =4；算子自身默认 8，见 operators/extrinsic_calib/extrinsic_calib_cpu.h:24）"
+  },
+
+  "rectify": {
+    "_note": "立体矫正参数（本测试中矫正与矫正温表两处共用）",
+    "alpha": 1.0,
+    "_alpha": "0=裁剪缩放到全有效区（无黑边、矫正焦距略大）；1=保留全部源像素（可能黑边）。当前取 1.0（2026-10-03 人工调整：对齐 data_in/camera/config.json:19 装机口径，保全边缘像素）；来源基线 0.0=factory_calib/module1_camera/calib_io.h:36 rectifyAlpha 默认",
+    "flags": 1024,
+    "_flags": "1024 = cv::CALIB_ZERO_DISPARITY（左右矫正主点 x 对齐，视差可直接 xL-xR）。来源：C:/opencv-cuda-4.13.0/include/opencv2/calib3d.hpp:628（0x00400）；装机默认即此（factory_calib/module1_camera/calib_io.h:37）；算子 validate 只接受 0 或 1024（operators/stereo_rectify/stereo_rectify_cpu.cpp:129）"
+  },
+
+  "gates": {
+    "_note": "门禁断言值；首跑实测与收紧依据见 factory_calib/data_out/camera261003/report.txt，门禁表出处 docs/plans/2026-10-03-fc1-camera261003-fullchain-test-design.md §3.5",
+    "minDetectedPairs": 20,
+    "_minDetectedPairs": "角点检出对数下限。来源：设计文档 §3.5（首跑实测 50/52，帧 50/51 左图未检出自动跳过）",
+    "reprojMeanMax": 1.0,
+    "_reprojMeanMax": "内参重投影均值上限 px。来源：设计文档 §3.5（首跑实测 0.0583335）",
+    "fxRelDiffMax": 0.05,
+    "_fxRelDiffMax": "左右相机 fx/fy 相对差上限。来源：设计文档 §3.5（首跑实测 0.6%）",
+    "rotOrthoMax": 1e-6,
+    "_rotOrthoMax": "外参 R 正交性 ‖R·Rᵀ−I‖∞ 上限。来源：设计文档 §3.5（首跑实测 1.1e-16）",
+    "baselineMinMm": 10.0,
+    "_baselineMinMm": "基线下限 mm（防单位错误的粗门禁）。来源：设计文档 §3.5（首跑实测 133.4mm）",
+    "baselineMaxMm": 500.0,
+    "_baselineMaxMm": "基线上限 mm（同上）",
+    "roiAreaRatioMin": 0.4,
+    "_roiAreaRatioMin": "矫正 validRoi 面积/画幅下限。2026-10-03 起 alpha=1 口径（基线实测 44.3%/44.1%，留 ~4pp 余量）；alpha=0 时代基线为 1.0/1.0、旧门限 0.5——alpha=1 保全全部源像素时可靠区收缩属物理属性，防退化能力不变（崩坏标定 ROI 趋近 0 照样拦截）",
+    "epiMedianMax": 0.5,
+    "_epiMedianMax": "极线自检 |yL-yR| 中位数上限 px（4400 角点对）。来源：设计文档 §3.5（alpha=0 首跑实测 0.359985；alpha=1 下实测 0.152466）",
+    "epiP95Max": 1.0,
+    "_epiP95Max": "极线自检 P95 上限 px。来源：设计文档 §3.5（alpha=0 首跑实测 0.960236；alpha=1 下实测 0.406738）",
+    "expectedTempTiers": 61,
+    "_expectedTempTiers": "温度表档数，须与 temperature 组推算一致（±15/0.5=61）。来源：260902 统一口径（factory_calib/AGENTS.md；calib_io.h:32-34 默认值同口径）"
+  }
+}

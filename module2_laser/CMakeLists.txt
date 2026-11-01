@@ -3,19 +3,25 @@ find_package(OpenCV 4.13 REQUIRED COMPONENTS
     core imgproc calib3d cudaimgproc cudaarithm cudafilters flann)
 find_package(Eigen3 3.4 REQUIRED)
 # E(2026-09-03): 链接 OpenMP——此前 curve_map 行级 #pragma omp 被静默忽略（61 档生成串行）；
-# 写法对齐 09 侧（modules/09_operatorlib/CMakeLists.txt:49,65）。
-# 注：限定 COMPONENTS CXX——本树 CUDA 语言已启用，不限定时 FindOpenMP 会连带要求
-# OpenMP_CUDA（MSVC 无 CUDA OpenMP 实现而误报失败）；模块仅消费 OpenMP::OpenMP_CXX。
+# 写法对齐 09 侧（modules/09_operatorlib/CMakeLists.txt:49,65）
+# 注：限定 COMPONENTS CXX——本工程 CUDA 语言已启用，不限定时 FindOpenMP 会连带要求
+# OpenMP_CUDA（MSVC 无 CUDA OpenMP 实现而误报失败）；模块仅消费 OpenMP::OpenMP_CXX
 find_package(OpenMP REQUIRED COMPONENTS CXX)
 
 file(GLOB_RECURSE M2_OP_CPP "${CMAKE_CURRENT_SOURCE_DIR}/operators/*.cpp")
 file(GLOB_RECURSE M2_OP_CU  "${CMAKE_CURRENT_SOURCE_DIR}/operators/*.cu")
 file(GLOB_RECURSE M2_OP_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/operators/*.h")
+# curve_map_cuda.cu 需 -fmad=false（对齐 CPU 舍入, 等价性红线）——从 fc2_ops 通配
+# 排除, 由下方 fc2_curve_map_cuda 专用目标编译（避免改动全库既有算子的编译旗标）
+list(FILTER M2_OP_CU EXCLUDE REGEX "curve_map_cuda")
 file(GLOB_RECURSE M2_TOP_TESTS_CPP "${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp")
 set(M2_SOURCES "")
 set(M2_TESTS "")
 foreach(f ${M2_OP_CPP} ${M2_OP_CU} ${M2_TOP_TESTS_CPP})
     if(f MATCHES "tests[\\\\/]test_[^/\\\\]*\\.cpp$")
+        list(APPEND M2_TESTS ${f})
+    elseif(f MATCHES "tests[\\\\/][^/\\\\]+[\\\\/]test_[^/\\\\]*\\.cpp$")
+        # tests/ 一级子文件夹平铺 test_*.cpp（如 tests/baseline_depth/；2026-10-09）
         list(APPEND M2_TESTS ${f})
     elseif(f MATCHES "tests[\\\\/]")
         # 跳过 tests 目录内非 test_ 文件
@@ -48,6 +54,24 @@ if(M2_SOURCES)
     endif()
 endif()
 
+# === curve_map_cuda（2026-10-08 转正: CMTT CUDA 主引擎的单档生成器）===
+# 专用目标: -fmad=false 保与 CPU 版等价性; PUBLIC 链入 fc2_ops 供全下游符号透传。
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/operators/curve_map_cuda/curve_map_cuda.cu" AND TARGET fc2_ops)
+    add_library(fc2_curve_map_cuda STATIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/operators/curve_map_cuda/curve_map_cuda.cu)
+    target_include_directories(fc2_curve_map_cuda PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/operators ${M2_INC_DIRS})
+    target_link_libraries(fc2_curve_map_cuda PUBLIC
+        ${OpenCV_LIBS} spdlog::spdlog nlohmann_json::nlohmann_json)
+    if(MSVC)
+        target_compile_options(fc2_curve_map_cuda PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
+    endif()
+    target_compile_options(fc2_curve_map_cuda PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-fmad=false>)
+    target_link_libraries(fc2_ops PUBLIC fc2_curve_map_cuda)
+endif()
+
 # === fc2_io: calib_io (读 config/handoff/姿态目录, 写 laser_calib.json) ===
 # 经验 #3 实测修订: find_package REQUIRED 没列 imgcodecs → ${OpenCV_LIBS} 不带它。
 # Release OpenCV 装在 ${OpenCV_DIR} 下有 opencv_imgcodecs4130.lib; Debug 无。
@@ -60,7 +84,7 @@ elseif(EXISTS "${OpenCV_DIR}/lib/opencv_imgcodecs4130.lib")
 endif()
 
 if(TARGET fc2_ops AND FC2_IMGCODECS_LIB)
-    # 把 laser_calib_cli.cpp 也编进 fc2_io（FC2_BUILDING_LIB 让它跳过 main()），
+    # 将 laser_calib_cli.cpp 也编进 fc2_io（FC2_BUILDING_LIB 让它跳过 main()），
     # calib_runner 三件套 = GUI 进程内调用入口（与产线 GUI 库链接约定一致）
     add_library(fc2_io STATIC calib_io.cpp calib_io.h
                             calib_runner.cpp calib_runner.h
@@ -81,8 +105,6 @@ if(TARGET fc2_ops AND FC2_IMGCODECS_LIB)
         target_compile_options(laser_calib PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/bigobj>)
     endif()
     fc_deploy_crt(laser_calib)
-    fc_deploy_opencv_dlls(laser_calib)
-    fc_setup_vs_debugger(laser_calib "${CMAKE_SOURCE_DIR}")
     # 主控参数库随 exe 部署（三层合并中间层; 缺失时 CLI 回退内置同值默认）
     add_custom_command(TARGET laser_calib POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -118,7 +140,7 @@ endif()
 if(FC_BUILD_TESTS)
     foreach(t ${M2_TESTS})
         get_filename_component(tname ${t} NAME_WE)
-        set(tname "fc2_${tname}")  # 加 fc2_ 前缀避免与模块1 测试同名冲突（合建 build_fc_all）
+        set(tname "fc2_${tname}")  # 加 fc2_ 前缀避免与模块1测试同名冲突（合入 build_fc_all）
         add_executable(${tname} ${t})
         if(TARGET fc2_ops)
             target_link_libraries(${tname} PRIVATE fc2_ops GTest::gtest_main)
@@ -143,3 +165,6 @@ if(FC_BUILD_TESTS)
         endif()
     endforeach()
 endif()
+
+# NOTE(2026-10-08): CMTT CUDA 已转正至 operators/curve_map_cuda + operators/cmtt_cuda,
+# 由上方 fc2_ops 通配与 fc2_curve_map_cuda 专用目标收录; 原 tests/cmtt_cuda 试验段已移除。

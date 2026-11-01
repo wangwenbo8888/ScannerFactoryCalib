@@ -18,3 +18,10 @@ factory_calib.log
 /test_data/**/*.png
 /test_data/**/*.bmp
 /test_data/**/*.bin
+
+# 261101 移植：模块内本地数据集（E 机运行时资产，不入库；缺席时相关测试按约定 SKIP）
+module1_camera/test_data/
+module2_laser/test_data/
+
+# 分析工具运行输出（不入库）
+module1_camera/tools/analyze_camera_calib/out/

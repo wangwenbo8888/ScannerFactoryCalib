@@ -57,6 +57,11 @@ void applyCameraParamsJson(const nlohmann::json& j,
         if (f.contains("minValidFrames"))
             ops.framesMinValidFrames = f["minValidFrames"].get<int>();
     }
+    if (j.contains("corner") && j["corner"].is_object()) {
+        const auto& c = j["corner"];
+        if (c.contains("workers"))
+            ops.cornerWorkers = c["workers"].get<int>();
+    }
 }
 
 // 薄壳（兼容旧调用；新组解析后丢弃）
@@ -121,7 +126,7 @@ std::optional<CameraInput> loadCameraInput(const std::string& dir,
             spdlog::warn("skip {}: read failed", lf.filename().string());
             continue;
         }
-        in.frames.push_back({l, r});
+        in.frames.push_back({l, r, lf.filename().string(), rf.filename().string()});
     }
     spdlog::info("loaded {} frame pairs from {}", in.frames.size(), dir);
     if (in.frames.empty()) return std::nullopt;

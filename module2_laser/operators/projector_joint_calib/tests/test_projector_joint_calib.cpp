@@ -667,3 +667,69 @@ TEST_F(ProjectorJointCalibTest, MultiLineImprovesTz) {
               << " multi err=" << eMulti << "\n";
     EXPECT_LE(eMulti, eSingle + 1.0);   // 多线不劣于单线
 }
+
+// ===== F8 右目重投影残差（Phase B）测试 =====
+
+// T1: 默认关闭=回归（rightTermUsed 应为 false，行为与现状一致）
+TEST_F(ProjectorJointCalibTest, RightTermDefaultOff) {
+    auto sc = makeMultiScene(8, 800, 0.2, 42, 5);
+    auto r = op_->ExecuteMultiLine(sc.input);
+    ASSERT_TRUE(r.success) << r.message;
+    EXPECT_FALSE(r.rightTermUsed) << "默认应不启用右目项";
+    EXPECT_EQ(r.phaseBIters, 0);
+}
+
+// T2: 启用右目项，干净数据（机制验证：不崩溃、有诊断、不劣化）
+TEST_F(ProjectorJointCalibTest, RightTermCleanData) {
+    auto sc = makeMultiScene(8, 800, 0.0, 42, 5);
+    sc.input.baseline = 60.0;   // mm
+    sc.input.enableRightTerm = true;
+    sc.input.rightTermWeight = 1.0;
+    auto r = op_->ExecuteMultiLine(sc.input);
+    ASSERT_TRUE(r.success) << r.message;
+    EXPECT_TRUE(r.rightTermUsed) << "应启用右目项";
+    EXPECT_GT(r.phaseBIters, 0) << "Phase B 应有迭代";
+    EXPECT_GT(r.urRowCount, 0) << "应有生效 uR 行";
+    std::cerr << "[rt-clean] urBiasPre=" << r.urBiasPreRms
+              << " post=" << r.urBiasPostRms
+              << " iters=" << r.phaseBIters
+              << " gate=" << r.urGateCount
+              << " rows=" << r.urRowCount << "\n";
+    // 干净数据下 Phase B 可能已是最优（pre≈post 合理），只需不显著劣化
+    EXPECT_LT(r.urBiasPostRms, r.urBiasPreRms + 0.5)
+        << "uR bias 不应劣化 (pre=" << r.urBiasPreRms << " post=" << r.urBiasPostRms << ")";
+    // Sampson 不劣化
+    EXPECT_LT(r.finalSampsonRms, 1.0) << "Sampson RMS 不应劣化";
+}
+
+// T3: 启用右目项，带噪声数据（uR 偏差应收敛或至少不劣化）
+TEST_F(ProjectorJointCalibTest, RightTermNoisyData) {
+    auto sc = makeMultiScene(8, 600, 0.3, 43, 5);
+    sc.input.baseline = 60.0;
+    sc.input.enableRightTerm = true;
+    sc.input.rightTermWeight = 1.0;
+    auto r = op_->ExecuteMultiLine(sc.input);
+    ASSERT_TRUE(r.success) << r.message;
+    EXPECT_TRUE(r.rightTermUsed);
+    std::cerr << "[rt-noisy] urBiasPre=" << r.urBiasPreRms
+              << " post=" << r.urBiasPostRms
+              << " iters=" << r.phaseBIters
+              << " cond=" << r.jacobianConditionNumber << "\n";
+    // post 不应显著劣化（允许噪声波动）
+    EXPECT_LT(r.urBiasPostRms, r.urBiasPreRms + 1.0)
+        << "uR bias 不应显著劣化 (pre=" << r.urBiasPreRms
+        << " post=" << r.urBiasPostRms << ")";
+    // projectorT 仍在真值附近
+    EXPECT_NEAR(r.projectorT[2], sc.t_true[2], 3.0)
+        << "tz 不应漂移过远";
+}
+
+// T4: enableRightTerm 但 baseline=0（应安全跳过 Phase B）
+TEST_F(ProjectorJointCalibTest, RightTermZeroBaseline) {
+    auto sc = makeMultiScene(8, 400, 0.0, 44, 3);
+    sc.input.baseline = 0.0;   // 无基线
+    sc.input.enableRightTerm = true;
+    auto r = op_->ExecuteMultiLine(sc.input);
+    ASSERT_TRUE(r.success) << r.message;
+    EXPECT_FALSE(r.rightTermUsed) << "baseline=0 应跳过 Phase B";
+}

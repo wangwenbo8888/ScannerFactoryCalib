@@ -39,6 +39,15 @@ struct MaskExtractParams {
     /// 比 2D 椭圆核快数倍; 掩膜对角方向外形略有差异, 需下游 A/B 验证）;
     /// 0=精确 2D 椭圆核（默认）。erodeSize<=1 时首腐蚀恒等跳过（不受此开关影响）
     int morphApprox = 0;
+    /// 高光分离: 厚度判据剔除过曝高光斑（2026-10-07 laser261006-1668 粘连事故）。
+    /// >0（奇数）启用新路径: mask2 再腐蚀本核 → 仅剩粗高光斑(细激光线被吃掉),
+    /// 膨胀 highlightDilateSize 回扩为"高光模板", 从 mask2 减去后再走
+    /// dilate(postErode) 闭运算。0=关闭（legacy 单路形态学）。
+    /// 需 highlightErodeSize > 激光线宽 且 < 高光斑厚度（本机: 线~5px/斑>18px, 取 9）
+    int highlightErodeSize = 0;
+    /// 高光模板回膨胀核大小（奇数; 仅 highlightErodeSize>0 时生效）。
+    /// 需 ≥ highlightErodeSize 以覆盖被腐蚀掉的高光原边界（取 13）
+    int highlightDilateSize = 13;
     /**
     * @brief 参数合法性校验
     * @throws std::invalid_argument 参数不合法
@@ -54,6 +63,12 @@ struct MaskExtractParams {
             throw std::invalid_argument("MaskExtractParams::postErodeSize must be positive odd or 0 (off)");
         if (morphApprox != 0 && morphApprox != 1)
             throw std::invalid_argument("MaskExtractParams::morphApprox must be 0 or 1");
+        if (highlightErodeSize < 0 || (highlightErodeSize > 0 && highlightErodeSize % 2 == 0))
+            throw std::invalid_argument("MaskExtractParams::highlightErodeSize must be positive odd or 0 (off)");
+        if (highlightDilateSize < 1 || highlightDilateSize % 2 == 0)
+            throw std::invalid_argument("MaskExtractParams::highlightDilateSize must be positive odd");
+        if (highlightErodeSize > 0 && highlightDilateSize < highlightErodeSize)
+            throw std::invalid_argument("MaskExtractParams::highlightDilateSize must be >= highlightErodeSize");
     }
 
     /**
@@ -65,7 +80,9 @@ struct MaskExtractParams {
             {"erodeSize", erodeSize},
             {"laserDilateSize", laserDilateSize},
             {"postErodeSize", postErodeSize},
-            {"morphApprox", morphApprox}
+            {"morphApprox", morphApprox},
+            {"highlightErodeSize", highlightErodeSize},
+            {"highlightDilateSize", highlightDilateSize}
         };
     }
 
@@ -80,6 +97,8 @@ struct MaskExtractParams {
         if (j.contains("laserDilateSize")) p.laserDilateSize = j.at("laserDilateSize").get<int>();
         if (j.contains("postErodeSize")) p.postErodeSize = j.at("postErodeSize").get<int>();
         if (j.contains("morphApprox")) p.morphApprox = j.at("morphApprox").get<int>();
+        if (j.contains("highlightErodeSize")) p.highlightErodeSize = j.at("highlightErodeSize").get<int>();
+        if (j.contains("highlightDilateSize")) p.highlightDilateSize = j.at("highlightDilateSize").get<int>();
         p.validate();
         return p;
     }

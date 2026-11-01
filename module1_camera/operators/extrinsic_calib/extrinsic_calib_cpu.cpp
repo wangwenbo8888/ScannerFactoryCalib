@@ -555,7 +555,7 @@ ExtrinsicCalibCpuResult ExtrinsicCalibCpu::Impl::Execute(
             cameraMatrixL, distCoeffsL, cameraMatrixR, distCoeffsR,
             params_.imageSize,
             R, T, E, F,
-            cv::CALIB_FIX_INTRINSIC,
+            cv::CALIB_FIX_INTRINSIC | cv::CALIB_USE_LU,
             cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 100, 1e-6)
         );
 

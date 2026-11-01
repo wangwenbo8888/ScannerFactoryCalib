@@ -5,7 +5,7 @@
     "square_size_mm": 15.0
   },
   "image_size": [2048, 1536],
-  "intrinsic_flags": 0,
+  "intrinsic_flags": 131072,
   "use_calibrateCameraRO": true,
   "reproj_error_threshold": 0.012,
   "temperature": {

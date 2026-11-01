@@ -10,12 +10,21 @@
 
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
+#include <algorithm>
+#include <atomic>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <array>
+#include <sstream>
+#include <iomanip>
+#include <ctime>
+#include <cmath>
 
 using namespace fc;
 using namespace calib;
@@ -61,6 +70,235 @@ ExtrinsicCalibCpuParams makeExtrinParams(const CameraCalibConfig& c,
                 static_cast<float>(j * actualSize),
                 static_cast<float>(i * actualSize), 0.0f);
     return p;
+}
+
+struct FrameMetaInfo {
+    std::optional<double> temp;
+    std::optional<double> exposure;
+};
+
+struct FrameRec {
+    size_t origIndex = 0;
+    std::string leftFile, rightFile;
+    bool valid = false;
+    std::string skipReason;
+    double subpixL = 0.0, subpixR = 0.0;
+    std::vector<cv::Point2f> cornersL, cornersR;
+    std::optional<double> temp, exposure;
+};
+
+// 侧车 frames_meta.csv: file,temp_c,exposure_us（首行表头；file 匹配左目 stem）
+std::map<std::string, FrameMetaInfo> parseFramesMeta(const std::string& dir) {
+    std::map<std::string, FrameMetaInfo> out;
+    std::ifstream ifs(dir + "/frames_meta.csv");
+    if (!ifs.is_open()) return out;
+    std::string line;
+    if (!std::getline(ifs, line)) return out;
+    size_t rows = 0;
+    while (std::getline(ifs, line)) {
+        if (line.empty()) continue;
+        std::stringstream ss(line);
+        std::string f, t, e;
+        std::getline(ss, f, ',');
+        std::getline(ss, t, ',');
+        std::getline(ss, e, ',');
+        if (f.empty()) continue;
+        FrameMetaInfo m;
+        try { if (!t.empty()) m.temp = std::stod(t); } catch (const std::exception&) {}
+        try { if (!e.empty()) m.exposure = std::stod(e); } catch (const std::exception&) {}
+        out[std::filesystem::path(f).stem().string()] = m;
+        ++rows;
+    }
+    spdlog::info("frames_meta.csv loaded: {} rows", rows);
+    return out;
+}
+
+std::string csvEsc(const std::string& s) {
+    if (s.find_first_of(",\"\n\r") == std::string::npos) return s;
+    std::string r = "\"";
+    for (char c : s) { if (c == '"') r += "\"\""; else r += c; }
+    return r + "\"";
+}
+
+std::string fmtN(double v, int prec) {
+    if (!std::isfinite(v)) return "";
+    std::ostringstream os;
+    os << std::fixed << std::setprecision(prec) << v;
+    return os.str();
+}
+
+std::string optStr(const std::optional<double>& v, int prec) {
+    return v.has_value() ? fmtN(*v, prec) : std::string();
+}
+
+std::string gridRegion(double u, double v, int W, int H) {
+    static const char* rows[3] = {"T", "M", "B"};
+    static const char* cols[3] = {"L", "C", "R"};
+    int ci = u < W / 3.0 ? 0 : (u < 2.0 * W / 3.0 ? 1 : 2);
+    int ri = v < H / 3.0 ? 0 : (v < 2.0 * H / 3.0 ? 1 : 2);
+    return std::string(rows[ri]) + cols[ci];
+}
+
+// 逐帧/逐角点 CSV 落盘（写失败仅 warn；epi_raw=原始像素×F 口径，row_align=矫正域口径）
+void emitFrameCsvs(const std::string& outPath,
+                   const std::vector<FrameRec>& recs,
+                   const std::vector<std::vector<cv::Point2f>>& lpts,
+                   const std::vector<std::vector<cv::Point2f>>& rpts,
+                   const calib::IntrinsicCalibResult& intrinRes,
+                   const calib::ExtrinsicCalibCpuResult& extrinRes,
+                   const calib::StereoRectifyCpuResult& rectifyRes,
+                   const CameraCalibConfig& cfg,
+                   const ExtrinsicCalibCpuParams& ep)
+{
+    namespace fs = std::filesystem;
+    const cv::Mat &KL = intrinRes.left.camera_matrix, &DL = intrinRes.left.dist_coeffs;
+    const cv::Mat &KR = intrinRes.right.camera_matrix, &DR = intrinRes.right.dist_coeffs;
+    const cv::Mat &F = extrinRes.F, &GR = extrinRes.R, &GT = extrinRes.T;
+    const cv::Mat &R1 = rectifyRes.R1, &R2 = rectifyRes.R2, &P1 = rectifyRes.P1, &P2 = rectifyRes.P2;
+    const int W = cfg.imageWidth, H = cfg.imageHeight;
+    const int NX = cfg.chessWidth, NY = cfg.chessHeight;
+    const double fxL = KL.at<double>(0, 0), fyL = KL.at<double>(1, 1);
+    const double cxL = KL.at<double>(0, 2), cyL = KL.at<double>(1, 2);
+
+    fs::path base(outPath);
+    if (base.has_extension()) base.replace_extension();
+    std::string pfPath = base.string() + "_perframe.csv";
+    std::string pcPath = base.string() + "_percorner.csv";
+    std::ofstream pf(pfPath), pc(pcPath);
+    if (!pf.is_open() || !pc.is_open()) {
+        spdlog::warn("per-frame csv not written (cannot open {} / {})", pfPath, pcPath);
+        return;
+    }
+
+    char tbuf[32];
+    std::time_t tt = std::time(nullptr);
+    std::strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", std::localtime(&tt));
+    {
+        std::ostringstream os;
+        os << std::fixed << std::setprecision(1);
+        os << "# schema=camera_calib_perframe.v1 generated=" << tbuf
+           << " board=" << NX << "x" << NY << "x" << cfg.squareSizeMm << "mm"
+           << " image=" << W << "x" << H << " ref_temp=" << cfg.referenceTemp
+           << " note=epi_raw uses raw-pixel F domain (has ~0.3px baseline artifact); row_align uses rectified domain";
+        pf << os.str() << "\n";
+        pc << os.str() << "\n";
+    }
+
+    pf << "frame_id,orig_index,left_file,right_file,valid,skip_reason,corner_count,"
+          "mean_subpix_delta_px,reproj_L_px,reproj_R_px,reproj_ratio,epi_raw_px,row_align_px,"
+          "stereo_reproj_px,extrin_deg,extrin_mm,dist_L_mm,dist_R_mm,tilt_deg,cover_pct,"
+          "board_center_u_px,board_center_v_px,region_L,region_R,"
+          "rvec_Lx,rvec_Ly,rvec_Lz,tvec_Lx_mm,tvec_Ly_mm,tvec_Lz_mm,"
+          "rvec_Rx,rvec_Ry,rvec_Rz,tvec_Rx_mm,tvec_Ry_mm,tvec_Rz_mm,"
+          "temp_c,exposure_us\n";
+    pc << "frame_id,corner_idx,grid_row,grid_col,x_L_px,y_L_px,x_R_px,y_R_px,"
+          "resid_dx_L_px,resid_dy_L_px,resid_dx_R_px,resid_dy_R_px,"
+          "epi_raw_px,row_align_dy_px,radius_norm\n";
+
+    size_t validSeen = 0;
+    for (const auto& rec : recs) {
+        std::ostringstream row;
+        row << (rec.valid ? validSeen + 1 : 0) << "," << rec.origIndex << ","
+            << csvEsc(rec.leftFile) << "," << csvEsc(rec.rightFile) << ","
+            << (rec.valid ? 1 : 0) << "," << csvEsc(rec.skipReason) << ",";
+        if (!rec.valid) {
+            row << "0";
+            for (int k = 0; k < 27; ++k) row << ",";
+            row << "," << optStr(rec.temp, 2)
+                << "," << optStr(rec.exposure, 1) << "\n";
+            pf << row.str();
+            continue;
+        }
+        const size_t vi = validSeen++;
+        const auto& cl = lpts[vi];
+        const auto& cr = rpts[vi];
+        const cv::Mat rvecL = intrinRes.left.rvecs[vi], tvecL = intrinRes.left.tvecs[vi];
+        const cv::Mat rvecR = intrinRes.right.rvecs[vi], tvecR = intrinRes.right.tvecs[vi];
+
+        std::vector<cv::Point2f> projL, projR, undL, undR;
+        cv::projectPoints(ep.objectPoints, rvecL, tvecL, KL, DL, projL);
+        cv::projectPoints(ep.objectPoints, rvecR, tvecR, KR, DR, projR);
+        cv::undistortPoints(cl, undL, KL, DL, R1, P1);
+        cv::undistortPoints(cr, undR, KR, DR, R2, P2);
+
+        const size_t n = cl.size();
+        double epiRawSum = 0.0, rowSum = 0.0, sqL = 0.0, sqR = 0.0;
+        for (size_t j = 0; j < n; ++j) {
+            const double xl = cl[j].x, yl = cl[j].y, xr = cr[j].x, yr = cr[j].y;
+            const double a = F.at<double>(0, 0) * xl + F.at<double>(0, 1) * yl + F.at<double>(0, 2);
+            const double b = F.at<double>(1, 0) * xl + F.at<double>(1, 1) * yl + F.at<double>(1, 2);
+            const double c = F.at<double>(2, 0) * xl + F.at<double>(2, 1) * yl + F.at<double>(2, 2);
+            const double epiJ = std::abs(a * xr + b * yr + c) / std::hypot(a, b);
+            const double dy = undL[j].y - undR[j].y;
+            epiRawSum += epiJ;
+            rowSum += std::abs(dy);
+            const double dxL = xl - projL[j].x, dyL = yl - projL[j].y;
+            const double dxR = xr - projR[j].x, dyR = yr - projR[j].y;
+            sqL += dxL * dxL + dyL * dyL;
+            sqR += dxR * dxR + dyR * dyR;
+            std::ostringstream prow;
+            prow << (vi + 1) << "," << j << "," << (j / NX) << "," << (j % NX) << ","
+                 << fmtN(xl, 2) << "," << fmtN(yl, 2) << "," << fmtN(xr, 2) << "," << fmtN(yr, 2) << ","
+                 << fmtN(dxL, 4) << "," << fmtN(dyL, 4) << "," << fmtN(dxR, 4) << "," << fmtN(dyR, 4) << ","
+                 << fmtN(epiJ, 4) << "," << fmtN(dy, 4) << ","
+                 << fmtN(std::hypot((xl - cxL) / fxL, (yl - cyL) / fyL), 4) << "\n";
+            pc << prow.str();
+        }
+        const double stReproj = std::sqrt((sqL + sqR) / (2.0 * static_cast<double>(n)));
+
+        cv::Mat Rl, Rr;
+        cv::Rodrigues(rvecL, Rl);
+        cv::Rodrigues(rvecR, Rr);
+        cv::Mat Rrel = Rr * Rl.t();
+        double trc = (cv::trace(Rrel * GR.t()).val[0] - 1.0) / 2.0;
+        trc = std::max(-1.0, std::min(1.0, trc));
+        const double edeg = std::acos(trc) * 180.0 / CV_PI;
+        cv::Mat trel = tvecR - Rrel * tvecL;
+        const double emm = cv::norm(trel - GT);
+
+        std::vector<cv::Point3f> ext = {ep.objectPoints[0], ep.objectPoints[NX - 1],
+                                        ep.objectPoints[static_cast<size_t>(NY - 1) * NX],
+                                        ep.objectPoints[static_cast<size_t>(NY) * NX - 1]};
+        std::vector<cv::Point2f> pixL, pixR;
+        cv::projectPoints(ext, rvecL, tvecL, KL, DL, pixL);
+        cv::projectPoints(ext, rvecR, tvecR, KR, DR, pixR);
+        auto bbox = [](const std::vector<cv::Point2f>& p) {
+            float u0 = p[0].x, v0 = p[0].y, u1 = p[0].x, v1 = p[0].y;
+            for (const auto& q : p) {
+                u0 = std::min(u0, q.x); v0 = std::min(v0, q.y);
+                u1 = std::max(u1, q.x); v1 = std::max(v1, q.y);
+            }
+            return std::array<float, 4>{u0, v0, u1, v1};
+        };
+        const auto bl = bbox(pixL), br = bbox(pixR);
+        const double cover = (bl[2] - bl[0]) * (bl[3] - bl[1]) / (double(W) * H) * 100.0;
+        const double cuL = (bl[0] + bl[2]) / 2.0, cvL = (bl[1] + bl[3]) / 2.0;
+        const double cuR = (br[0] + br[2]) / 2.0, cvR = (br[1] + br[3]) / 2.0;
+
+        const double reprojL = intrinRes.left.per_view_errors[vi];
+        const double reprojR = intrinRes.right.per_view_errors[vi];
+
+        row << n << "," << fmtN((rec.subpixL + rec.subpixR) / 2.0, 4) << ","
+            << fmtN(reprojL, 4) << "," << fmtN(reprojR, 4) << ","
+            << (reprojR > 0 ? fmtN(reprojL / reprojR, 3) : std::string()) << ","
+            << fmtN(epiRawSum / n, 4) << "," << fmtN(rowSum / n, 4) << ","
+            << fmtN(stReproj, 4) << "," << fmtN(edeg, 4) << "," << fmtN(emm, 3) << ","
+            << fmtN(cv::norm(tvecL), 3) << "," << fmtN(cv::norm(tvecR), 3) << ","
+            << fmtN(std::acos(std::max(-1.0, std::min(1.0, Rl.at<double>(2, 2)))) * 180.0 / CV_PI, 3) << ","
+            << fmtN(cover, 2) << "," << fmtN(cuL, 1) << "," << fmtN(cvL, 1) << ","
+            << gridRegion(cuL, cvL, W, H) << "," << gridRegion(cuR, cvR, W, H) << ","
+            << fmtN(rvecL.at<double>(0), 6) << "," << fmtN(rvecL.at<double>(1), 6) << ","
+            << fmtN(rvecL.at<double>(2), 6) << ","
+            << fmtN(tvecL.at<double>(0), 3) << "," << fmtN(tvecL.at<double>(1), 3) << ","
+            << fmtN(tvecL.at<double>(2), 3) << ","
+            << fmtN(rvecR.at<double>(0), 6) << "," << fmtN(rvecR.at<double>(1), 6) << ","
+            << fmtN(rvecR.at<double>(2), 6) << ","
+            << fmtN(tvecR.at<double>(0), 3) << "," << fmtN(tvecR.at<double>(1), 3) << ","
+            << fmtN(tvecR.at<double>(2), 3) << ","
+            << optStr(rec.temp, 2) << "," << optStr(rec.exposure, 1) << "\n";
+        pf << row.str();
+    }
+    spdlog::info("per-frame csv -> {} / {}", pfPath, pcPath);
 }
 
 } // namespace
@@ -115,21 +353,71 @@ int main(int argc, char** argv) {
     const auto& cfg = input->config;
     const auto& ops = input->ops;
 
-    // 1. 逐帧提取棋盘角点
+    // 1. 逐帧提取棋盘角点（全帧留痕：失败帧也进 FrameRec，供逐帧 CSV 用）
+    // 批次二（2026-10-14）：corner.workers>1 时按帧并行提取；
+    // 提取期间将 OpenCV 内部线程压为 1（嵌套并行闸会退化帧级并行），
+    // 结果与串行逐字节一致（opt_bench test_opt_corner_10s 臂二实证）。
     ChessboardCornerParams cp;
     cp.patternSize = cv::Size(cfg.chessWidth, cfg.chessHeight);
     std::vector<std::vector<cv::Point2f>> lpts, rpts;
-    for (size_t i = 0; i < input->frames.size(); ++i) {
+    auto metaMap = parseFramesMeta(inDir);
+    std::vector<FrameRec> recs(input->frames.size());
+    const size_t frameCount = input->frames.size();
+    const int cornerWorkers = std::max(1, ops.cornerWorkers);
+
+    auto processFrame = [&](size_t i) {
+        FrameRec& rec = recs[i];
+        rec.origIndex = i;
+        rec.leftFile = input->frames[i].leftFile;
+        rec.rightFile = input->frames[i].rightFile;
+        auto it = metaMap.find(std::filesystem::path(rec.leftFile).stem().string());
+        if (it != metaMap.end()) {
+            rec.temp = it->second.temp;
+            rec.exposure = it->second.exposure;
+        }
         ChessboardCornerResult rl, rr;
-        if (!extractChessboardCorners(input->frames[i].leftGray, cp, rl) ||
-            !extractChessboardCorners(input->frames[i].rightGray, cp, rr))
-        {
-            spdlog::warn("frame {}: corner extraction failed, skip", i);
-            continue;
+        bool okL = extractChessboardCorners(input->frames[i].leftGray, cp, rl);
+        bool okR = extractChessboardCorners(input->frames[i].rightGray, cp, rr);
+        if (!okL || !okR) {
+            rec.skipReason = !okL ? (!okR ? "corner_L+corner_R" : "corner_L") : "corner_R";
+            spdlog::warn("frame {}: corner extraction failed, skip ({})", i, rec.skipReason);
+            return;
         }
         normalizeLRCornerOrder(rl, rr);
-        lpts.push_back(std::move(rl.corners));
-        rpts.push_back(std::move(rr.corners));
+        rec.valid = true;
+        rec.subpixL = rl.meanSubpixDelta;
+        rec.subpixR = rr.meanSubpixDelta;
+        rec.cornersL = std::move(rl.corners);
+        rec.cornersR = std::move(rr.corners);
+    };
+
+    if (cornerWorkers <= 1 || frameCount == 0) {
+        for (size_t i = 0; i < frameCount; ++i) processFrame(i);
+    } else {
+        const int savedNumThreads = cv::getNumThreads();
+        cv::setNumThreads(1);
+        const int nt = static_cast<int>(
+            std::min(static_cast<size_t>(cornerWorkers), frameCount));
+        std::atomic<size_t> next(0);
+        std::vector<std::thread> pool;
+        pool.reserve(static_cast<size_t>(nt));
+        for (int t = 0; t < nt; ++t) {
+            pool.emplace_back([&] {
+                for (;;) {
+                    size_t i = next.fetch_add(1);
+                    if (i >= frameCount) break;
+                    processFrame(i);
+                }
+            });
+        }
+        for (auto& th : pool) th.join();
+        cv::setNumThreads(savedNumThreads);
+    }
+
+    for (const auto& rec : recs) {
+        if (!rec.valid) continue;
+        lpts.push_back(rec.cornersL);
+        rpts.push_back(rec.cornersR);
     }
     if (lpts.size() < static_cast<size_t>(ops.framesMinValidFrames)) {
         spdlog::error("too few valid frames: {}", lpts.size()); return 1;
@@ -204,5 +492,11 @@ int main(int argc, char** argv) {
                                   tableL, tableR, tableE, tableR2);
     if (!writeJson(outPath, j)) return 1;
     spdlog::info("camera_calib done -> {}", outPath);
+
+    try {
+        emitFrameCsvs(outPath, recs, lpts, rpts, intrinRes, extrinRes, rectifyRes, cfg, ep);
+    } catch (const std::exception& e) {
+        spdlog::warn("per-frame csv emit failed: {}", e.what());
+    }
     return 0;
 }

@@ -1,7 +1,7 @@
 # tests/e2e — L3 合成端到端测试自包含单元
 
 > 本文件夹是 `module1_camera` 的合成图端到端测试（L3）自包含单元：测试源码＋参数＋说明同驻一处。
-> 上级访问规则见 `factory_calib/AGENTS.md`（AI 只读保护区，人工明确指令除外）。
+> 上级访问规则见 `factory_calib/AGENTS.md`（2026-10-14 起 AI 可自由访问，原只读保护区规则废止）。
 
 ## 1. 文件清单
 
@@ -49,4 +49,4 @@
 
 1. **调参数只改 `config.json`，不改测试代码**（改姿态表/门限/图像尺寸等均如此）。
 2. 改键名须三处同步：`config.json` ＋ `loadConfig()`/`E2EConfig` ＋ 本文档 §2。
-3. 本文件夹属 `factory_calib/` 保护区：AI 改动需人工明确指令（上级 AGENTS.md 第一部分）。
+3. 本文件夹属 `factory_calib/` 产线交付物：改动后须走模块1 全量回归（`ctest --test-dir build_fc1_rel -C Release`）。

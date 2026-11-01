@@ -140,17 +140,27 @@ void CurveMapTempTableGenParams::validate() const {
     if (!(tempHalfRange >= 0.0f))
         throw std::invalid_argument(
             "CurveMapTempTableGenParams::tempHalfRange must be >= 0");
+    if (tiersBelow < 0 || tiersAbove < 0)
+        throw std::invalid_argument(
+            "CurveMapTempTableGenParams: tiersBelow/tiersAbove must be >= 0");
+    if ((tiersBelow > 0) != (tiersAbove > 0))
+        throw std::invalid_argument(
+            "CurveMapTempTableGenParams: asymmetric tiers require both "
+            "tiersBelow>0 and tiersAbove>0 (or both 0 for symmetric range)");
     if (!(depthMin > 0.0f) || !(depthMax > depthMin))
         throw std::invalid_argument(
             "CurveMapTempTableGenParams: invalid depth window (need 0 < min < max)");
     // 温网整除性: 端点含入依赖 halfRange 为 step 整数倍（不可整除 → 端点漂移, 拒绝）
-    const double nGrid =
-        static_cast<double>(tempHalfRange) / static_cast<double>(tempStep);
-    if (std::fabs(nGrid - std::floor(nGrid + 0.5)) > 1e-6)
-        throw std::invalid_argument(
-            "CurveMapTempTableGenParams: tempHalfRange " +
-            std::to_string(tempHalfRange) + " is not an integer multiple of tempStep " +
-            std::to_string(tempStep));
+    // （非对称模式不消费 tempHalfRange, 免检）
+    if (tiersBelow == 0) {
+        const double nGrid =
+            static_cast<double>(tempHalfRange) / static_cast<double>(tempStep);
+        if (std::fabs(nGrid - std::floor(nGrid + 0.5)) > 1e-6)
+            throw std::invalid_argument(
+                "CurveMapTempTableGenParams: tempHalfRange " +
+                std::to_string(tempHalfRange) + " is not an integer multiple of tempStep " +
+                std::to_string(tempStep));
+    }
 }
 
 nlohmann::json CurveMapTempTableGenParams::toJson() const {
@@ -158,6 +168,8 @@ nlohmann::json CurveMapTempTableGenParams::toJson() const {
         {"referenceTemp", referenceTemp},
         {"tempHalfRange", tempHalfRange},
         {"tempStep", tempStep},
+        {"tiersBelow", tiersBelow},
+        {"tiersAbove", tiersAbove},
         {"rowStep", rowStep},
         {"depthMin", depthMin},
         {"depthMax", depthMax},
@@ -170,6 +182,8 @@ CurveMapTempTableGenParams CurveMapTempTableGenParams::fromJson(const nlohmann::
     if (j.contains("referenceTemp")) p.referenceTemp = j.at("referenceTemp").get<double>();
     if (j.contains("tempHalfRange")) p.tempHalfRange = j.at("tempHalfRange").get<float>();
     if (j.contains("tempStep"))      p.tempStep      = j.at("tempStep").get<float>();
+    if (j.contains("tiersBelow"))    p.tiersBelow    = j.at("tiersBelow").get<int>();
+    if (j.contains("tiersAbove"))    p.tiersAbove    = j.at("tiersAbove").get<int>();
     if (j.contains("rowStep"))       p.rowStep       = j.at("rowStep").get<float>();
     if (j.contains("depthMin"))      p.depthMin      = j.at("depthMin").get<float>();
     if (j.contains("depthMax"))      p.depthMax      = j.at("depthMax").get<float>();
@@ -328,7 +342,10 @@ CurveMapTempTableResult CurveMapTempTableGenerator::Generate(
     // 与纯串行一致 → 线程数无关确定性（硬规则 #8 维持; 勿开 OMP_NESTED）。
     const int nHalf = static_cast<int>(std::lround(
         static_cast<double>(params_.tempHalfRange) / static_cast<double>(params_.tempStep)));
-    const size_t total = static_cast<size_t>(2 * nHalf) + 1;
+    // 非对称档位（2026-10-13）: tiersBelow/tiersAbove 双正时覆盖对称半范围路径
+    const int kLow  = (params_.tiersBelow > 0) ? -params_.tiersBelow : -nHalf;
+    const int kHigh = (params_.tiersAbove > 0) ?  params_.tiersAbove :  nHalf;
+    const size_t total = static_cast<size_t>(kHigh - kLow) + 1;
     result.tiers.resize(total);                   // 下标写（档序 = 温度升序）
     std::vector<std::vector<uint8_t>> tierBlobs;  // 档载荷: move-through 至 sidecar
     tierBlobs.resize(total);
@@ -339,8 +356,8 @@ CurveMapTempTableResult CurveMapTempTableGenerator::Generate(
 #if defined(_OPENMP)
     #pragma omp parallel for schedule(dynamic) num_threads(lanes)
 #endif
-    for (int k = -nHalf; k <= nHalf; ++k) {
-        const size_t idx = static_cast<size_t>(k + nHalf);
+    for (int k = kLow; k <= kHigh; ++k) {
+        const size_t idx = static_cast<size_t>(k - kLow);
         const double temp = params_.referenceTemp + k * static_cast<double>(params_.tempStep);
         const bool isRef = (k == 0);
 

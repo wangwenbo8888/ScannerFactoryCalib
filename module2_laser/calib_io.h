@@ -70,17 +70,30 @@ struct LaserOpParams {
     int maskErodeSize       = 1;
     int maskLaserDilateSize = 19;
     int maskPostErodeSize   = 13;
+    // 4-1 mask 高光分离（2026-10-07 laser261006-1668 粘连事故; 0=off 兼容 legacy）
+    int maskHighlightErodeSize  = 0;
+    int maskHighlightDilateSize = 13;
     // 4-2 ccl
     int cclMinArea   = 0;
     int cclTopXCount = 27;
     // 4-3 label
     int labelRealLineTolerance = 10;
+    // 4-3 label 门禁（2026-10-07 laser261006-1668 编号错位事故）:
+    //   expectedLineCount: 编号后线数 != 该值 → 整帧拒（默认 0=off; 产线 25）
+    //   maxRunWidth: 扫描线切割游程展布 > 该值 → 判粘连整帧拒（默认 0=off; 产线 30px,
+    //                正常线宽实测 12-22px / 双线粘连 >=38px）
+    int labelExpectedLineCount = 0;
+    int labelMaxRunWidth       = 0;
     // 4-4 steger（deviceId 走 LaserCalibConfig::deviceId）
     float stegerSigma         = 1.5f;
     int   stegerKernelSize    = 0;
     float stegerLowThreshold  = 2.0f;
     float stegerHighThreshold = 0.0f;
     int   stegerMaxLabels     = 256;
+    // 4-4 steger 逐点宽度门禁（0=off; 平滑后口径, 详见 StegerParams 注释）
+    float stegerMaxLineWidth  = 0.0f;
+    // 4-4 steger 平顶双点去重（2026-10-13 自 09 侧移植; 0=Off 基线, 1=Centroid）
+    int   stegerDedupMode     = 0;
     // 4-7 match：视差上界 = |f·Tx| / depthMin × 本系数
     double matchDisparityMarginFactor = 1.05;
     // PJC（对齐 ProjectorJointCalibParams 字段）
@@ -112,8 +125,15 @@ struct LaserOpParams {
     double pjcAccA7MaxBasinSpread  = 0.5;
     // 4-14 CMTT（rowStep/depth 继承标定，不在此）
     double cmttTempHalfRange = 15.0;
+    // 4-14 档距与非对称档位（2026-10-13 外置; 原 CLI 硬编码 0.5/对称 ±半范围）
+    float cmttTempStep   = 0.5f;
+    int   cmttTiersBelow = 0;      // >0 且 tiersAbove>0 → 非对称 k∈[-below,+above]
+    int   cmttTiersAbove = 0;
     // clamped 档占比告警阈（超出仅 warn，不改 verdict；默认 5%）
     double cmttClampedWarnRatio = 0.05;
+    // 引擎选择（cmtt.cudaEnabled, 2026-10-08 CUDA 转正后默认 true=CUDA 主引擎;
+    // false 回落 CPU 版备用——两版产物结构一致, 参考档实测逐条目一致）
+    bool cmttCudaEnabled = true;
 };
 
 // 统一解析器：对一份 JSON 文档做 present-key 覆盖（主库与数据集 config 共用）
@@ -169,6 +189,8 @@ bool validateHandoffConsistency(const LaserCalibConfig& cfg,
 //   <dir>/camera_calib.json   ← handoff
 //   <dir>/pose_00/L_tube0.png + R_tube0.png  [+ L_tube1.png + R_tube1.png ...]
 //   <dir>/pose_01/...
+// 备选布局（2026-10-12 自动回退, pose_* 缺席时生效）:
+//   <dir>/left/*.png + <dir>/right/*.png 同名配对, 每对 = 1 pose × 1 tube
 // ============================================================================
 struct PoseFrame {
     cv::Mat leftGray;
@@ -188,8 +210,6 @@ std::optional<LaserInput> loadLaserInput(const std::string& dir,
                                          const LaserCalibConfig* baseCfg = nullptr,
                                          const LaserOpParams* baseOps = nullptr);
 
-// 注：模块1 侧同名功能叫 writeJson——本模块故意命名 writeLaserJson，
-// 避免两模块 calib_io.obj 同符号（GUI 同时链接 fc1_io+fc2_io 时 LNK2005）。
-bool writeLaserJson(const std::string& path, const nlohmann::json& j);
+bool writeLaserJson(const std::string& path, const nlohmann::json& j);  // 命名避让模块1 的 writeJson，防 GUI 双库链接同符号
 
 } // namespace fc

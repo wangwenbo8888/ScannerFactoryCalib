@@ -77,6 +77,10 @@ void applyLaserParamsJson(const json& j, LaserCalibConfig& c, LaserOpParams& ops
         if (ll.contains("centerRowOffset")) c.labelCenterRowOffset = ll["centerRowOffset"].get<int>();
         if (ll.contains("realLineTolerance"))
             ops.labelRealLineTolerance = ll["realLineTolerance"].get<int>();
+        if (ll.contains("expectedLineCount"))
+            ops.labelExpectedLineCount = ll["expectedLineCount"].get<int>();
+        if (ll.contains("maxRunWidth"))
+            ops.labelMaxRunWidth = ll["maxRunWidth"].get<int>();
     }
 
     // ---- 算子层可调组（2026-10-04 主库化；编译默认＝产线定稿值）----
@@ -87,6 +91,10 @@ void applyLaserParamsJson(const json& j, LaserCalibConfig& c, LaserOpParams& ops
         if (m.contains("erodeSize"))       ops.maskErodeSize       = m["erodeSize"].get<int>();
         if (m.contains("laserDilateSize")) ops.maskLaserDilateSize = m["laserDilateSize"].get<int>();
         if (m.contains("postErodeSize"))   ops.maskPostErodeSize   = m["postErodeSize"].get<int>();
+        if (m.contains("highlightErodeSize"))
+            ops.maskHighlightErodeSize = m["highlightErodeSize"].get<int>();
+        if (m.contains("highlightDilateSize"))
+            ops.maskHighlightDilateSize = m["highlightDilateSize"].get<int>();
     }
     if (j.contains("ccl") && j["ccl"].is_object()) {
         const auto& m = j["ccl"];
@@ -100,6 +108,8 @@ void applyLaserParamsJson(const json& j, LaserCalibConfig& c, LaserOpParams& ops
         if (s.contains("lowThreshold"))  ops.stegerLowThreshold  = s["lowThreshold"].get<float>();
         if (s.contains("highThreshold")) ops.stegerHighThreshold = s["highThreshold"].get<float>();
         if (s.contains("maxLabels"))     ops.stegerMaxLabels     = s["maxLabels"].get<int>();
+        if (s.contains("maxLineWidth"))  ops.stegerMaxLineWidth  = s["maxLineWidth"].get<float>();
+        if (s.contains("dedupMode"))     ops.stegerDedupMode     = s["dedupMode"].get<int>();
     }
     if (j.contains("match") && j["match"].is_object()) {
         const auto& m = j["match"];
@@ -141,8 +151,16 @@ void applyLaserParamsJson(const json& j, LaserCalibConfig& c, LaserOpParams& ops
         const auto& m = j["cmtt"];
         if (m.contains("tempHalfRange"))
             ops.cmttTempHalfRange = m["tempHalfRange"].get<double>();
+        if (m.contains("tempStep"))
+            ops.cmttTempStep = m["tempStep"].get<float>();
+        if (m.contains("tiersBelow"))
+            ops.cmttTiersBelow = m["tiersBelow"].get<int>();
+        if (m.contains("tiersAbove"))
+            ops.cmttTiersAbove = m["tiersAbove"].get<int>();
         if (m.contains("clampedWarnRatio"))
             ops.cmttClampedWarnRatio = m["clampedWarnRatio"].get<double>();
+        if (m.contains("cudaEnabled"))
+            ops.cmttCudaEnabled = m["cudaEnabled"].get<bool>();
     }
 }
 
@@ -497,8 +515,40 @@ std::optional<LaserInput> loadLaserInput(const std::string& dir,
     std::sort(poseDirs.begin(), poseDirs.end());
 
     if (poseDirs.empty()) {
-        spdlog::error("no pose_* subdirectories in {}", dir);
-        return std::nullopt;
+        // 2026-10-12: pose_* 缺席时回退 left/+right/ 同名顺序帧布局（原始采集形态,
+        // 如 test_data/laser261006-1668）。每对同名帧 = 1 pose × 1 tube 帧,
+        // 对齐 DUIBI1005-1 人工转换惯例; pose_* 与 left/ 并存时 pose_* 优先。
+        const fs::path ldir = fs::path(dir) / "left";
+        const fs::path rdir = fs::path(dir) / "right";
+        if (!fs::is_directory(ldir) || !fs::is_directory(rdir)) {
+            spdlog::error("no pose_* subdirectories or left/+right/ layout in {}", dir);
+            return std::nullopt;
+        }
+
+        std::vector<fs::path> lFiles;
+        for (auto& e : fs::directory_iterator(ldir)) {
+            if (!e.is_regular_file()) continue;
+            const std::string ext = e.path().extension().string();
+            if (ext == ".png" || ext == ".jpg") lFiles.push_back(e.path());
+        }
+        std::sort(lFiles.begin(), lFiles.end());
+
+        for (auto& lf : lFiles) {
+            const fs::path rf = rdir / lf.filename();
+            if (!fs::exists(rf)) {
+                spdlog::warn("skip {}: no right pair {}",
+                             lf.filename().string(), rf.string());
+                continue;
+            }
+            cv::Mat l = cv::imread(lf.string(), cv::IMREAD_GRAYSCALE);
+            cv::Mat r = cv::imread(rf.string(), cv::IMREAD_GRAYSCALE);
+            if (l.empty() || r.empty()) {
+                spdlog::warn("skip {}: read failed", lf.filename().string());
+                continue;
+            }
+            in.poseDirs.push_back("left/" + lf.filename().string());
+            in.poseFrames.push_back({{l, r}});
+        }
     }
 
     for (auto& pd : poseDirs) {

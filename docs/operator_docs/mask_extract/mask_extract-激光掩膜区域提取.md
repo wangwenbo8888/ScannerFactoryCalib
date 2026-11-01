@@ -155,3 +155,20 @@ left_skew 实测组配：`threshold=50, erodeSize=1, laserDilateSize=19, postEro
 **验证**：①优化 1-3 为**构造性等价**（1×1 腐蚀恒等旁路＋拷贝替代 clone 不改位），实证：全链 22 姿态匹配数与旧版完全相同（397,658）；②近似路径 22 姿态 A/B：掩膜差 2.5~3.5%px → 点数 −1.45%，点云深度分布不变（p50 455.1 vs 453.9mm）；③ctest 20/20 绿。
 
 **工具与产物**：`fcstepdump --mask-bench <in_dir> <out_dir> [iters]`（分步计时＋base/approx/diff 掩膜 PNG×132）；`data_out/mask_bench/`、`data_out/scan_e2e_ab_{base,approx}/`。基准注意：空载逐 isolated 步测值与流水线负载态差约 1.9×（降频），以流水线复测为准。
+
+## 更新：高光分离可选路径（2026-10-07，laser261006-1668 过曝粘连事故）
+
+**新增参数**（`MaskExtractParams`，默认 off 兼容 legacy）：
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `highlightErodeSize` | 0（off） | >0 启用：mask2 再腐蚀本核→仅剩粗高光斑（细激光线被吃掉），**须 > 线宽且 < 斑厚**（本机线 ~5px/斑 >18px，取 9） |
+| `highlightDilateSize` | 13 | 高光模板回膨胀核，**须 ≥ highlightErodeSize**（覆盖被腐蚀的原边界） |
+
+**新路径流程**（highlightErodeSize>0 时）：
+```
+二值化(thr) → 腐蚀(erodeSize)=掩膜2
+  → [mask3=腐蚀(hlE)→只剩斑; mask4=膨胀(hlD)→高光模板; 掩膜5=掩膜2 & ~mask4]  ← 高光剔除
+  → 膨胀(laserDilate) → 腐蚀(postErode) = 最终掩膜
+```
+厚度判据本质：erode 核小于线宽→线存活；大于亮斑厚度则连斑带线全灭——`maxRunWidth`（laser_label 门 2）与 `maxLineWidth`（steger 门禁）同源思路的掩膜级实现。legacy 路径（0=off）逐位不变；形态学核固定 2D 椭圆（不参与 morphApprox 线核近似）。单测 +4（剔斑保线/旧路径保留/参数校验/JSON 回环，22/22 绿）。本数据集实测：thr200 链由 DEGRADED(A7=5.1) → PASS——但**产线最终选择更轻的 steger 点级门禁方案**，本路径保留为掩膜级选项。主库不写入（off），数据集 config 启用。

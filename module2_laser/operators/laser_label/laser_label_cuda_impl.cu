@@ -345,10 +345,34 @@ LaserLabelResult LaserLabelerCUDA::Impl::Execute(
 
         int actual_max_label = max_label_host + 1;
 
-        // === Step 3.5: 拆分扫描行上的粘连游程（仅横切 + splitMergedRuns） ===
-        // 膨胀致相邻平行线连通域粘连时, 同一标签在扫描行上呈多个不连续游程段;
-        // 对 ≥2 游程的标签, 以游程间隙中点为界把域拆成两个标签, 循环至全部单游程。
-        if (horizontal && params_.splitMergedRuns) {
+        // === Step 3.5: 扫描行/列游程分解 → 门禁测量(原始游程) + 粘连拆分 ===
+        // 膨胀/高光过曝致相邻平行线连通域粘连时, 同一标签在扫描线上呈
+        // 多个不连续游程段(splitMergedRuns 可拆)或单条异常宽游程(拆分无从
+        // 下手, 由 maxRunWidth 门禁整帧拒绝, 防编号错位毒化下游)。
+        struct GateRun { int label, a0, a1; };
+        auto runWidthGate = [&](const std::map<int, std::vector<GateRun>>& byLabel) {
+            if (params_.maxRunWidth <= 0) return;
+            int worst_label = 0, worst_extent = 0;
+            for (const auto& [lab, v] : byLabel) {
+                if (v.empty()) continue;
+                // 展布 = 末游程末端 - 首游程起点(含游程间隙, 覆盖
+                // "单条宽游程"与"同标签多游程"两种粘连形态)
+                const int extent = v.back().a1 - v.front().a0;
+                if (extent > worst_extent) { worst_extent = extent; worst_label = lab; }
+            }
+            if (worst_extent > params_.maxRunWidth) {
+                result.frameRejected = true;
+                if (!result.rejectReason.empty()) result.rejectReason += "; ";
+                result.rejectReason += "runWidth=" + std::to_string(worst_extent)
+                    + ">maxRunWidth(" + std::to_string(params_.maxRunWidth)
+                    + ") label=" + std::to_string(worst_label);
+                CALIB_LOG_WARN("gate: merged laser lines suspected, label {} cut extent "
+                               "{}px > maxRunWidth {}px -> frame rejected",
+                               worst_label, worst_extent, params_.maxRunWidth);
+            }
+        };
+
+        if (horizontal) {
             // 下载扫描行
             std::vector<int> scanline(cols);
             cudaMemcpyAsync(scanline.data(),
@@ -359,8 +383,7 @@ LaserLabelResult LaserLabelerCUDA::Impl::Execute(
             cudaStreamSynchronize(cuda_stream);
 
             // 游程分解: (label, runStart, runEnd) 仅记录长度>=1 的段
-            struct Run { int label, x0, x1; };
-            std::vector<Run> runs;
+            std::vector<GateRun> runs;
             int x = 0;
             while (x < cols) {
                 if (scanline[x] > 0 && scanline[x] < actual_max_label) {
@@ -370,40 +393,70 @@ LaserLabelResult LaserLabelerCUDA::Impl::Execute(
                     runs.push_back({lab, x0, x});
                 } else ++x;
             }
-            // 每标签游程数
-            std::map<int, std::vector<Run>> byLabel;
+            std::map<int, std::vector<GateRun>> byLabel;
             for (auto& r : runs) byLabel[r.label].push_back(r);
-            int next_label = actual_max_label;
-            bool changed = false;
-            for (auto& [lab, v] : byLabel) {
-                if (v.size() < 2) continue;
-                // 保留首游程为原标签, 其余每游程拆出新标签
-                for (size_t k = 1; k < v.size(); ++k) {
-                    // 拆分阈值: 前一段结束与本段开始的中点
-                    int split_x = (v[k - 1].x1 + v[k].x0) / 2;
-                    if (next_label > params_.maxLabels) break;
-                    dim3 blk(16, 16);
-                    dim3 grd((cols + 15) / 16, (rows + 15) / 16);
-                    SplitMergedLabelKernel<<<grd, blk, 0, cuda_stream>>>(
-                        d_labels_buf_.ptr<int>(), rows, cols, d_labels_buf_.step,
-                        lab, split_x, next_label);
-                    ++next_label;
-                    changed = true;
+
+            // ---- 门禁 2: maxRunWidth(split 前测量原始游程展布) ----
+            runWidthGate(byLabel);
+
+            // ---- 粘连拆分(splitMergedRuns, 原逻辑): 同标签 >=2 游程段时拆分 ----
+            if (params_.splitMergedRuns) {
+                int next_label = actual_max_label;
+                bool changed = false;
+                for (auto& [lab, v] : byLabel) {
+                    if (v.size() < 2) continue;
+                    // 保留首游程为原标签, 其余每游程拆出新标签
+                    for (size_t k = 1; k < v.size(); ++k) {
+                        // 拆分阈值: 前一段结束与本段开始的中点
+                        int split_x = (v[k - 1].a1 + v[k].a0) / 2;
+                        if (next_label > params_.maxLabels) break;
+                        dim3 blk(16, 16);
+                        dim3 grd((cols + 15) / 16, (rows + 15) / 16);
+                        SplitMergedLabelKernel<<<grd, blk, 0, cuda_stream>>>(
+                            d_labels_buf_.ptr<int>(), rows, cols, d_labels_buf_.step,
+                            lab, split_x, next_label);
+                        ++next_label;
+                        changed = true;
+                    }
+                }
+                if (changed) {
+                    cudaStreamSynchronize(cuda_stream);
+                    op_err = cudaGetLastError();
+                    if (op_err != cudaSuccess) {
+                        result.success = false;
+                        result.message = std::string("SplitMergedLabelKernel failed: ")
+                                       + cudaGetErrorString(op_err);
+                        return result;
+                    }
+                    actual_max_label = next_label;
+                    CALIB_LOG_INFO("split merged runs: {} labels after split",
+                                   actual_max_label - 1);
                 }
             }
-            if (changed) {
-                cudaStreamSynchronize(cuda_stream);
-                op_err = cudaGetLastError();
-                if (op_err != cudaSuccess) {
-                    result.success = false;
-                    result.message = std::string("SplitMergedLabelKernel failed: ")
-                                   + cudaGetErrorString(op_err);
-                    return result;
-                }
-                actual_max_label = next_label;
-                CALIB_LOG_INFO("split merged runs: {} labels after split",
-                               actual_max_label - 1);
+        } else if (params_.maxRunWidth > 0) {
+            // 竖切门禁: 下载中心列, 同口径游程分解 + 展布检查(无拆分逻辑)
+            std::vector<int> scancol(rows);
+            cudaMemcpy2DAsync(scancol.data(), sizeof(int),
+                              reinterpret_cast<const int*>(
+                                  reinterpret_cast<const char*>(d_labels_buf_.ptr<int>())
+                                  + (size_t)center_x * sizeof(int)),
+                              d_labels_buf_.step, sizeof(int), rows,
+                              cudaMemcpyDeviceToHost, cuda_stream);
+            cudaStreamSynchronize(cuda_stream);
+
+            std::vector<GateRun> runs;
+            int y = 0;
+            while (y < rows) {
+                if (scancol[y] > 0 && scancol[y] < actual_max_label) {
+                    int lab = scancol[y];
+                    int y0 = y;
+                    while (y < rows && scancol[y] == lab) ++y;
+                    runs.push_back({lab, y0, y});
+                } else ++y;
             }
+            std::map<int, std::vector<GateRun>> byLabel;
+            for (auto& r : runs) byLabel[r.label].push_back(r);
+            runWidthGate(byLabel);
         }
 
         // === Step 4: Init scan buffers（哨兵值: 竖切=rows, 横切=cols） ===
@@ -582,7 +635,18 @@ LaserLabelResult LaserLabelerCUDA::Impl::Execute(
 
         result.d_labeledMask = d_output;
         result.componentCount = component_count;
+        result.lineCount = component_count;
         result.success = true;
+
+        // ---- 门禁 1: expectedLineCount(编号后有效线数必须等于期望值) ----
+        if (params_.expectedLineCount > 0 && component_count != params_.expectedLineCount) {
+            result.frameRejected = true;
+            if (!result.rejectReason.empty()) result.rejectReason += "; ";
+            result.rejectReason += "lineCount=" + std::to_string(component_count)
+                + "!=expectedLineCount(" + std::to_string(params_.expectedLineCount) + ")";
+            CALIB_LOG_WARN("gate: line count {} != expected {} -> frame rejected",
+                           component_count, params_.expectedLineCount);
+        }
 
         if (component_count == 0) {
             result.qualityFlag = calib::QualityFlag::Warning;
@@ -596,6 +660,12 @@ LaserLabelResult LaserLabelerCUDA::Impl::Execute(
                 ? "Labeling successful (realLine filter rejected "
                   + std::to_string(rejected_count) + " components)"
                 : "Labeling successful";
+        }
+
+        // 门禁拒绝时改写消息与质量标志(执行成功, 数据质量不过关)
+        if (result.frameRejected) {
+            result.qualityFlag = calib::QualityFlag::Degraded;
+            result.message = "Frame gate rejected: " + result.rejectReason;
         }
 
         CALIB_LOG_DEBUG("label() completed: {} components, qualityFlag={}",

@@ -645,6 +645,7 @@ std::vector<cv::Vec3d> denoisePoses(const std::vector<PosePointSet>& poses,
 
 // 多线联合 Sampson 残差: 点归 (lineIdx, ptIdx); 参数 [t(3), C_0..C_{L-1} (每线6)]
 // F6: ① 姿态权 W_s（逐点所属姿态, 帧精度 σ_s⁻²）② 鲁棒核 w_rob(|d|; Huber/Cauchy)
+struct RightTermCtx;  // F8 前向声明（定义在 robustWeight 之后）
 struct MultiLineData {
     const std::vector<std::vector<cv::Vec3d>>* linePts;  // 每线降噪点
     const std::vector<NormParams>* nps;                  // 每线独立归一化
@@ -657,6 +658,8 @@ struct MultiLineData {
     double huberDelta = 0.0;       // >0: Huber 核生效; 0: 纯 L2
     double cauchyC = 0.0;          // >0 且 huberDelta<=0: Cauchy 核生效
     const std::vector<double>* robustW = nullptr;   // IRLS 外部权（空=不用）
+    // F8 右目重投影残差上下文（空=禁用，行为与现状逐位一致）
+    const RightTermCtx* urCtx = nullptr;
 };
 
 // 核权: Huber w=min(1,δ/|d|); Cauchy w=1/(1+(d/c)²)
@@ -667,19 +670,165 @@ inline double robustWeight(double d, double huberDelta, double cauchyC) {
     return 1.0;
 }
 
+// ============================================================================
+// F8 右目重投影残差（Phase B）：evalRightResidual + RightTermCtx
+// 与 CMTT 前向泛函（curve_map.cpp:78-107,147-157）逐字同构
+// ============================================================================
+
+struct RightTermGates {
+    double clampPx  = 10.0;
+    double discRel  = 1e-6;
+    double zMin     = 50.0;
+    double zMax     = 3000.0;
+};
+
+struct RightTermCtx {
+    bool on = false;
+    double B = 0.0;           // baseline (mm)
+    double lambda_ = 1.0;     // rightTermWeight
+    double ramp = 1.0;        // ramp-in 因子（Phase B 前 K 迭代线性升）
+    Eigen::Index nTotal = 0;  // 点行总数（uR 行偏移基准）
+    std::vector<uint8_t> mask; // 冻结门控 mask（size=nTotal, 1=有效）
+    RightTermGates gates;
+};
+
+/// F8 核心残差：给定 3D 点 P（左矫正系）＋当前参数 (t,C_raw)，
+/// 复刻 CMTT 前向泛函计算 ΔuR = uR_pred - uR_obs（原始像素域）。
+/// 返回 false = 门控（调用方写 0 行）；true = dUrOut 已 clamp 到 ±clampPx。
+static bool evalRightResidual(
+    const cv::Vec3d& P, const cv::Vec3d& t,
+    const double Craw[6],
+    double f, const cv::Point2d& pp, double B,
+    const RightTermGates& g,
+    double& dUrOut, bool& dualValidOut)
+{
+    dualValidOut = false;
+    const double X = P[0], Y = P[1], Z = P[2];
+    if (Z < 1e-6) return false;
+    const double uL = f * X / Z + pp.x;
+    const double v  = f * Y / Z + pp.y;
+    if (std::fabs(t[2]) < 1e-9) return false;
+    const double Ex = f * t[0] / t[2] + pp.x;
+    const double Ey = f * t[1] / t[2] + pp.y;
+    const double du = Ex - uL, dv = Ey - v;
+
+    const double A = Craw[0], Bq = Craw[1], Cq = Craw[2];
+    const double D = Craw[3], Eq = Craw[4], F0 = Craw[5];
+    const double a = A*du*du + Bq*du*dv + Cq*dv*dv;
+    const double b = 2*A*uL*du + Bq*(uL*dv + v*du) + 2*Cq*v*dv + D*du + Eq*dv;
+    const double c = A*uL*uL + Bq*uL*v + Cq*v*v + D*uL + Eq*v + F0;
+
+    double cand[2]; int nCand = 0;
+    if (std::fabs(a) < 1e-18) {
+        if (std::fabs(b) > 1e-18) cand[nCand++] = -c / b;
+    } else {
+        const double disc = b*b - 4.0*a*c;
+        if (disc > 0.0 && disc >= g.discRel * std::max(b*b, 4.0*std::fabs(a*c))) {
+            const double sq = std::sqrt(disc);
+            const double q  = -0.5 * (b + (b >= 0.0 ? sq : -sq));
+            cand[nCand++] = q / a;
+            if (std::fabs(q) > 1e-300) cand[nCand++] = c / q;
+        }
+    }
+
+    const double uc = uL - pp.x;
+    double best = 0.0; bool have = false; int nValid = 0;
+    for (int i = 0; i < nCand; ++i) {
+        const double qu = uL + cand[i] * du;
+        const double qc = qu - pp.x;
+        const double den = qc - uc;
+        if (std::fabs(den) < 1e-9) continue;
+        const double Zm = (qc * t[2] - f * t[0]) / den;
+        if (Zm < g.zMin || Zm > g.zMax) continue;
+        ++nValid;
+        const double dur = f * B * (Zm - Z) / (Zm * Z);
+        if (!have || std::fabs(dur) < std::fabs(best)) { best = dur; have = true; }
+    }
+    dualValidOut = (nValid >= 2);
+    if (!have) return false;
+    dUrOut = std::max(-g.clampPx, std::min(g.clampPx, best));
+    return true;
+}
+
+/// Phase B 入口：冻结门控 mask ＋ pre 诊断统计
+static RightTermCtx freezeRightCtx(
+    const std::vector<std::vector<cv::Vec3d>>& linePts,
+    const std::vector<NormParams>& nps,
+    const cv::Vec3d& t,
+    const std::vector<std::array<double, 6>>& Cs,
+    double f, const cv::Point2d& pp,
+    const MultiLineInput& input, const ProjectorJointCalibParams& prm,
+    // 输出诊断
+    std::vector<double>& preBiasPerLine, double& preRms,
+    int& gateCount, int& dualCount, int& clampCount,
+    double& angleMed, double& angleMin)
+{
+    RightTermCtx ctx;
+    ctx.on = true;
+    ctx.B = input.baseline;
+    ctx.lambda_ = input.rightTermWeight;
+    ctx.gates.clampPx = prm.rightTermClampPx;
+    ctx.gates.discRel = prm.rightTermDiscRel;
+    ctx.gates.zMin = prm.rightTermDepthMin;
+    ctx.gates.zMax = prm.rightTermDepthMax;
+
+    const size_t L = linePts.size();
+    size_t nTotal = 0;
+    for (size_t l = 0; l < L; ++l) nTotal += linePts[l].size();
+    ctx.nTotal = static_cast<Eigen::Index>(nTotal);
+    ctx.mask.assign(nTotal, 0);
+
+    preBiasPerLine.assign(L, 0.0);
+    gateCount = 0; dualCount = 0; clampCount = 0;
+    double sumSq = 0.0; long long cnt = 0;
+    std::vector<double> angles;
+
+    size_t gi = 0;
+    for (size_t l = 0; l < L; ++l) {
+        double Craw[6];
+        denormalizeCurve(Cs[l].data(), nps[l], Craw);
+        double lineSum = 0.0; long long lineCnt = 0;
+        for (const auto& P : linePts[l]) {
+            double dur; bool dual;
+            if (evalRightResidual(P, t, Craw, f, pp, ctx.B, ctx.gates, dur, dual)) {
+                ctx.mask[gi] = 1;
+                lineSum += dur; ++lineCnt;
+                sumSq += dur * dur; ++cnt;
+                if (dual) ++dualCount;
+                if (std::fabs(dur) >= ctx.gates.clampPx) ++clampCount;
+            } else {
+                ++gateCount;
+            }
+            ++gi;
+        }
+        preBiasPerLine[l] = lineCnt > 0 ? lineSum / lineCnt : 0.0;
+    }
+    preRms = cnt > 0 ? std::sqrt(sumSq / cnt) : 0.0;
+
+    if (!angles.empty()) {
+        std::sort(angles.begin(), angles.end());
+        angleMed = angles[angles.size() / 2];
+        angleMin = angles.front();
+    }
+    return ctx;
+}
+
 void computeMultiResiduals(const MultiLineData& d, const cv::Vec3d& t,
                            const std::vector<std::array<double, 6>>& Cs,
                            Eigen::VectorXd& r, double& cost) {
     const size_t L = d.linePts->size();
     size_t nTotal = 0;
     for (size_t l = 0; l < L; ++l) nTotal += (*d.linePts)[l].size();
-    r.resize(static_cast<Eigen::Index>(nTotal + 3 * L));
+    const bool rtOn = d.urCtx && d.urCtx->on;
+    r.resize(static_cast<Eigen::Index>(nTotal + (rtOn ? nTotal : 0) + 3 * L));
     double costS = 0.0;
     Eigen::Index ri = 0;
     for (size_t l = 0; l < L; ++l) {
         const auto& pts = (*d.linePts)[l];
         const NormParams& np = (*d.nps)[l];
         const double C[6] = {Cs[l][0], Cs[l][1], Cs[l][2], Cs[l][3], Cs[l][4], Cs[l][5]};
+        double Craw[6] = {0,0,0,0,0,0};
+        if (rtOn) denormalizeCurve(Cs[l].data(), np, Craw);
         size_t ptIdx = 0;
         const size_t nPoses = d.ptsPerPose && !d.ptsPerPose->empty()
             ? (*d.ptsPerPose)[l].size() : 0;
@@ -701,6 +850,20 @@ void computeMultiResiduals(const MultiLineData& d, const cv::Vec3d& t,
                 else wt *= robustWeight(dd, d.huberDelta, d.cauchyC);
                 r(ri) = std::sqrt(wt) * dd;
                 costS += wt * dd * dd;
+                // —— F8 uR 行：复用同迭代的 Fu/Fv/denom/Ws，与 Sampson 行共尺度 ——
+                if (rtOn) {
+                    const Eigen::Index urRow = d.urCtx->nTotal + ri;
+                    if (d.urCtx->mask[static_cast<size_t>(ri)]) {
+                        double dur; bool dual;
+                        if (evalRightResidual(pts[ptIdx], t, Craw, d.f, d.pp,
+                                              d.urCtx->B, d.urCtx->gates, dur, dual)) {
+                            const double rho = std::sqrt(Fu*Fu/(np.su*np.su) + Fv*Fv/(np.sv*np.sv)) / denom;
+                            const double wtU = Ws * d.urCtx->lambda_ * d.urCtx->ramp;
+                            r(urRow) = std::sqrt(wtU) * dur * rho;
+                            costS += wtU * dur * dur * rho * rho;
+                        } else r(urRow) = 0.0;
+                    } else r(urRow) = 0.0;
+                }
                 ++ri;
             }
         }
@@ -716,6 +879,20 @@ void computeMultiResiduals(const MultiLineData& d, const cv::Vec3d& t,
             const double dd = F / denom;
             r(ri) = std::sqrt(w) * dd;
             costS += w * dd * dd;
+            if (rtOn) {
+                const Eigen::Index urRow = d.urCtx->nTotal + ri;
+                if (d.urCtx->mask[static_cast<size_t>(ri)]) {
+                    double dur; bool dual;
+                    if (evalRightResidual(pts[ptIdx], t, Craw, d.f, d.pp,
+                                          d.urCtx->B, d.urCtx->gates, dur, dual)) {
+                        const NormParams& np2 = np;
+                        const double rho = std::sqrt(Fu*Fu/(np2.su*np2.su) + Fv*Fv/(np2.sv*np2.sv)) / denom;
+                        const double wtU = d.urCtx->lambda_ * d.urCtx->ramp;
+                        r(urRow) = std::sqrt(wtU) * dur * rho;
+                        costS += wtU * dur * dur * rho * rho;
+                    } else r(urRow) = 0.0;
+                } else r(urRow) = 0.0;
+            }
         }
     }
     const double sl = std::sqrt(d.lambdaReg);
@@ -803,7 +980,7 @@ MultiLineResult ProjectorJointCalib::ExecuteMultiLine(const MultiLineInput& inpu
     };
     const auto tWall0 = tNow();
     double msDenoise = 0.0, msNorm = 0.0, msJac = 0.0, msJtJ = 0.0;
-    double msTrials = 0.0, msMisc = 0.0;
+            double msTrials = 0.0, msMisc = 0.0, msPhaseB = 0.0;
     int iterCount = 0, evalCount = 0;
 
     try {
@@ -956,7 +1133,8 @@ MultiLineResult ProjectorJointCalib::ExecuteMultiLine(const MultiLineInput& inpu
                 computeMultiResiduals(mdata, tp, CsCur, r1t[static_cast<size_t>(j)], c1);
             }
             msJac += tMs(tTA);
-            Eigen::VectorXd lineBuf(static_cast<Eigen::Index>(nTotal));
+            Eigen::VectorXd lineBuf(static_cast<Eigen::Index>(
+                mdata.urCtx && mdata.urCtx->on ? 2 * nTotal : nTotal));
             for (size_t l = 0; l < L; ++l) {
                 const Eigen::Index offL = lineOff[l];
                 const Eigen::Index nL = static_cast<Eigen::Index>(linePts[l].size());
@@ -1137,7 +1315,7 @@ MultiLineResult ProjectorJointCalib::ExecuteMultiLine(const MultiLineInput& inpu
             costHist.push_back(cost0);
             // Cauchy 切换: 残差中位数（归一化坐标）低于阈值后收紧核
             if (params_.robustEnabled && mdata.huberDelta > 0.0) {
-                Eigen::VectorXd absR = r0.head(r0.size() - static_cast<Eigen::Index>(3 * L)).cwiseAbs();
+                Eigen::VectorXd absR = r0.head(static_cast<Eigen::Index>(nTotal)).cwiseAbs();
                 std::sort(absR.data(), absR.data() + absR.size());
                 const double medR = absR.size() > 0 ? absR(absR.size() / 2) : 0.0;
                 if (medR < params_.cauchyToL2Thresh * 0.5) {
@@ -1162,7 +1340,7 @@ MultiLineResult ProjectorJointCalib::ExecuteMultiLine(const MultiLineInput& inpu
         for (int round = 0; round < params_.irlsMaxRounds; ++round) {
             const auto tMisc2 = tNow();
             // 用当前残差生成 Cauchy 型外部权
-            const size_t nTotalR = static_cast<size_t>(r0.size()) - 3 * L;
+            const size_t nTotalR = static_cast<size_t>(nTotal);
             std::vector<double> wNew(nTotalR, 1.0);
             {
                 std::vector<double> absR(nTotalR);
@@ -1243,6 +1421,100 @@ MultiLineResult ProjectorJointCalib::ExecuteMultiLine(const MultiLineInput& inpu
             mdata.robustW = nullptr;   // 本轮权消耗完, 下轮由新残差再生成
             (void)maxChange; (void)wPrev;
             if (maxChange < 0.05 && !wPrev.empty()) break;
+        }
+
+        // ====================================================================
+        // F8 Phase B：右目重投影残差——在 Sampson 收敛后 ramp-in uR 项
+        // 直接优化 CMTT 表消费量（uR 预测精度），消法向度量盲区
+        // ====================================================================
+        if (input.enableRightTerm && input.baseline > 1e-6 && nTotal > 0) {
+            const auto tPB0 = std::chrono::steady_clock::now();
+            // 冻结门控 mask ＋ pre 诊断
+            RightTermCtx uctx = freezeRightCtx(
+                linePts, nps, t, Cs, f, pp, input, params_,
+                result.urBiasPrePerLine, result.urBiasPreRms,
+                result.urGateCount, result.urDualRootCount, result.urClampCount,
+                result.urCrossAngleMedianDeg, result.urCrossAngleMinDeg);
+            uctx.ramp = 0.0;  // Phase B 从 0 开始 ramp
+            mdata.urCtx = &uctx;
+            result.urRowCount = static_cast<int>(nTotal) - result.urGateCount;
+
+            // 重算残差（行数扩 2*nTotal + 3L）
+            double costPB0 = 0.0;
+            computeMultiResiduals(mdata, t, Cs, r0, costPB0);
+            ++evalCount;
+
+            double lambdaPB = 1e-3;  // 换代价函数重置 λ（既有先例 :1293/:1363）
+            const int maxPB = params_.rightTermMaxIters;
+            double prevCostPB = costPB0;
+            int pbIters = 0;
+            for (int k = 0; k < maxPB; ++k, ++pbIters) {
+                // ramp-in
+                const double rampPrev = uctx.ramp;
+                uctx.ramp = params_.rightTermRampIters > 0
+                    ? std::min(1.0, (k + 1.0) / params_.rightTermRampIters) : 1.0;
+                if (uctx.ramp != rampPrev) {
+                    computeMultiResiduals(mdata, t, Cs, r0, costPB0);
+                    ++evalCount;
+                }
+                // GN 正规方程（复用既有块稀疏/稠密路径）
+                Eigen::MatrixXd H(P, P);
+                Eigen::VectorXd g(P);
+                if (params_.useBlockJtJ) {
+                    accumBlockHg(t, Cs, r0, H, g);
+                    evalCount += P;
+                } else {
+                    Eigen::MatrixXd J = buildDenseJ(r0);
+                    H = J.transpose() * J;
+                    g = J.transpose() * r0;
+                    evalCount += P;
+                }
+                // LM trial 循环
+                bool improvedPB = false;
+                for (int trial = 0; trial < 8; ++trial) {
+                    Eigen::LDLT<Eigen::MatrixXd> ldlt(H + lambdaPB * Eigen::MatrixXd::Identity(P, P));
+                    Eigen::VectorXd step = ldlt.solve(-g);
+                    if (!step.allFinite()) { lambdaPB *= 3; continue; }
+                    cv::Vec3d tN = t; auto CsN = Cs;
+                    for (int j = 0; j < 3; ++j) tN[j] += step[j];
+                    for (size_t l = 0; l < L; ++l)
+                        for (int ci = 0; ci < 6; ++ci)
+                            CsN[l][ci] += step[3 + l * 6 + ci];
+                    double cN = 0.0;
+                    Eigen::VectorXd rN;
+                    computeMultiResiduals(mdata, tN, CsN, rN, cN);
+                    ++evalCount;
+                    if (cN < costPB0) {
+                        t = tN; Cs = CsN; r0 = rN; costPB0 = cN;
+                        lambdaPB = std::max(lambdaPB * 0.3, 1e-9);
+                        improvedPB = true;
+                        break;
+                    }
+                    lambdaPB *= 3;
+                }
+                // 收敛检查
+                const double stepNorm = (H.diagonal().array() > 0).select(
+                    g.cwiseAbs().cwiseQuotient(H.diagonal().cwiseAbs().cwiseMax(1e-12)), 0).maxCoeff();
+                if (!improvedPB && lambdaPB >= 1e8) break;
+                if (stepNorm < params_.convergenceThreshold) break;
+                const double relDrop = prevCostPB > 1e-12 ? (prevCostPB - costPB0) / prevCostPB : 0;
+                if (relDrop < 0.005 && k > params_.rightTermRampIters) break;
+                prevCostPB = costPB0;
+            }
+            mdata.urCtx = nullptr;  // 脱离 Phase B 上下文
+
+            // post 诊断：用终态 (t,Cs) 直接重算逐点 ΔuR
+            {
+                std::vector<double> dummyBias; double dummyRms;
+                int dummyG, dummyD, dummyC; double dummyAM, dummyAN;
+                RightTermCtx postCtx = freezeRightCtx(
+                    linePts, nps, t, Cs, f, pp, input, params_,
+                    result.urBiasPostPerLine, result.urBiasPostRms,
+                    dummyG, dummyD, dummyC, dummyAM, dummyAN);
+            }
+            result.rightTermUsed = true;
+            result.phaseBIters = pbIters;
+            msPhaseB += tMs(tPB0);
         }
 
         // —— F6 诊断: perLine（rms/p95/离群率/帧权均值）+ perPose（带符号偏差）——

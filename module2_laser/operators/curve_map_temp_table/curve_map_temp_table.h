@@ -28,6 +28,9 @@ struct CurveMapTempTableGenParams {
     double referenceTemp = 0.0;    // 参考温度（须与两源表 referenceTemp 一致）
     float tempHalfRange = 15.f;    // ±15°C（须为 tempStep 整数倍）
     float tempStep = 0.5f;         // 档距
+    int tiersBelow = 0;            // 非对称档位（2026-10-13）: 参考温下方档数;
+                                   //   >0 且 tiersAbove>0 时覆盖 tempHalfRange 对称路径
+    int tiersAbove = 0;            // 同上, 参考温上方档数（k ∈ [-below, +above]）
     float rowStep = 0.0f;          // 红线: 调用方从标定 JSON 继承（无猜默认）
     float depthMin = 100.0f;       // 全档统一（硬规则 #2）
     float depthMax = 700.0f;

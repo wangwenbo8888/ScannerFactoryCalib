@@ -24,6 +24,7 @@
 #include "laser_extrinsic_compensate_cpu.h"
 
 #include <opencv2/core/cuda.hpp>
+#include <opencv2/cudaarithm.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <spdlog/spdlog.h>
@@ -1560,11 +1561,20 @@ int main(int argc, char** argv) {
 
     cv::cuda::Stream stream;
 
+    // mask 参数走三层合并(config.json mask 组可覆盖; 原为硬编码 50/1/19/13)
+    const auto& ops = input->ops;
     MaskExtractParams maskParams;
-    maskParams.threshold = 50;
-    maskParams.erodeSize = 1;
-    maskParams.laserDilateSize = 19;
-    maskParams.postErodeSize = 13;
+    maskParams.threshold = ops.maskThreshold;
+    maskParams.erodeSize = ops.maskErodeSize;
+    maskParams.laserDilateSize = ops.maskLaserDilateSize;
+    maskParams.postErodeSize = ops.maskPostErodeSize;
+    maskParams.highlightErodeSize = ops.maskHighlightErodeSize;
+    maskParams.highlightDilateSize = ops.maskHighlightDilateSize;
+    spdlog::info("mask params from config: threshold={}, erode={}, dilate={}, postErode={}, "
+                 "highlightErode={}, highlightDilate={}",
+                 maskParams.threshold, maskParams.erodeSize,
+                 maskParams.laserDilateSize, maskParams.postErodeSize,
+                 maskParams.highlightErodeSize, maskParams.highlightDilateSize);
     MaskExtractCUDA maskL(maskParams), maskR(maskParams);
 
     RegionAnalyzerParams cclParams;
@@ -1651,6 +1661,26 @@ int main(int argc, char** argv) {
 
             auto maskResL = maskL.Execute(f.leftGray, stream);
             auto maskResR = maskR.Execute(f.rightGray, stream);
+            {
+                // ①-b 可视化: 二值化后、腐蚀前（掩膜1; 与算子 Step 2 同输入同参, 逐位一致）
+                // 放在 4-1 空掩膜检查之前——后续步骤失败的帧也保留二值化现场
+                if (maskResL.success && maskResL.d_grayImage
+                    && maskResR.success && maskResR.d_grayImage) {
+                    cv::cuda::GpuMat binL, binR;
+                    cv::cuda::threshold(*maskResL.d_grayImage, binL,
+                                        ops.maskThreshold, 255.0,
+                                        cv::THRESH_BINARY, stream);
+                    cv::cuda::threshold(*maskResR.d_grayImage, binR,
+                                        ops.maskThreshold, 255.0,
+                                        cv::THRESH_BINARY, stream);
+                    stream.waitForCompletion();
+                    cv::Mat bL, bR;
+                    binL.download(bL);
+                    binR.download(bR);
+                    cv::imwrite(outDir + "/" + stem + "_L_1binary.png", bL);
+                    cv::imwrite(outDir + "/" + stem + "_R_1binary.png", bR);
+                }
+            }
             if (!maskResL.success || !maskResR.success
                 || !maskResL.d_cleanedMask || !maskResR.d_cleanedMask
                 || maskResL.d_cleanedMask->empty() || maskResR.d_cleanedMask->empty()) {

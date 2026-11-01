@@ -22,6 +22,28 @@
   },
   "laser_label": {
     "scanDirection": 1,
-    "centerRowOffset": 0
+    "centerRowOffset": 0,
+    "realLineTolerance": 10,
+    "expectedLineCount": 0,
+    "maxRunWidth": 0
+  },
+  "mask": {
+    "threshold": 50,
+    "erodeSize": 1,
+    "laserDilateSize": 19,
+    "postErodeSize": 13,
+    "highlightErodeSize": 0,
+    "highlightDilateSize": 13
+  },
+  "steger": {
+    "maxLineWidth": 0,
+    "dedupMode": 0
+  },
+  "cmtt": {
+    "cudaEnabled": false,
+    "tempStep": 0.5,
+    "tempHalfRange": 15.0,
+    "tiersBelow": 30,
+    "tiersAbove": 30
   }
 }

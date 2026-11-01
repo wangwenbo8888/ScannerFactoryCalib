@@ -169,3 +169,10 @@ OpenCV core / nlohmann_json / OpenMP（档级并行；无 OpenMP 构建退化纯
 ---
 
 > **参考卡结束**
+
+## 更新：转为 CPU 备用引擎（2026-10-08，CUDA 转正）
+
+- **地位变更**：4-14 默认引擎已让位 `operators/cmtt_cuda`（CUDA 编排）＋`operators/curve_map_cuda`（GPU 求交）——61 档 24.8min→113s。本算子退居**热备**：`cmtt.cudaEnabled=false`（主库/数据集 config）一键切回，全部行为不变。
+- **仍是两引擎共用件**（CUDA 版直接 include 本目录公开 API）：`TempParamInterpolator`（温度插值）、`rescaleCurve`（曲线重标）、`cmttTierGridMatches`（冻结网格断言）、`CmttBuilder/CmttReader`（容器）——本卡对这四件仍是权威描述。
+- **等价性证据**（test_cmtt_cuda，2026-10-08）：真实数据参考档 **27,538,991 条目与 CPU 版逐条目一致**；合成单档 685,919==685,919 精确一致。CUDA 版不承诺 61 档逐字节相同（浮点边界），CPU 版线程数无关确定性红线不受影响。
+- 参考卡：CUDA 版见 `curve_map_cuda/` 与 `cmtt_cuda/` 两卡。

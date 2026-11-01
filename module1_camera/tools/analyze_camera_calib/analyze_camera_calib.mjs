@@ -34,6 +34,8 @@ const GLOSSARY = [
       ['reprojL / reprojR', '每帧左/右相机的重投影误差'],
       ['P50 / P90', '一半 / 90% 的帧低于该值，P90 更能反映最差的那批帧'],
       ['std', '帧间波动，越大越不整齐'],
+      ['外参Δ°/Δmm', '该帧瞬时外参（由左右目位姿推出）与全局标定 R/T 的旋转差/平移差——衡量该帧与整体外参的自洽程度，混有帧级位姿噪声，非真值误差'],
+      ['位置九宫格', '棋盘中心在画面所处区域（上/中/下×左/中/右）＋板心像素坐标＋离画面中心偏移；左右目分别标注'],
     ],
   },
   {
@@ -232,6 +234,70 @@ function boardGeometry(m, cfgBoard) {
     geo[s] = { perView: views };
   }
   return geo;
+}
+function matMul3(a, b) {
+  const r = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++)
+    r[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
+  return r;
+}
+function mat3T(a) {
+  return [[a[0][0], a[1][0], a[2][0]], [a[0][1], a[1][1], a[2][1]], [a[0][2], a[1][2], a[2][2]]];
+}
+function rotAngleDeg(a, b) {
+  const r = matMul3(a, mat3T(b));
+  const c = Math.max(-1, Math.min(1, (r[0][0] + r[1][1] + r[2][2] - 1) / 2));
+  return Math.acos(c) * 180 / Math.PI;
+}
+function extrinsicSelfConsistency(m) {
+  const E = m.extrinsic;
+  if (!E || !E.R || !E.T) return null;
+  const lv = m.sides?.left?.rvecs ?? [], lt = m.sides?.left?.tvecs ?? [];
+  const rv = m.sides?.right?.rvecs ?? [], rt = m.sides?.right?.tvecs ?? [];
+  const n = Math.min(lv.length, lt.length, rv.length, rt.length);
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const rl = vec3(lv[i]), rr = vec3(rv[i]), tl = vec3(lt[i]), tr = vec3(rt[i]);
+    if (!rl || !rr || !tl || !tr) { out.push(null); continue; }
+    const Rl = rodrigues(rl), Rr = rodrigues(rr);
+    const Rrel = matMul3(Rr, mat3T(Rl));
+    const Trel = [
+      tr[0] - (Rrel[0][0] * tl[0] + Rrel[0][1] * tl[1] + Rrel[0][2] * tl[2]),
+      tr[1] - (Rrel[1][0] * tl[0] + Rrel[1][1] * tl[1] + Rrel[1][2] * tl[2]),
+      tr[2] - (Rrel[2][0] * tl[0] + Rrel[2][1] * tl[1] + Rrel[2][2] * tl[2]),
+    ];
+    out.push({
+      rotErrDeg: rotAngleDeg(Rrel, E.R),
+      transErrMm: Math.hypot(Trel[0] - E.T[0], Trel[1] - E.T[1], Trel[2] - E.T[2]),
+    });
+  }
+  return out;
+}
+function regionLabel(g, W, H) {
+  if (!g || !W || !H) return null;
+  const col = g.uc < W / 3 ? '左' : g.uc < 2 * W / 3 ? '中' : '右';
+  const row = g.vc < H / 3 ? '上' : g.vc < 2 * H / 3 ? '中' : '下';
+  return `${row}${col}(${Math.round(g.uc)},${Math.round(g.vc)},偏${Math.round(g.centerOff)}px)`;
+}
+function buildPerFrame(m, geo) {
+  const selfCons = extrinsicSelfConsistency(m);
+  const W = num(m.imageSize?.[0]), H = num(m.imageSize?.[1]);
+  const rows = m._out?.rows ?? [];
+  const stableReproj = m._out?.outliers?.reproj?.stable ?? [];
+  const stableEpi = m._out?.outliers?.epipolar?.stable ?? [];
+  return rows.map((r, i) => {
+    const sc = selfCons ? selfCons[i] : null;
+    const gl = geo?.left?.perView?.[i] ?? null, gr = geo?.right?.perView?.[i] ?? null;
+    return {
+      view: r.view, reprojL: r.reprojL, reprojR: r.reprojR, epi: r.epi,
+      rotErrDeg: sc ? sc.rotErrDeg : null, transErrMm: sc ? sc.transErrMm : null,
+      distL: r.distL, distR: r.distR, angleL: r.angleL, angleR: r.angleR,
+      ucL: gl ? Math.round(gl.uc) : null, vcL: gl ? Math.round(gl.vc) : null, offL: gl ? Math.round(gl.centerOff) : null,
+      ucR: gr ? Math.round(gr.uc) : null, vcR: gr ? Math.round(gr.vc) : null, offR: gr ? Math.round(gr.centerOff) : null,
+      regionL: regionLabel(gl, W, H), regionR: regionLabel(gr, W, H),
+      outlierReproj: stableReproj.includes(r.view), outlierEpi: stableEpi.includes(r.view),
+    };
+  });
 }
 function detectOutliers(xs) {
   const empty = { methods: { iqr: [], medSigma3: [], top5: [] }, stable: [] };
@@ -1023,6 +1089,17 @@ function renderRunSection(m, out, corr, th) {
   for (const t of out.top5)
     L.push(`| ${t.view + 1} | ${fmt(t.reprojL)} | ${fmt(t.reprojR)} | ${fmt(t.epi)} | ${fmt(t.distL, 1)} | ${fmt(t.angleL, 1)} | ${fmt(t.coverL, 1)} | ${fmt(t.lrRatio, 2)} | ${t.bothBad == null ? 'N/A' : t.bothBad ? '是' : '否'} |`);
   L.push('');
+  L.push('### 逐帧数据表', '');
+  L.push('> 外参Δ°/Δmm＝该帧瞬时外参（由左右目位姿推出）与全局标定 R/T 的自洽性残差，非真值误差；位置＝棋盘中心九宫格(坐标px,离画面中心偏移px)；✱＝离群帧；几何列无棋盘 config 时为 N/A。', '');
+  L.push('| view# | reprojL | reprojR | 外参Δ° | 外参Δmm | 极线 | 距离L/R mm | 斜角L/R° | 位置L | 位置R |', '|---|---|---|---|---|---|---|---|---|---|');
+  for (const r of m.perFrame ?? []) {
+    const mark = (r.outlierReproj || r.outlierEpi) ? '✱ ' : '';
+    const dist = r.distL == null ? 'N/A' : `${fmt(r.distL, 0)}/${fmt(r.distR, 0)}`;
+    const ang = r.angleL == null ? 'N/A' : `${fmt(r.angleL, 1)}/${fmt(r.angleR, 1)}`;
+    const posL = r.regionL ?? 'N/A', posR = r.regionR ?? 'N/A';
+    L.push(`| ${mark}${r.view + 1} | ${fmt(r.reprojL)} | ${fmt(r.reprojR)} | ${fmt(r.rotErrDeg, 3)} | ${fmt(r.transErrMm, 2)} | ${fmt(r.epi)} | ${dist} | ${ang} | ${posL} | ${posR} |`);
+  }
+  L.push('');
   L.push('### 相关性', '');
   const pfmt = p => p == null ? 'N/A' : p < 1e-4 ? p.toExponential(2) : p.toFixed(4);
   const cfmt = c => c == null || c.r == null ? 'N/A' : `${fmt(c.r)}${c.sig}（p=${pfmt(c.p)}）`;
@@ -1168,6 +1245,7 @@ function analyzeAll(okRuns, args, outDir) {
     m.board = cfg;
     const geo = boardGeometry(m, cfg);
     m._out = analyzeOutliers(m, geo);
+    m.perFrame = buildPerFrame(m, geo);
     m._corr = analyzeCorrelations(m._out, geo, m);
     m._stats = {
       stereo: stereoConsistency(m),

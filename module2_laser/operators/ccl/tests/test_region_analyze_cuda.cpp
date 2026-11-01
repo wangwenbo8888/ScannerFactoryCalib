@@ -931,8 +931,20 @@ TEST_F(RegionAnalyzerTest, LabeledMaskDownloadCorrect) {
     EXPECT_EQ(min_val, 0);
     EXPECT_EQ(max_val, 2);
 
-    EXPECT_EQ(h_labeled.at<int>(10, 10), 1);
+    // 标签具体编号依赖 GPU 侧连通域合并/紧缩顺序（不同 GPU 架构顺序可能不同，
+    // 实测同一矩形稳定得到 1 或 2 均合法）；契约是分割正确性而非编号顺序：
+    // 同矩形同标签、异矩形异标签、背景为 0、两标签恰为 {1,2}。
+    const int labA1 = h_labeled.at<int>(10, 10);
+    const int labA2 = h_labeled.at<int>(12, 12);
+    const int labB  = h_labeled.at<int>(35, 35);
+    EXPECT_EQ(labA1, labA2);
+    EXPECT_NE(labA1, labB);
+    EXPECT_NE(labA1, 0);
+    EXPECT_NE(labB, 0);
+    EXPECT_EQ(std::min(labA1, labB), 1);
+    EXPECT_EQ(std::max(labA1, labB), 2);
     EXPECT_EQ(h_labeled.at<int>(0, 0), 0);
+    EXPECT_EQ(h_labeled.at<int>(49, 49), 0);
 }
 
 // ============================================================

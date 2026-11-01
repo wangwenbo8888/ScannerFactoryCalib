@@ -61,10 +61,8 @@ T requireKey(const nlohmann::json& j, const char* key) {
 
 E2EConfig loadConfig() {
     const fs::path candidates[] = {
-        fs::path("module1_camera/tests/e2e/config.json"),                             // 仓库根=factory_calib 自身（独立仓库布局, repo 根直跑）
-        fs::path("../../module1_camera/tests/e2e/config.json"),                       // ctest cwd=<repo>/build_*/module1_camera（独立仓库布局）
-        fs::path("factory_calib/module1_camera/tests/e2e/config.json"),               // repo 根直跑（factory_calib 为子目录的工作区布局）
-        fs::path("../../factory_calib/module1_camera/tests/e2e/config.json"),          // ctest cwd=build_fc1_rel/module1_camera（工作区布局）
+        fs::path("factory_calib/module1_camera/tests/e2e/config.json"),               // repo 根直跑
+        fs::path("../../factory_calib/module1_camera/tests/e2e/config.json"),          // ctest cwd=build_fc1_rel/module1_camera
         fs::path("../../../factory_calib/module1_camera/tests/e2e/config.json"),      // 更深构建目录
         fs::path("E:/JEAMMWARE2601001/factory_calib/module1_camera/tests/e2e/config.json"),  // 绝对兜底
     };

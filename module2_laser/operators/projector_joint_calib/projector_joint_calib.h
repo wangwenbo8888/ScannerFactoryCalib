@@ -38,6 +38,14 @@ struct ProjectorJointCalibParams {
     int    irlsMaxRounds       = 2;      // IRLS 权刷新轮数上限
     bool   poseWeightEnabled   = true;   // 姿态定权 W_s=1/σ_s² (σ_s=平面内点RMS厚度)
 
+    // —— F8 右目重投影残差（Phase B）——
+    int    rightTermMaxIters   = 40;    // Phase B 迭代上限
+    int    rightTermRampIters  = 10;    // ramp-in 迭代数（0=不 ramp 全权启动）
+    double rightTermClampPx    = 10.0;  // |ΔuR| 钳位（Lipschitz 软门，防分支翻转毒化雅可比）
+    double rightTermDiscRel    = 1e-6;  // 求根判别式相对门限
+    double rightTermDepthMin   = 50.0;  // Z_m 深度窗下限（mm）
+    double rightTermDepthMax   = 3000.0;// Z_m 深度窗上限（mm）
+
     void validate() const {
         if (convergenceThreshold <= 0.0)
             throw std::invalid_argument("ProjectorJointCalibParams::convergenceThreshold must be > 0");
@@ -151,6 +159,11 @@ struct MultiLineInput {
     double      f = 0.0;
     cv::Point2d principalPoint = cv::Point2d(0.0, 0.0);
     cv::Vec3d   initialT = cv::Vec3d(0, 0, 0);
+
+    // —— F8 右目重投影残差（Phase B）——
+    double baseline        = 0.0;   // 右基线 B = |P2(0,3)|/f（mm）；enableRightTerm 时须 >0
+    bool   enableRightTerm = false; // 默认 false：残差布局/行为与现状逐位一致
+    double rightTermWeight = 1.0;   // 像素域相对权重（1 ⇔ 1px uR ≡ 1px Sampson）
 };
 
 struct MultiLineResult {
@@ -173,13 +186,11 @@ struct MultiLineResult {
 
     // —— F6 鲁棒优化诊断 ——
     /// 逐线残差统计（诊断/验收 A1-A3）
-    /// 注意口径: 归一化拟合坐标（projectNorm 后），非像素——与 finalSampsonRms（像素系）
-    /// 差 su/sv 量级（~百倍）。验收阈值 A1/A2 亦为此口径（2026-10-04 标注勘正）。
     struct LineDiag {
         int    lineIdx = -1;          // 输入 lines 下标
-        double rms = 0.0;             // 加权 Sampson rms（归一化坐标，非 px）
-        double p95 = 0.0;             // 95 分位残差（归一化坐标，非 px）
-        double outlierRatio = 0.0;    // |残差|>2（归一化坐标）点占比 [0,1]
+        double rms = 0.0;             // 加权 Sampson rms (px)
+        double p95 = 0.0;             // 95 分位残差 (px)
+        double outlierRatio = 0.0;    // 残差>2px 点占比 [0,1]
         int    pointCount = 0;
         double meanPoseWeight = 1.0;  // 该线各姿态平均帧权（σ_s⁻², 归一化）
     };
@@ -187,12 +198,26 @@ struct MultiLineResult {
     /// 逐姿态系统偏差（验收 A6 前置诊断: 某姿态把所有线拉向同侧 → t 残余/重建偏差）
     struct PoseDiag {
         int    poseIdx = -1;          // 该线内姿态序号（调用方映射）
-        double meanResidual = 0.0;    // 带符号平均残差（归一化坐标，非 px）
-        double rms = 0.0;             // （归一化坐标）
+        double meanResidual = 0.0;    // 带符号平均残差（px, 归一化坐标系）
+        double rms = 0.0;
     };
     std::vector<PoseDiag> perPose;    // 跨全部线扁平化（每线姿态数一致时按线分组）
     int irlsRounds = 0;               // IRLS 实际执行轮数
     double huberDelta = 0.0;          // 收敛时核参数（0=纯L2）
+
+    // —— F8 右目重投影残差诊断（Phase B）——
+    bool   rightTermUsed = false;
+    int    phaseBIters = 0;
+    double urBiasPreRms  = 0.0;       // Phase B 入口 |ΔuR| rms（px）
+    double urBiasPostRms = 0.0;       // Phase B 结束 |ΔuR| rms（px）
+    std::vector<double> urBiasPrePerLine;   // 逐线带符号均值（px, 与 usedLineIdx 对应）
+    std::vector<double> urBiasPostPerLine;
+    double urCrossAngleMedianDeg = 0.0;     // 极线×曲线交角中位数
+    double urCrossAngleMinDeg    = 0.0;
+    int    urGateCount   = 0;       // 冻结时被门控点数
+    int    urRowCount    = 0;       // 生效 uR 行数
+    int    urDualRootCount = 0;     // 双根均有效（分支歧义计数）
+    int    urClampCount  = 0;       // 冻结时 |ΔuR|>clampPx 计数
 
     MultiLineResult() = default;
     ~MultiLineResult() = default;
