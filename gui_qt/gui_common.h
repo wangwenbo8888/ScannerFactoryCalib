@@ -5,19 +5,20 @@
 
 namespace fc::gui {
 
-// 四种激光线类型（采集模式与标定类型共用同一张表；
-// 下位机协议尚未区分类型，通信仍统一用 N10 标志点+激光线命令）
+// 五种激光线类型（采集模式与标定类型共用同一张表；261105 固件五管语义：
+// T=左斜 V=右斜 C=深孔 D=精细 E=备用中竖25线——下位机 N10 按管开关分线型）
 struct LaserTypeSpec {
     const char* key;    // 子目录名 / 输出文件名后缀
     const char* name;   // 中文名（UI 显示）
 };
 inline constexpr LaserTypeSpec kLaserTypes[] = {
-    {"left_skew", "左斜"},
-    {"right_skew", "右斜"},
-    {"fine",      "精细"},
-    {"deep_hole", "深孔"},
+    {"left_skew",    "左斜"},
+    {"right_skew",   "右斜"},
+    {"fine",         "精细"},
+    {"deep_hole",    "深孔"},
+    {"mid_vertical", "中竖"},   // 261105 增：备用中竖25线（E 管）
 };
-inline constexpr int kLaserTypeCount = 4;
+inline constexpr int kLaserTypeCount = 5;
 inline QString laserTypeDir(int i) {   // data_in/laser/<key>
     return QStringLiteral("data_in/laser/") + QString::fromLatin1(kLaserTypes[i].key);
 }

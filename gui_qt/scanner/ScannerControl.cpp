@@ -74,31 +74,34 @@ bool ScannerControl::isOpen() const {
 
 bool ScannerControl::start(const ScannerParams& p) {
     { std::ofstream d("E:/workfold/factory_calib/debug.txt", std::ios::app); d << "scannerStart open=" << isOpen() << " freq=" << p.freq << " laser=" << p.laser
-        << " T" << p.tubeT << " V" << p.tubeV << " C" << p.tubeC << " D" << p.tubeD << "\n"; }
+        << " T" << p.tubeT << " V" << p.tubeV << " C" << p.tubeC << " D" << p.tubeD << " E" << p.tubeE << "\n"; }
     if (!isOpen()) {
         notify(QStringLiteral("请先打开扫描仪串口"));
         return false;
     }
-    // 260831 协议七参格式: "N10 H{freq} B{bg} T{t} V{v} C{c} D{d} L{laser};"
-    // T/V/C/D 四管开关：已开启者按 T→V→C→D 轮流点亮，单开一管即固定该激光线
+    // 261105 协议八参格式: "N10 H{freq} B{bg} T{t} V{v} C{c} D{d} E{e} L{laser};"
+    // T/V/C/D/E 五管开关（261105 语义 T=左斜 V=右斜 C=深孔 D=精细 E=备用中竖25线）：
+    // 已开启者按 T→V→C→D→E 轮流点亮，单开一管即固定该激光线
     int laserVal = (p.laser > 0) ? p.laser : 0;
-    QString cmd = QStringLiteral("N10 H%1 B%2 T%3 V%4 C%5 D%6 L%7;")
+    QString cmd = QStringLiteral("N10 H%1 B%2 T%3 V%4 C%5 D%6 E%7 L%8;")
                       .arg(p.freq)
                       .arg(p.background)
                       .arg(p.tubeT ? 1 : 0)
                       .arg(p.tubeV ? 1 : 0)
                       .arg(p.tubeC ? 1 : 0)
                       .arg(p.tubeD ? 1 : 0)
+                      .arg(p.tubeE ? 1 : 0)
                       .arg(laserVal);
     spdlog::info("[Scanner] 启动命令: {}", cmd.toStdString());
     notify(QStringLiteral("发送启动命令: %1").arg(cmd));
 
     bool ok = sendLine(cmd);
     if (ok) {
-        notify(QStringLiteral("扫描仪已启动 (freq=%1 bg=%2 laser=%3 T%4 V%5 C%6 D%7)")
+        notify(QStringLiteral("扫描仪已启动 (freq=%1 bg=%2 laser=%3 T%4 V%5 C%6 D%7 E%8)")
                    .arg(p.freq).arg(p.background).arg(laserVal)
                    .arg(p.tubeT ? 1 : 0).arg(p.tubeV ? 1 : 0)
-                   .arg(p.tubeC ? 1 : 0).arg(p.tubeD ? 1 : 0));
+                   .arg(p.tubeC ? 1 : 0).arg(p.tubeD ? 1 : 0)
+                   .arg(p.tubeE ? 1 : 0));
     }
     return ok;
 }

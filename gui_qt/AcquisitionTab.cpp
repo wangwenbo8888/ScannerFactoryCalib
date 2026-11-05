@@ -163,6 +163,7 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
     scannerModeCbx_->addItem(QStringLiteral("标志点+右斜激光线"), 2);
     scannerModeCbx_->addItem(QStringLiteral("标志点+精细激光线"), 3);
     scannerModeCbx_->addItem(QStringLiteral("标志点+深孔激光线"), 4);
+    scannerModeCbx_->addItem(QStringLiteral("标志点+中竖激光线(备用25线)"), 5);
     scannerModeCbx_->setCurrentIndex(1);  // 默认激光模式：实时预览看激光线变换
     scanRow1->addWidget(scannerModeCbx_);
     scannerStartBtn_ = new QPushButton(QStringLiteral("▶ 启动扫描仪"));
@@ -1007,20 +1008,22 @@ void AcquisitionTab::onStartScanner() {
     ScannerParams p;
     p.freq       = freqSlider_->value();
     p.background = bgLightSlider_->value();
-    // 模式 → N10 四管开关（261002 临时测试机协议——扫描仪损坏临时环境，管语义：
-    //   T=精细线、V=左斜线、C=右斜线、D=无对应线〔测试机未接，占位〕；原 260831
-    //   管号 T=左斜/V=右斜/C=深孔/D=精细 作废，回正式机须回退）：
-    //   0=仅标志点 → 四管全关（T0 V0 C0 D0，仅补光，相机标定）
-    //   1=左斜 → 仅 V1；2=右斜 → 仅 C1；3=精细 → 仅 T1；4=深孔 → 仅 D1（无对应线）
+    // 模式 → N10 五管开关（261105 固件管语义定版：T=左斜、V=右斜、C=深孔、
+    //   D=精细、E=备用中竖25线；261002 临时机口径「T=精细/V=左斜/C=右斜/
+    //   D=占位」作废）：
+    //   0=仅标志点 → 五管全关（仅补光，相机标定）
+    //   1=左斜 → 仅 T1；2=右斜 → 仅 V1；3=精细 → 仅 D1；4=深孔 → 仅 C1；
+    //   5=中竖 → 仅 E1（备用25线）
     // 协议语义：已开启的管轮流点亮，单开一管即固定该激光线
     int mode = scannerModeCbx_->currentData().toInt();
     p.laser = laserSlider_->value();
     switch (mode) {
-        case 1:  p.tubeV = 1; break;   // 左斜 → V 管（261002 临时）
-        case 2:  p.tubeC = 1; break;   // 右斜 → C 管
-        case 3:  p.tubeT = 1; break;   // 精细 → T 管
-        case 4:  p.tubeD = 1; break;   // 深孔 → D 管（测试机无对应线，占位）
-        default: p.laser = 0; break;   // 仅标志点：激光关（四管全 0）
+        case 1:  p.tubeT = 1; break;   // 左斜 → T 管（261105 语义）
+        case 2:  p.tubeV = 1; break;   // 右斜 → V 管
+        case 3:  p.tubeD = 1; break;   // 精细 → D 管
+        case 4:  p.tubeC = 1; break;   // 深孔 → C 管
+        case 5:  p.tubeE = 1; break;   // 中竖 → E 管（备用25线）
+        default: p.laser = 0; break;   // 仅标志点：激光关（五管全 0）
     }
     // 布防顺序关键（2026-09-27 修复）：先布防相机、后发 N10。
     // 旧顺序先发 N10 电机立刻转，相机左右布防有数~数十 ms 间隙（含两次 OpenStream），
