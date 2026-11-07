@@ -372,7 +372,99 @@ LaserLabelResult LaserLabelerCUDA::Impl::Execute(
             }
         };
 
+        // rowRefMode=1: 每标签自参考行((ymin+ymax)/2)的 minX 排序键
+        // (26111-07 斜扇面事故: 单中心行下边缘线从上/下出画不可编号)
+        std::vector<int> adaptiveMinx;
+
         if (horizontal) {
+            if (params_.rowRefMode == 1) {
+                // ---- 自适应行路径: 全图标签下载 → 每标签 y 跨度 → 自参考行游程 ----
+                // (GpuMat 行有 step 对齐填充, 必须按 2D 拷贝——线性拷贝会行错位)
+                std::vector<int> h_mask((size_t)rows * cols);
+                cudaMemcpy2DAsync(h_mask.data(), (size_t)cols * sizeof(int),
+                                  d_labels_buf_.ptr<int>(), d_labels_buf_.step,
+                                  (size_t)cols * sizeof(int), rows,
+                                  cudaMemcpyDeviceToHost, cuda_stream);
+                cudaStreamSynchronize(cuda_stream);
+
+                std::vector<int> yMin(actual_max_label, INT_MAX);
+                std::vector<int> yMax(actual_max_label, -1);
+                for (int y = 0; y < rows; ++y) {
+                    const int* rowp = &h_mask[(size_t)y * cols];
+                    for (int x = 0; x < cols; ++x) {
+                        const int lab = rowp[x];
+                        if (lab > 0 && lab < actual_max_label) {
+                            if (y < yMin[lab]) yMin[lab] = y;
+                            if (y > yMax[lab]) yMax[lab] = y;
+                        }
+                    }
+                }
+
+                adaptiveMinx.assign(params_.maxLabels + 1, cols);   // cols=横切哨兵
+                std::map<int, std::vector<GateRun>> byLabel;
+                for (int lab = 1; lab < actual_max_label; ++lab) {
+                    if (yMax[lab] < 0) continue;                    // 标签不存在
+                    const int refY = (yMin[lab] + yMax[lab]) / 2;   // 自参考行
+                    const int* rowp = &h_mask[(size_t)refY * cols];
+                    int x = 0;
+                    auto& v = byLabel[lab];
+                    while (x < cols) {
+                        if (rowp[x] == lab) {
+                            const int x0 = x;
+                            while (x < cols && rowp[x] == lab) ++x;
+                            v.push_back({lab, x0, x});
+                        } else {
+                            ++x;
+                        }
+                    }
+                }
+
+                // ---- 门禁 2: maxRunWidth(自参考行原始游程展布, 与旧口径同语义) ----
+                runWidthGate(byLabel);
+
+                // ---- 粘连拆分(splitMergedRuns): 拆分键/排序键自参考行派生 ----
+                // 排序键: 保留半部=首游程起点; 拆出新标签=其触发游程起点
+                // (split_x=(前段末+本段初)/2 < 本段起点 → 新标签 minX=本段起点,
+                //  无需回读 GPU 重算)
+                for (auto& [lab, v] : byLabel) {
+                    if (v.empty()) continue;
+                    adaptiveMinx[lab] = v.front().a0;
+                }
+                if (params_.splitMergedRuns) {
+                    int next_label = actual_max_label;
+                    bool changed = false;
+                    for (auto& [lab, v] : byLabel) {
+                        if (v.size() < 2) continue;
+                        for (size_t k = 1; k < v.size(); ++k) {
+                            int split_x = (v[k - 1].a1 + v[k].a0) / 2;
+                            if (next_label > params_.maxLabels) break;
+                            dim3 blk(16, 16);
+                            dim3 grd((cols + 15) / 16, (rows + 15) / 16);
+                            SplitMergedLabelKernel<<<grd, blk, 0, cuda_stream>>>(
+                                d_labels_buf_.ptr<int>(), rows, cols, d_labels_buf_.step,
+                                lab, split_x, next_label);
+                            adaptiveMinx[next_label] = v[k].a0;
+                            ++next_label;
+                            changed = true;
+                        }
+                    }
+                    if (changed) {
+                        cudaStreamSynchronize(cuda_stream);
+                        op_err = cudaGetLastError();
+                        if (op_err != cudaSuccess) {
+                            result.success = false;
+                            result.message = std::string("SplitMergedLabelKernel failed: ")
+                                           + cudaGetErrorString(op_err);
+                            return result;
+                        }
+                        actual_max_label = next_label;
+                        CALIB_LOG_INFO("adaptive-row split: {} labels after split",
+                                       actual_max_label - 1);
+                    }
+                }
+                CALIB_LOG_INFO("rowRefMode=1 adaptive per-line reference rows: {} labels",
+                               byLabel.size());
+            } else {
             // 下载扫描行
             std::vector<int> scanline(cols);
             cudaMemcpyAsync(scanline.data(),
@@ -433,6 +525,7 @@ LaserLabelResult LaserLabelerCUDA::Impl::Execute(
                                    actual_max_label - 1);
                 }
             }
+            }   // rowRefMode=0 旧中心行路径
         } else if (params_.maxRunWidth > 0) {
             // 竖切门禁: 下载中心列, 同口径游程分解 + 展布检查(无拆分逻辑)
             std::vector<int> scancol(rows);
@@ -479,8 +572,15 @@ LaserLabelResult LaserLabelerCUDA::Impl::Execute(
             return result;
         }
 
-        // === Step 5: 扫描扫描线（竖切: 中心列取minY / 横切: 中心行取minX） ===
-        if (horizontal) {
+        // === Step 5: 扫描扫描线（竖切: 中心列取minY / 横切: 中心行取minX / 自适应: 各线自参考行minX） ===
+        if (horizontal && params_.rowRefMode == 1) {
+            // 自适应行: Step 3.5 已在 host 算好各标签自参考行首游程起点,
+            // 直接上载为排序键(未线标签保持哨兵=cols, 与 BuildMapTable 同口径)
+            cudaMemcpyAsync(thrust::raw_pointer_cast(d_min_y_coords_.data()),
+                            adaptiveMinx.data(),
+                            (size_t)actual_max_label * sizeof(int),
+                            cudaMemcpyHostToDevice, cuda_stream);
+        } else if (horizontal) {
             int grid_scan = (cols + block_size_1d - 1) / block_size_1d;
             ScanCenterRowKernel<<<grid_scan, block_size_1d, 0, cuda_stream>>>(
                 d_labels_buf_.ptr<int>(),

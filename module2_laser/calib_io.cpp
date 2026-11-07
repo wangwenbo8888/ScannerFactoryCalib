@@ -74,6 +74,7 @@ void applyLaserParamsJson(const json& j, LaserCalibConfig& c, LaserOpParams& ops
     if (j.contains("laser_label") && j["laser_label"].is_object()) {
         const auto& ll = j["laser_label"];
         if (ll.contains("scanDirection")) c.labelScanDirection = ll["scanDirection"].get<int>();
+        if (ll.contains("rowRefMode")) c.labelRowRefMode = ll["rowRefMode"].get<int>();
         if (ll.contains("centerRowOffset")) c.labelCenterRowOffset = ll["centerRowOffset"].get<int>();
         if (ll.contains("realLineTolerance"))
             ops.labelRealLineTolerance = ll["realLineTolerance"].get<int>();

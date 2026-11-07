@@ -44,6 +44,8 @@ struct LaserCalibConfig {
     // 激光线编号扫描方向（喂 LaserLabelParams）:
     //   0=竖切中心列(默认, 水平多线形态), 1=横切中心行(斜线形态)
     int labelScanDirection = 0;
+    /// 横切行参考(仅 scanDirection=1): 0=旧中心行 / 1=自适应每线中点行(默认)
+    int labelRowRefMode = 1;
     int labelCenterRowOffset = 0;
 
     // F7 漂移解并发线程数（顶层键 f7Threads）

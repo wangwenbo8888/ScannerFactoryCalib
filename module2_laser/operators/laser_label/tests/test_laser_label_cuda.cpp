@@ -686,4 +686,175 @@ TEST_F(LaserLabelTest, GateOffByDefault) {
     EXPECT_NO_THROW(params_.validate());
 }
 
+// ============================================================================
+// rowRefMode 测试（2026-11-07 斜扇面事故: 单中心行切割在剪切扇面下丢线）
+// 0=旧中心行 / 1=自适应每线中点行(默认)
+// ============================================================================
+
+// 斜扇面辅助: 画 N 条 45° 平行斜线, y 起点 yi0 = 5 + i*45 → 仅前 3 条跨中心行
+// (i=0: y5..155 / i=1: y50..200 / i=2: y95..199 跨; i=3: y140..199 / i=4: y185..199 不跨)
+static cv::Mat makeShearedFan(int rows, int cols) {
+    cv::Mat m = cv::Mat::zeros(rows, cols, CV_32SC1);
+    for (int i = 0; i < 5; ++i) {
+        const int y0 = 5 + i * 45;
+        cv::line(m, cv::Point(30 + i * 60, y0),
+                 cv::Point(30 + i * 60 + 150, y0 + 150),
+                 cv::Scalar(i + 1), 6);
+    }
+    return m;
+}
+
+TEST_F(LaserLabelTest, RowRefModeDefaultIsAdaptive) {
+    EXPECT_EQ(params_.rowRefMode, 1);
+    EXPECT_NO_THROW(params_.validate());
+    params_.rowRefMode = 2;
+    EXPECT_THROW(params_.validate(), std::invalid_argument);
+    params_.rowRefMode = 0;
+    EXPECT_NO_THROW(params_.validate());
+}
+
+TEST_F(LaserLabelTest, RowRefModeJsonRoundtrip) {
+    params_.rowRefMode = 0;
+    auto restored = LaserLabelParams::fromJson(params_.toJson());
+    EXPECT_EQ(restored.rowRefMode, 0);
+    nlohmann::json j = {{"rowRefMode", 1}};
+    EXPECT_EQ(LaserLabelParams::fromJson(j).rowRefMode, 1);
+}
+
+// 自适应行: 斜扇面 5 条线全部编号(含未跨中心行的 2 条), 按 x 升序 1..5
+TEST_F(LaserLabelTest, AdaptiveRowNumbersShearedFan) {
+    params_.scanDirection = 1;          // rowRefMode 默认 1
+    LaserLabelerCUDA labeler(params_);
+    labeler.Warmup(200, 400);
+
+    cv::Mat labels_cpu = makeShearedFan(200, 400);
+    cv::cuda::GpuMat d_labels;
+    d_labels.upload(labels_cpu);
+
+    auto result = labeler.Execute(d_labels);
+
+    EXPECT_TRUE(result.success);
+    EXPECT_EQ(result.componentCount, 5);
+    EXPECT_EQ(result.lineCount, 5);
+
+    cv::Mat h_output;
+    result.d_labeledMask->download(h_output);
+    for (int i = 0; i < 5; ++i) {
+        const int yMin = 5 + i * 45;                         // 裁切后实际跨度
+        const int yMax = std::min(5 + i * 45 + 150, 199);
+        const int refY = (yMin + yMax) / 2;                  // 算子用的自参考行
+        const int refX = 30 + i * 60 + (refY - yMin);        // 该行处线的 x
+        EXPECT_EQ(h_output.at<int>(refY, refX), i + 1)
+            << "line " << i << " should get label " << (i + 1);
+    }
+}
+
+// 旧行为钉死(A/B 回滚锚): 同扇面 rowRefMode=0 只编 3 条, 未跨线置 0
+TEST_F(LaserLabelTest, LegacyCenterRowDropsShearedLines) {
+    params_.scanDirection = 1;
+    params_.rowRefMode = 0;
+    LaserLabelerCUDA labeler(params_);
+    labeler.Warmup(200, 400);
+
+    cv::Mat labels_cpu = makeShearedFan(200, 400);
+    cv::cuda::GpuMat d_labels;
+    d_labels.upload(labels_cpu);
+
+    auto result = labeler.Execute(d_labels);
+
+    EXPECT_TRUE(result.success);
+    EXPECT_EQ(result.componentCount, 3);              // 仅跨中心行的 3 条
+    cv::Mat h_output;
+    result.d_labeledMask->download(h_output);
+    // 线3(y140..199)与线4(y185..199)未跨中心行 → 整域置 0
+    EXPECT_EQ(h_output.at<int>(169, 239), 0);
+    EXPECT_EQ(h_output.at<int>(192, 277), 0);
+}
+
+// 顺序兼容: 全部线都跨中心行时, 两种模式编号完全一致
+TEST_F(LaserLabelTest, AdaptiveOrderMatchesLegacyWhenAllCross) {
+    params_.scanDirection = 1;
+    params_.rowRefMode = 1;
+    LaserLabelerCUDA labeler(params_);
+    labeler.Warmup(200, 400);
+
+    cv::Mat labels_cpu = makeHorizontalLines(
+        200, 400, {10, 80, 150, 220, 290}, {12, 12, 12, 12, 12}, {3, 1, 4, 2, 5});
+    cv::cuda::GpuMat d_labels;
+    d_labels.upload(labels_cpu);
+    auto r1 = labeler.Execute(d_labels);
+    ASSERT_TRUE(r1.success);
+    EXPECT_EQ(r1.componentCount, 5);
+
+    cv::Mat h1;
+    r1.d_labeledMask->download(h1);
+    // 按 x 排序 → x=10 带=1, x=80 带=2, ... （旧标签 3,1,4,2,5 重编号为 1..5）
+    EXPECT_EQ(h1.at<int>(100, 16), 1);
+    EXPECT_EQ(h1.at<int>(100, 86), 2);
+    EXPECT_EQ(h1.at<int>(100, 156), 3);
+    EXPECT_EQ(h1.at<int>(100, 226), 4);
+    EXPECT_EQ(h1.at<int>(100, 296), 5);
+}
+
+// 门禁语义保留: 未跨中心行的宽游程(过曝粘连)在自适应行下仍被门2抓到(旧行为漏检)
+TEST_F(LaserLabelTest, AdaptiveRowGateDetectsWideRunOffCenter) {
+    params_.scanDirection = 1;          // rowRefMode 默认 1
+    params_.maxRunWidth = 30;
+    LaserLabelerCUDA labeler(params_);
+    labeler.Warmup(200, 400);
+
+    // 3 条正常线跨中心行 + 1 条 132px 宽带在画面下部(不跨中心行)
+    cv::Mat labels_cpu = cv::Mat::zeros(200, 400, CV_32SC1);
+    for (int i = 0; i < 3; ++i)
+        cv::rectangle(labels_cpu, cv::Point(10 + i * 70, 60),
+                      cv::Point(10 + i * 70 + 11, 140), cv::Scalar(i + 1), -1);
+    cv::rectangle(labels_cpu, cv::Point(250, 150), cv::Point(381, 190),
+                  cv::Scalar(9), -1);   // 宽 132, 参考行 y=170
+    cv::cuda::GpuMat d_labels;
+    d_labels.upload(labels_cpu);
+
+    auto result = labeler.Execute(d_labels);
+
+    EXPECT_TRUE(result.success);
+    EXPECT_TRUE(result.frameRejected);                          // 自适应: 抓到
+    EXPECT_NE(result.rejectReason.find("runWidth=132"), std::string::npos);
+
+    // 旧行为对照: 中心行看不到该带 → 不拒(记录改进点, 非回归)
+    params_.rowRefMode = 0;
+    LaserLabelerCUDA legacy(params_);
+    legacy.Warmup(200, 400);
+    auto r0 = legacy.Execute(d_labels);
+    ASSERT_TRUE(r0.success);
+    EXPECT_FALSE(r0.frameRejected);
+}
+
+// 拆分语义保留: 自参考行上同标签双游程 → 拆成两条线(maxRunWidth 关闭不干扰)
+TEST_F(LaserLabelTest, AdaptiveRowSplitMergedRuns) {
+    params_.scanDirection = 1;          // rowRefMode 默认 1
+    params_.maxRunWidth = 0;
+    LaserLabelerCUDA labeler(params_);
+    labeler.Warmup(200, 400);
+
+    // 两条正常线跨中心行(x=10 标签1, x=300 标签2) + 下部同标签双游程(标签5)
+    cv::Mat labels_cpu = cv::Mat::zeros(200, 400, CV_32SC1);
+    cv::rectangle(labels_cpu, cv::Point(10, 60), cv::Point(21, 140), cv::Scalar(1), -1);
+    cv::rectangle(labels_cpu, cv::Point(300, 60), cv::Point(311, 140), cv::Scalar(2), -1);
+    cv::rectangle(labels_cpu, cv::Point(100, 150), cv::Point(111, 180), cv::Scalar(5), -1);
+    cv::rectangle(labels_cpu, cv::Point(200, 150), cv::Point(211, 180), cv::Scalar(5), -1);
+    cv::cuda::GpuMat d_labels;
+    d_labels.upload(labels_cpu);
+
+    auto result = labeler.Execute(d_labels);
+
+    EXPECT_TRUE(result.success);
+    EXPECT_EQ(result.componentCount, 4);          // 标签5 拆成 2 → 共 4 条
+    cv::Mat h_output;
+    result.d_labeledMask->download(h_output);
+    // 按 x 排序: x=10→1, x=100(拆分左半)→2, x=200(拆分右半)→3, x=300→4
+    EXPECT_EQ(h_output.at<int>(100, 15), 1);
+    EXPECT_EQ(h_output.at<int>(165, 105), 2);
+    EXPECT_EQ(h_output.at<int>(165, 205), 3);
+    EXPECT_EQ(h_output.at<int>(100, 305), 4);
+}
+
 #endif // WITH_CUDA_TESTS

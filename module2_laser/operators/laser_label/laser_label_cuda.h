@@ -37,6 +37,13 @@ struct LaserLabelParams {
     int scanDirection = 0;
     /// 横切模式下的中心行偏移 (row = rows/2 + centerRowOffset)
     int centerRowOffset = 0;
+    /// 横切模式行参考(rowRefMode, 仅 scanDirection=1 生效; 竖切恒为固定中心列):
+    /// 0=旧中心行: 只对跨过中心行的线取交点 minX 排序, 未跨线标签被删(映射0)
+    ///            ——斜扇面(边缘线从上/下出画)下大量线不可编号(261107 实证:
+    ///            左目 25 条线仅 18 条跨中心行, 门1 线数恒不符整帧被拒)
+    /// 1=自适应行(默认): 每条线取自身 y 跨度中点行为参考行取交点 minX 排序
+    ///            ——全画面线均可编号; 平行线族下与旧规则排序结果一致(语义兼容)
+    int rowRefMode = 1;
     /// 拆分扫描行上的粘连游程(仅横切生效, 默认 true):
     /// 膨胀导致相邻平行线连通域粘连时, 同一标签在扫描行上出现多个不连续游程段,
     /// 每段各自成线编号(按段最小 x 排序), 恢复正确线数
@@ -68,6 +75,8 @@ struct LaserLabelParams {
             throw std::invalid_argument("LaserLabelParams::centerColOffset must be [-500, 500]");
         if (scanDirection != 0 && scanDirection != 1)
             throw std::invalid_argument("LaserLabelParams::scanDirection must be 0 or 1");
+        if (rowRefMode != 0 && rowRefMode != 1)
+            throw std::invalid_argument("LaserLabelParams::rowRefMode must be 0 (fixed center row) or 1 (adaptive per-line mid row)");
         if (centerRowOffset < -500 || centerRowOffset > 500)
             throw std::invalid_argument("LaserLabelParams::centerRowOffset must be [-500, 500]");
         if (realLineTolerance < 0)
@@ -86,6 +95,7 @@ struct LaserLabelParams {
             {"centerColOffset", centerColOffset},
             {"scanDirection", scanDirection},
             {"centerRowOffset", centerRowOffset},
+            {"rowRefMode", rowRefMode},
             {"splitMergedRuns", splitMergedRuns},
             {"realLineTolerance", realLineTolerance},
             {"expectedLineCount", expectedLineCount},
@@ -100,6 +110,7 @@ struct LaserLabelParams {
         if (j.contains("centerColOffset")) p.centerColOffset = j.at("centerColOffset").get<int>();
         if (j.contains("scanDirection")) p.scanDirection = j.at("scanDirection").get<int>();
         if (j.contains("centerRowOffset")) p.centerRowOffset = j.at("centerRowOffset").get<int>();
+        if (j.contains("rowRefMode")) p.rowRefMode = j.at("rowRefMode").get<int>();
         if (j.contains("splitMergedRuns")) p.splitMergedRuns = j.at("splitMergedRuns").get<bool>();
         if (j.contains("realLineTolerance")) p.realLineTolerance = j.at("realLineTolerance").get<int>();
         if (j.contains("expectedLineCount")) p.expectedLineCount = j.at("expectedLineCount").get<int>();

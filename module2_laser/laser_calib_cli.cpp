@@ -260,14 +260,15 @@ int fc::runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
     labelParams.deviceId = cfg.deviceId;
     labelParams.scanDirection = cfg.labelScanDirection;
     labelParams.centerRowOffset = cfg.labelCenterRowOffset;
+    labelParams.rowRefMode = cfg.labelRowRefMode;
     labelParams.realLineTolerance = ops.labelRealLineTolerance;
     labelParams.expectedLineCount = ops.labelExpectedLineCount;
     labelParams.maxRunWidth = ops.labelMaxRunWidth;
     LaserLabelerCUDA labelL(labelParams);
     LaserLabelerCUDA labelR(labelParams);
     spdlog::info("4-3 LaserLabelerCUDA x2 (L/R) constructed "
-                 "(scanDirection={}, centerRowOffset={}, expectedLineCount={}, maxRunWidth={})",
-                 labelParams.scanDirection, labelParams.centerRowOffset,
+                 "(scanDirection={}, rowRefMode={}, expectedLineCount={}, maxRunWidth={})",
+                 labelParams.scanDirection, labelParams.rowRefMode,
                  labelParams.expectedLineCount, labelParams.maxRunWidth);
 
     // ----- 4-4 Steger（steger_fast, 2026-09-04 起产线）-----
