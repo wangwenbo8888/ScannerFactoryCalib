@@ -268,7 +268,10 @@ int main(int argc, char** argv) {
     LaserMatchScanParamsV3 vp3;
     vp3.epipolar_row_step = rowStep;
     vp3.vL_tolerance = 0.7f;
-    vp3.match_threshold = 2.0f;
+    // 261107 精细竖线适配：对齐主工程 per-tube D 管 match_threshold
+    // （32 容 CMTT rms 6.4）——env FCV3_THR 可覆盖
+    vp3.match_threshold = [] { const char* e = getenv("FCV3_THR");
+                               return e ? static_cast<float>(atof(e)) : 32.0f; }();
     LaserMatchScanCudaV3 matcher(vp3);
     if (!matcher.SetTempTable(tempTable)) { std::cerr << "v3 SetTempTable failed\n"; return 1; }
     matcher.SetCurrentTemperature(tableTempC);
@@ -367,6 +370,8 @@ int main(int argc, char** argv) {
             cv::Mat fids;
             e.d_interp_line_ids->download(fids, stream);
             stream.waitForCompletion();
+            std::cout << (side ? "[interp R] pts=" : "[interp L] pts=")
+                      << pts.size() << std::endl;   // 261107 分镜计数
             fids = fids.reshape(1, 1);
             cv::Mat img(h.imageSize, CV_8UC3, cv::Scalar(0, 0, 0));
             for (size_t i = 0; i < pts.size(); ++i) {

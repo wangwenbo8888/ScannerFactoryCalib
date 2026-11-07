@@ -118,6 +118,10 @@ struct LaserOpParams {
     double pjcHuberDelta0          = 1.0;
     int    pjcIrlsMaxRounds        = 2;
     bool   pjcPoseWeightEnabled    = true;
+    // 261107 PJC 初值注入（空=不覆盖，走 tMech+共识 median 老路径）：
+    // 弱几何数据集（如精细 7 竖线 43% 组合缺失）共识 median 被污染时，
+    // 用同机强数据集（如右斜 25 线）的 projectorT 作先验初值压盆地
+    std::vector<double> pjcInitialT = {};
     // PJC 验收门禁阈值（2026-10-04 外置；默认＝CLI 原硬编码 AcceptanceCfg）
     double pjcAccA1MaxLineRms      = 0.5;
     double pjcAccA2MaxP95          = 1.5;

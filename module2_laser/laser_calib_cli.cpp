@@ -688,8 +688,20 @@ int fc::runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
         mlIn.principalPoint = cv::Point2d(stereoK(0, 2), stereoK(1, 2));
         // 点云在左相机矫正坐标系 → initialT 用 R1·(80,3,3)（R1 实测 ~10.4° yaw）
         cv::Matx33d R1m = h.R1;
-        const cv::Vec3d tMech = R1m * cv::Vec3d(80.0, 3.0, 3.0);
-        mlIn.initialT = tMech;
+        cv::Vec3d tMech = R1m * cv::Vec3d(80.0, 3.0, 3.0);
+        // 261107 初值注入：config pjc.initialT 覆盖机械初值（弱几何数据集
+        // 盆地救捞——如精细 7 竖线组合缺失 43% 时共识 median 被污染；
+        // 用同机强数据集 projectorT 先验。tMech 仍为缺省回退）
+        cv::Vec3d tInit = tMech;
+        if (ops.pjcInitialT.size() == 3) {
+            tInit = cv::Vec3d(ops.pjcInitialT[0], ops.pjcInitialT[1],
+                              ops.pjcInitialT[2]);
+            spdlog::info("pjc.initialT override: ({:.2f},{:.2f},{:.2f}) "
+                         "(tMech=({:.2f},{:.2f},{:.2f}) discarded)",
+                         tInit[0], tInit[1], tInit[2],
+                         tMech[0], tMech[1], tMech[2]);
+        }
+        mlIn.initialT = tInit;
 
         // —— F8 右目重投影残差：从 handoff P2 提取基线 B ＋ 启用右目项 ——
         // B = |P2(0,3)| / fx（矫正系右基线，mm）——与 fcstepdump --pjc-multiline 同口径
@@ -707,7 +719,7 @@ int fc::runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
                 si.poses = line;
                 si.f = mlIn.f;
                 si.principalPoint = mlIn.principalPoint;
-                si.initialT = tMech;
+                si.initialT = tInit;
                 auto sr = warmOp.Execute(si);
                 if (!sr.success) continue;
                 if (sr.finalSampsonRms > 1.0) continue;

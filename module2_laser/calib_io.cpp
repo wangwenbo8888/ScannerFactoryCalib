@@ -131,7 +131,12 @@ void applyLaserParamsJson(const json& j, LaserCalibConfig& c, LaserOpParams& ops
         if (p.contains("cauchyToL2Thresh"))     ops.pjcCauchyToL2Thresh     = p["cauchyToL2Thresh"].get<double>();
         if (p.contains("topologyEpsilon"))      ops.pjcTopologyEpsilon      = p["topologyEpsilon"].get<double>();
         if (p.contains("curveDegree"))          ops.pjcCurveDegree          = p["curveDegree"].get<int>();
-        if (p.contains("useCeres"))             ops.pjcUseCeres             = p["useCeres"].get<bool>();
+        if (p.contains("useCeres"))               ops.pjcUseCeres               = p["useCeres"].get<bool>();
+    // 261107 PJC 初值注入（3 元数组；空/长度不符=忽略）
+    if (p.contains("initialT") && p["initialT"].is_array()
+        && p["initialT"].size() == 3) {
+        ops.pjcInitialT = p["initialT"].get<std::vector<double>>();
+    }
         if (p.contains("useBlockJtJ"))          ops.pjcUseBlockJtJ          = p["useBlockJtJ"].get<bool>();
         if (p.contains("anomalyRmsThreshold"))  ops.pjcAnomalyRmsThreshold  = p["anomalyRmsThreshold"].get<double>();
         if (p.contains("robustEnabled"))        ops.pjcRobustEnabled        = p["robustEnabled"].get<bool>();

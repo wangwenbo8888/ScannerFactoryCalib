@@ -1,13 +1,9 @@
 {
   "_doc": "laser_calib 主控参数库：三层合并的中间层。下层=编译内置默认（原同值；2026-10-12 起 7 键对齐 laser261006-1668 定稿：mask 120/3/9/0、steger.maxLineWidth 6.0、scanDirection 1、referenceTemp 22.5——编译内置仍是旧中性值）。rowStep/depthMin/depthMax 随标定走(红线)不外置；lineIds 省略=从累积点云反推。注意: pjc.acceptance 的 a1/a2 阈值作用在归一化坐标残差(非像素)。",
   "_usage": "注释键约定：`_` 前缀键（_doc/_usage/_pipeline/_audit/_sec_*/_c_*）装载器安全忽略，改实参只改无前缀键。优先级：编译内置 ← 本主库 ← 数据集 config.json（逐叶覆盖，present-key）← pose 目录 temps.txt 的 ref_temp（最高）。主库定位：exe 旁（POST_BUILD 拷贝）→ cwd → 源码树，全缺回退编译内置同值默认；改主库无需重编译。⚠ 数据集 config 的显式零值键（postErodeSize/highlightErodeSize=0）不可省——省略会被主库默认值顶上（2026-10-07 固化事故）。本文件按模块2 主流程序编排（§1~§13），JSON 键序不影响装载。",
-
   "_pipeline": "模块2 主流程算子全录（按 CLI 调用序；×2＝左右目各一实例）：4-1 激光掩膜 MaskExtractCUDA×2[§2] → 4-2 连通域 RegionAnalyzerCUDA×2[§3] → 4-3 线编号 LaserLabelerCUDA×2[§4] → 4-4 中心提取 StegerExtractorFast×2[§5] → 4-5 去畸变 UndistortPointsCuda×2[§6·几何来自 handoff 无用户参数] → 4-6 极线插值 EpipolarInterpDualCuda×2(Labeled)[§7·无外置参数] → 4-7 标定版匹配 LaserMatchCuda(单实例)[§8] → 4-8 三维重建 LaserReconstructCuda(Q 按调用传入)[§9·窗口复用 plane_map] → 4-9/4-10/4-11 端点链/光心/外参优化（已退役，PJC 顶替）[§10] → PJC 投影机联合标定 ProjectorJointCalib[§11] → 5-3 激光外参温补 LaserExtrinsicCompensateCPU[§12·复用 temperature 组] → 4-14 温表生成 cmtt_cuda 主引擎(或 CPU 备用 curve_map_temp_table→curve_map/curve_map_cuda)[§13]。§1 为跨步骤全局项。",
-
   "_audit": "代码对照审核结论（2026-10-08，对照 laser_calib_cli.cpp 装配段＋各算子 Params 结构＋calib_io 装载器）——【已收录核对一致】ccl/label/steger/match/pjc(含验收七阈)/cmtt/temperature/plane_map/rectify 全部与 ops 结构逐键一致。【装载器支持、本库原未显式写出→本次补显式】mask.highlightErodeSize/highlightDilateSize（补 0/13＝编译默认，0=关闭，行为不变）；lineIds（顶层键，省略＝累积点云反推，有意不写）。【算子可设但 CLI 未接线——改本库无效，需改代码才能外置】① mask_extract.morphApprox（默认 0，形态学降维开关）；② ccl.maxArea（默认 100000，组件面积上限）；③ laser_label.maxLabels（默认 256）/centerColOffset（默认 0，竖切模式列偏移）/splitMergedRuns（默认 true，粘连游程二分）；④ epipolar_interp_dual 的 epipolar_row_step（默认 0.7）/window_offset（-1 自动）/max_x_diff（1.0）——⚠ 4-6 行栅格默认 0.7 与 4-7 laser_match 行桶默认 0.5 不一致且两者均未接线，建议人工确认口径；⑤ laser_match 的 epipolar_row_step（默认 0.5）/min_disparity（默认 0）；⑥ curve_map 的 maxGap（默认 8，覆盖空洞告警）/uSampleStep（默认 -1 自动）。4-5 undistort_cuda/4-8 recon/5-3 compensate 的几何与窗口全由 handoff 或既有参数组派生，无独立缺口。",
-
   "_sec_1": "═══════ §1 全局运行（跨步骤） ═══════",
-
   "_c_deviceId": "GPU 卡号（注入所有 CUDA 算子）。单卡机器保持 0。",
   "deviceId": 0,
   "_c_f7Threads": "PJC(§11) 的 F7 漂移解并发线程数。作用＝标定提速（28 任务并发）；0＝自动 min(核−2,8)、1＝串行；性能类参数，结果与线程数无关（确定性已对拍验证）。",
@@ -21,9 +17,7 @@
     "_c_flags": "cv::stereoRectify 标志位。1＝CALIB_ZERO_DISPARITY（主点行对齐，极线水平的根基），不动。",
     "flags": 1
   },
-
   "_sec_2": "═══════ §2 · 步骤 4-1 激光掩膜（MaskExtractCUDA ×2） ═══════",
-
   "_c_mask_doc": "从原图二值出激光区域（厂家 mask_extract 老形态，与扫描侧 mask_separation 不是同一算子）。morphApprox/maxArea 类未接线项见 _audit。",
   "mask": {
     "_c_threshold": "二值化阈值。作用＝第一杠杆：调低→暗线也进来（点多噪声多），调高→只留亮线芯（产线结论 120 可救回暗线帧）。",
@@ -39,9 +33,7 @@
     "_c_highlightDilateSize": "高光分离·高光模板回扩膨胀核（px；仅 highlightErodeSize>0 时生效）。取值≈能覆盖 hlErode 腐蚀后的高光原边界（经验 13）。",
     "highlightDilateSize": 13
   },
-
   "_sec_3": "═══════ §3 · 步骤 4-2 连通域（RegionAnalyzerCUDA ×2） ═══════",
-
   "_c_ccl_doc": "把掩膜里的线框成候选组件。maxArea（组件面积上限，算子默认 100000）未外置，见 _audit②。",
   "ccl": {
     "_c_minArea": "组件面积下限（px²）。0＝关闭（由 topX 主裁）。",
@@ -49,9 +41,7 @@
     "_c_topXCount": "只留面积前 X 大组件。27＝25 条线＋2 余量，挡零散杂块。",
     "topXCount": 27
   },
-
   "_sec_4": "═══════ §4 · 步骤 4-3 激光线编号（LaserLabelerCUDA ×2，含两道整帧安检门） ═══════",
-
   "_c_laser_label_doc": "给每条线贴 1..25 号牌；编号按位置顺序排，错一截后段全错位，故设双门禁整帧拦截。maxLabels/centerColOffset/splitMergedRuns 未外置，见 _audit③。",
   "laser_label": {
     "_c_scanDirection": "线形态选择。0＝竖切中心列（水平多线形态）；1＝横切中心行（斜线形态）。2026-10-12 起主库基线＝1（对齐 laser261006-1668 斜线形态）；水平多线数据集在其 config.json 写 0。",
@@ -68,9 +58,7 @@
     "maxRunWidth": 30,
     "_doc_gate": "门1: 编号后线数!=25 整帧拒(编号按位置顺序无绝对锚定,中部缺线/粘连致后段错位); 门2: 扫描线切割游程展布>30px 判粘连整帧拒(1688x1400 斜线形态实测: 正常线宽12-22px/双线粘连>=38px, laser261006-1668 事故 2026-10-07)"
   },
-
   "_sec_5": "═══════ §5 · 步骤 4-4 中心提取（StegerExtractorFast ×2） ═══════",
-
   "_c_steger_doc": "沿激光线法向找亚像素亮脊中心（与扫描侧 steger_fast 同族；灰度＋线号掩膜输入）。",
   "steger": {
     "_c_sigma": "高斯尺度（≈半个线宽）。细线 1.5；晕染偏粗线 2~4——σ 太小粗线响应弱提不出来、太大相邻线糊在一起。",
@@ -89,39 +77,27 @@
     "dedupMode": 1,
     "_doc_widthGate": "逐点宽度门禁(平滑后口径 w=sqrt(g/|λ|), 0=off 基线)。正常线(全宽4-5px,σ=1.5) w≈2.4; 过曝/平顶 w>=16。启用时按数据集标定(建议5-8起)"
   },
-
   "_sec_6": "═══════ §6 · 步骤 4-5 去畸变（UndistortPointsCuda ×2）——无用户参数 ═══════",
-
   "_c_undistort_doc": "把 4-4 的中心点搬到矫正坐标系。K/D/R/P 全部来自 handoff（模块1 相机标定：L 路 K_L/D_L/R1/P1、R 路 K_R/D_R/R2/P2；P 只取 3×3 内参部分，平移项置零）——几何随标定走，无用户可调项；deviceId 复用 §1。",
-
   "_sec_7": "═══════ §7 · 步骤 4-6 极线插值（EpipolarInterpDualCuda ×2，Labeled 模式）——无外置参数 ═══════",
-
   "_c_interp_doc": "按线号把矫正点整理到极线栅格（Labeled 路径＝opt 内核逐位等价）。CLI 只接线 deviceId＋mode=Labeled；epipolar_row_step（算子默认 0.7）/window_offset（-1 自动）/max_x_diff（1.0）均未外置——⚠ 其中行栅格默认 0.7 与 4-7 行桶默认 0.5 不一致，详见 _audit④，如需统一应改代码接线。",
-
   "_sec_8": "═══════ §8 · 步骤 4-7 标定版匹配（LaserMatchCuda，单实例 L+R） ═══════",
-
   "_c_match_doc": "左右目有号配对（消费 4-6 的插值点＋线号）。max_disparity 由 Q/depthMin/marginFactor 派生；epipolar_row_step（默认 0.5）/min_disparity（默认 0）未外置，见 _audit⑤。",
   "match": {
     "_c_disparityMarginFactor": "匹配视差上界放宽系数。上界＝f·Tx/depthMin×此系数；1.05＝放宽 5% 容差余量（防几何边界上的真对被卡）。",
     "disparityMarginFactor": 1.05
   },
-
   "_sec_9": "═══════ §9 · 步骤 4-8 三维重建（LaserReconstructCuda）——无独立参数 ═══════",
-
   "_c_recon_doc": "匹配对＋Q 三角化出 3D 点（Q 按调用从 handoff 传入）。深度窗复用 §13 plane_map 组的 depthMin/depthMax；deviceId 复用 §1——无独立可调项。",
-
   "_sec_10": "═══════ §10 · 步骤 4-9/4-10/4-11（已退役） ═══════",
-
   "_c_retired_doc": "旧端点链 endpoint_extract／光心求解 virtual_camera_pose／外参优化 pose_optimize——2026-08-25 起由 §11 PJC 一步顶替（源码存 operators/retired/，CLI 不再调用）。列出仅为流程完整性。",
-
   "_sec_11": "═══════ §11 · PJC 投影机联合标定（ProjectorJointCalib——整条激光标定的数学核心） ═══════",
-
   "_c_pjc_doc": "解投影机光心 t ＋ 25 条发射曲线（模型 t(3)+C(6)，R=I、K=f+主点固定）。产物是 §13 温表的几何真源。f/主点/初始 t 来自 handoff 与累积点云，非用户参数。",
   "pjc": {
     "_c_maxIterations": "LM 迭代上限。不收敛时加大无益，先查数据质量。",
     "maxIterations": 100,
     "_c_convergenceThreshold": "收敛判据：参数更新量低于此即停。",
-    "convergenceThreshold": 1e-8,
+    "convergenceThreshold": 1e-08,
     "_c_minPoses": "最少姿态数（数据量门槛）。低于此不解算。",
     "minPoses": 5,
     "_c_minPointsPerPose": "每姿态最少参与点数。低于此的姿态被剔除。",
@@ -172,13 +148,9 @@
       "a7MaxBasinSpread": 0.5
     }
   },
-
   "_sec_12": "═══════ §12 · 步骤 5-3 激光外参温补（LaserExtrinsicCompensateCPU）——复用 temperature 组 ═══════",
-
   "_c_lecp_doc": "按温度把虚拟相机位姿外推成 61 档（cte/tempStep/tempRangeMin/Max 全部复用 §13 temperature 组，无独立键）。",
-
   "_sec_13": "═══════ §13 · 步骤 4-14 温表生成（CMTT：cmtt_cuda 主引擎 / curve_map_temp_table CPU 备用 → curve_map/curve_map_cuda） ═══════",
-
   "_c_temperature_doc": "【温补骨架】61 档温度表的覆盖范围与外推比例尺（供 5-3 温补与 4-14 逐档重标消费）。",
   "temperature": {
     "_c_cte": "热膨胀系数（/℃）。作用＝外推各温度档几何变化的比例尺；随设备材料定，不动。",
@@ -192,21 +164,19 @@
     "_c_tempStep": "档距（℃）。0.5＝每 0.5℃ 一档，运行时按名义温就近取整档直用。",
     "tempStep": 0.5
   },
-
   "_c_plane_map_doc": "【栅格与深度窗】标定链几何采样的空间口径（4-6 行距语义、4-7 视差界、4-8 深度窗、curve_map/CMTT 表生成共用）。",
   "plane_map": {
     "_c_gridStep": "采样栅格密度（px）。作用＝几何采样的空间分辨率；一般不动。",
     "gridStep": 0.5,
     "_c_depthMin": "深度收录窗下限（mm）。作用＝比这近的重建点不进表不参与；同时派生 4-7 匹配视差上界；⚠ 红线：随标定走（CMTT 表头同值），不在此随意改。2026-10-13 人工指令改 100→200（与设备实际工作距对齐；同批 10 档实验产物见 test_data/laser261006-1668/cmtt_4deg_10tiers_dw200_500/）。",
-    "depthMin": 200.0,
+    "depthMin": 100.0,
     "_c_depthMax": "深度收录窗上限（mm）。同上，窗外远点丢弃（4-8 recon 同窗）；按设备最远工作距离定。2026-10-13 人工指令改 5000→500。",
-    "depthMax": 500.0,
+    "depthMax": 1000.0,
     "_c_depthSamples": "深度方向采样点数（旧 plane_map 链消费）。",
     "depthSamples": 200,
     "_c_epipolarStep": "极线行距（px）。⚠ 全局 rowStep 的实际生效口径＝从本组读取（非算子默认 0.7，曾因口径混淆出过条目数差半的事故）；CLI 将它注入 4-14 CMTT 的 cmp.rowStep 与 PJC 产物 epipolarRowStep。CMTT 表 rowStep 与扫描端 interp 行距必须一致，动了整条链错位（注意：4-6/4-7 算子自身的 epipolar_row_step 未接线、用算子默认，见 _audit④⑤）。2026-10-12 起基线＝0.67＝round2(P1焦距/原始左目fx)＝round2(1231.1388/1839.6028)——本机型矫正缩放比（0.67 格≈1.0 原像素，原生采样密度；0.5 为 1.34× 过采样），换机型按同公式重算。键位预算@W=1688/ROI 1163×878/25 线：uLq≤1688/0.67≈2519≤4095 ✓，bucket≈878/0.67×25≈32775≤65535 ✓。",
     "epipolarStep": 0.67
   },
-
   "_c_cmtt_doc": "【引擎设置】curve_map 61 档 sidecar 的生成引擎。",
   "cmtt": {
     "_c_tempStep": "4-14 档距（℃）。2026-10-13 外置并定稿 4.0（原 CLI 硬编码 0.5/对称 61 档退役为兼容默认）。",
