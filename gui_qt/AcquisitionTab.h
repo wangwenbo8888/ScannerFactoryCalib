@@ -2,6 +2,7 @@
 
 #include <QWidget>
 #include <QImage>
+#include <QSpinBox>
 #include <memory>
 #include <atomic>
 #include <condition_variable>
@@ -37,6 +38,9 @@ public:
     ~AcquisitionTab() override;
 
 signals:
+    // 261108 采集参数实时判定报告（回调线程分析 → UI 线程刷新右侧面板）
+    void updateJudge(QString report);
+    void autoTuneRequest(int bgDelta, int laserDelta, double expFactor, int ctrDelta);   // 261108 V2
     void statusMessage(QString msg);
     // 照搬 LeadScanK2：左右配对后 emit updateImages(QImage,QImage)，QueuedConnection 到 onUpdateImages
     void updateImages(QImage left, QImage right);
@@ -63,6 +67,8 @@ private slots:
     void onStartScanner();       // 发 N10 启动扫描仪 + 自动开始实时预览
     void onStopScanner();        // 发 N11 停止扫描仪 + 停止预览
     void onUpdateImages(QImage left, QImage right);  // 照搬 LeadScanK2 onUpdateImages
+    void onUpdateJudge(QString report);   // 261108 采集参数实时判定（右侧面板）
+    void onAutoTune(int bgDelta, int laserDelta, double expFactor, int ctrDelta);   // 261108 V2
 
 public:
     // 照搬 LeadScanK2 setLeftImage/setRightImage：由相机回调线程调用，配对后 emit updateImages
@@ -158,6 +164,15 @@ private:
     PreviewWidget* leftPreview_  = nullptr;
     PreviewWidget* rightPreview_ = nullptr;
     QLabel* leftInfoLbl_  = nullptr;
+    // 261108 采集参数实时判定面板（预览行第三列）
+    QLabel* judgeLbl_ = nullptr;          // 富文本判定报告
+    QSpinBox* judgeExpectSpin_ = nullptr; // 目标线数（左斜/右斜 25、精细 7）
+    int judgeSkip_ = 0;                   // 分析降频计数（每 10 对分析一次 ≈3Hz）
+    std::atomic<int> judgeExpect_{25};    // spin 的回调线程安全缓存
+    // 261108 自动调参 V1（补光/激光两参，N10 重发；曝光/增益留 V2）
+    std::atomic<bool> autoTuneOn_{false};
+    std::atomic<long long> lastTuneNs_{0};
+    QPushButton* autoTuneBtn_ = nullptr;
     QLabel* rightInfoLbl_ = nullptr;
 
     // —— 保存 ——

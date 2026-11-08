@@ -37,6 +37,9 @@
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
+// 261108 目标线数全局缓存（analyzeShot 为 static 函数访问不到成员；spin 变更时同步）
+static std::atomic<int> judgeExpectGlobal{25};
+
 #include <spdlog/spdlog.h>
 #include <QTransform>
 #include <atomic>
@@ -273,6 +276,41 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
     rightCol->addWidget(rightInfoLbl_);
     previewRow->addLayout(leftCol, 1);
     previewRow->addLayout(rightCol, 1);
+    // —— 261108 采集参数实时判定列（右侧）——
+    // 三指标（261108 两批左斜数据标定的窗口）：过曝 2.8~5.0%（右斜成功批
+    // 3.89%）、游程>30px=0（斜线正常 8~22）、中部行线数=目标±1；双眼全过
+    // 才显示「可以采集」。调亮度档时看此面板，绿灯后再正式采集。
+    auto* judgeCol = new QVBoxLayout;
+    auto* judgeTitleRow = new QHBoxLayout;
+    judgeTitleRow->addWidget(new QLabel(QStringLiteral("采集参数判定")));
+    judgeExpectSpin_ = new QSpinBox;
+    judgeExpectSpin_->setRange(1, 40);
+    judgeExpectSpin_->setValue(25);
+    judgeExpectSpin_->setToolTip(QStringLiteral(
+        "目标线数：左斜/右斜=25，精细=7。与 4-3 门禁 expectedLineCount 同值"));
+    judgeTitleRow->addWidget(new QLabel(QStringLiteral("目标线数")));
+    judgeTitleRow->addWidget(judgeExpectSpin_);
+    autoTuneBtn_ = new QPushButton(QStringLiteral("自动调节"));
+    autoTuneBtn_->setCheckable(true);
+    autoTuneBtn_->setToolTip(QStringLiteral(
+        "开启后按判定自动调 补光/激光 档（每次 1 步、800ms 节流、绿灯自停）。\n"
+        "规则：背景>25 降补光 / 过曝>5.5% 降激光 / 过曝<2.5%且线暗 升激光。\n"
+        "手动滑杆随时可覆盖（关自动后）。"));
+    judgeTitleRow->addWidget(autoTuneBtn_);
+    judgeTitleRow->addStretch(1);
+    judgeCol->addLayout(judgeTitleRow);
+    judgeLbl_ = new QLabel(QStringLiteral(
+        "<p style='color:#888;'>（采集预览后实时判定）</p>"
+        "<p>①过曝占比 目标 2.8~5.0%</p>"
+        "<p>②游程>30px 目标 0（无粘连）</p>"
+        "<p>③线数 = 目标±1（双眼）</p>"));
+    judgeLbl_->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+    judgeLbl_->setWordWrap(true);
+    judgeLbl_->setMinimumWidth(220);
+    judgeLbl_->setStyleSheet(
+        "background:#fafafa; border:1px solid #d0d0d0; border-radius:4px; padding:8px;");
+    judgeCol->addWidget(judgeLbl_, 1);
+    previewRow->addLayout(judgeCol, 0);
     root->addLayout(previewRow, 4);
 
     // —— 保存（用户确认后才落盘）——
@@ -315,6 +353,19 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
     });
     // 照搬 LeadScanK2：updateImages 配对双张，Qt::QueuedConnection
     connect(this, SIGNAL(updateImages(QImage,QImage)), this, SLOT(onUpdateImages(QImage,QImage)), Qt::QueuedConnection);
+    // 261108 采集参数实时判定（右侧面板）
+    connect(this, SIGNAL(updateJudge(QString)), this, SLOT(onUpdateJudge(QString)), Qt::QueuedConnection);
+    connect(this, SIGNAL(autoTuneRequest(int,int,double,int)), this, SLOT(onAutoTune(int,int,double,int)), Qt::QueuedConnection);
+    if (autoTuneBtn_)
+        connect(autoTuneBtn_, &QPushButton::toggled, this, [this](bool on) {
+            autoTuneOn_.store(on);
+            autoTuneBtn_->setText(on ? QStringLiteral("调节中…(点停)")
+                                      : QStringLiteral("自动调节"));
+        });
+    connect(judgeExpectSpin_, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
+        judgeExpect_.store(v, std::memory_order_relaxed);
+        judgeExpectGlobal.store(v, std::memory_order_relaxed);
+    });
     connect(freqSlider_,      &QSlider::valueChanged, this, [this](int v){
         freqValLbl_->setText(QString::number(v));
     });
@@ -1092,6 +1143,58 @@ QImage convertMattoQImage(cv::Mat& mat) {
     }
     return QImage();
 }
+
+// 261108 采集参数判定（口径与 tools/calib_shot_monitor.py 同源）：
+// 过曝占比 / 游程>30px 计数 / 中部行线数估计。mask 阈值 120 与标定 config 同口径。
+struct ShotMetrics {
+    double hotPct = 0.0;
+    int wideRuns = 0;
+    int lineEst = 0;
+    double bg = 0.0;   // 261108 背景灰度（环境光泄漏指标——右斜 PASS 批
+                       // 14~19 稳定 vs 左斜 28~55 波动即残差 6.5 主因）
+};
+static ShotMetrics analyzeShot(const cv::Mat& full) {
+    ShotMetrics m;
+    if (full.empty()) return m;
+    // 261108 提速：0.25 降采样（全分辨率 CCL ~40ms 回调线程阻塞＝判定滞后
+    // 主因；降采样后 ~3ms。比例类指标（过曝/背景）不变；尺寸门等比 /4、
+    // 面积门 /16）
+    cv::Mat gray;
+    cv::resize(full, gray, cv::Size(), 0.25, 0.25, cv::INTER_AREA);
+    const int hot = cv::countNonZero(gray > 235);
+    m.hotPct = 100.0 * hot / (gray.rows * gray.cols);
+    m.bg = cv::mean(gray)[0];
+    cv::Mat bw;
+    cv::threshold(gray, bw, 120, 255, cv::THRESH_BINARY);
+    // 线数＝CCL 大组件数（v4 终版：逐行游程受断口/扇面稀疏行干扰不可用
+    // 〔p50=17/max=27 实证〕；组件数为 4-3 同源口径，噪声以 0.7×第 N 大
+    // 面积门滤除；判据放宽 ±3＝辅助级——肉眼数线，面板主打过曝/粘连）
+    cv::Mat labels, statsv, centv;
+    const int n = cv::connectedComponentsWithStats(bw, labels, statsv, centv, 8);
+    std::vector<int> areas;
+    for (int i = 1; i < n; ++i) {
+        const int area = statsv.at<int>(i, cv::CC_STAT_AREA);
+        const int hh = statsv.at<int>(i, cv::CC_STAT_HEIGHT);
+        const int ww = statsv.at<int>(i, cv::CC_STAT_WIDTH);
+        if (area >= 32 && std::max(hh, ww) >= 13)
+            areas.push_back(area);
+    }
+    std::sort(areas.begin(), areas.end(), std::greater<int>());
+    const int expect = judgeExpectGlobal.load(std::memory_order_relaxed);
+    if (!areas.empty()) {
+        const int nth = areas[std::min<size_t>(areas.size() - 1,
+                                               static_cast<size_t>(std::max(1, expect) - 1))];
+        const int gate = static_cast<int>(0.7 * nth);
+        m.lineEst = static_cast<int>(
+            std::count_if(areas.begin(), areas.end(),
+                          [gate](int a) { return a >= gate; }));
+        // 粘连＝最大组件 > 2.8×第 expect 大（两线粘连≈2 倍面积）
+        if (static_cast<int>(areas.size()) >= expect && expect >= 1
+            && nth >= 1000 && areas.front() > 3.2 * nth)
+            m.wideRuns = 1;
+    }
+    return m;
+}
 }  // namespace
 
 // 左右帧配对（SDK 回调线程调用）：轮次制——左右各有未消费新帧即成一对，后到者触发。
@@ -1122,6 +1225,106 @@ void AcquisitionTab::setLeftImage(cv::Mat& left, uint64_t id) {
         leftFresh_ = rightFresh_ = false;
     }
     ++pairCount_;
+    ++pairCount_;
+    // 261108 采集参数判定：每 3 对（≈10Hz）分析一次（0.25 降采样 ~3ms）
+    if (doPreview && !pairL.empty() && !pairR.empty()) {   // 261108 每对分析（3ms 无压力——滞后主因曾是间隔+全图CCL）
+        const ShotMetrics mlRaw = analyzeShot(pairL);
+        const ShotMetrics mrRaw = analyzeShot(pairR);
+        // 两帧滑动平均（调参抖动滤波；首帧直通）
+        static ShotMetrics pmL, pmR;
+        static bool hasPrev = false;
+        ShotMetrics ml = mlRaw, mr = mrRaw;
+        if (hasPrev) {
+            ml.hotPct = 0.5 * (ml.hotPct + pmL.hotPct); ml.bg = 0.5 * (ml.bg + pmL.bg);
+            mr.hotPct = 0.5 * (mr.hotPct + pmR.hotPct); mr.bg = 0.5 * (mr.bg + pmR.bg);
+        }
+        pmL = mlRaw; pmR = mrRaw; hasPrev = true;
+        const int expect = judgeExpect_.load(std::memory_order_relaxed);
+        auto oneEye = [&](const char* tag, const ShotMetrics& m) {
+            const bool okHot = m.hotPct <= 5.0;   // 261108 下限取消：过曝低无罪（线亮由线数反映），上限防粘连
+            // 粘连为信息项不参与判定（碎组件基线失真误报实证；肉眼易辨）
+            const bool okWide = true;
+            const bool okLines = std::abs(m.lineEst - expect) <= 5;
+            const bool okBg = m.bg >= 5.0 && m.bg <= 25.0;
+            QString s = QString("%1眼：过曝%2 %3 背景%4 %5 线数%6 %7")
+                .arg(tag, QString::number(m.hotPct, 'f', 2) + "%", okHot ? "✓" : "✗")
+                .arg(QString::number(m.bg, 'f', 0), okBg ? "✓" : "✗")
+                .arg(QString::number(m.wideRuns) + "条", okWide ? "✓" : "✗")
+                .arg(QString::number(m.lineEst), okLines ? "✓" : "✗");
+            return s;
+        };
+        const char* now = QDateTime::currentDateTime().toString("HH:mm:ss").toUtf8().constData();
+        QString report = QString("<span style='color:#888;'>[%1]</span><br>").arg(now)
+                       + oneEye("L", ml) + "<br>" + oneEye("R", mr);
+        const bool allL = (ml.hotPct <= 5.0
+                           && ml.bg >= 5.0 && ml.bg <= 25.0
+                           && std::abs(ml.lineEst - expect) <= 5);
+        const bool allR = (mr.hotPct <= 5.0
+                           && mr.bg >= 5.0 && mr.bg <= 25.0
+                           && std::abs(mr.lineEst - expect) <= 5);
+        if (allL && allR) {
+            report = "<p style='color:#1a7f37; font-weight:bold;'>✅ 可以采集（双眼全过，按此档采满 pose）</p>" + report;
+        } else {
+            QString tip;
+            for (const ShotMetrics* m : {&ml, &mr}) {
+                const char* tag = (m == &ml) ? "L" : "R";
+                if (m->lineEst < expect - 5) tip += QString("%1眼线数不足→升亮度/激光档半档；").arg(tag);
+                if (m->lineEst > expect + 5) tip += QString("%1眼多线→降补光/激光档；").arg(tag);
+                if (m->hotPct > 5.0) tip += QString("%1眼过曝→降激光档；").arg(tag);
+                if (m->bg > 25.0) tip += QString("%1眼背景%2高→关补光/挡环境光；").arg(tag).arg(int(m->bg));
+            }
+            report = QString("<p style='color:#b3261e; font-weight:bold;'>✗ 继续调整</p>")
+                   + report + "<br><span style='color:#b3261e;'>" + tip + "</span>";
+        }
+        emit updateJudge(report);
+        // 261108 绿灯→自动停止＋完成提示（一次性任务语义）
+        if (autoTuneOn_.load(std::memory_order_relaxed) && (allL && allR)) {
+            emit autoTuneRequest(0, 0, 1.0, 0);
+        }
+        // 261108 V2 分层解耦（曝光对数步进/背光/激光/对比度兜底）：
+        //   背景>25：背光有→降背光；否则降曝光；曝光到底→升对比度（压暗背景）
+        //   过曝>5.5%：降激光；激光到底→降对比度（压高亮）
+        //   过曝<2.5%且线暗：升激光；激光满→升曝光（背景<20）；到顶→升对比度
+        //   背景<5：升曝光
+        if (autoTuneOn_.load(std::memory_order_relaxed) && !(allL && allR)) {
+            const long long nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (nowNs - lastTuneNs_.load() > 800000000LL) {
+                const double bgMax = std::max(ml.bg, mr.bg);
+                const double bgMin = std::min(ml.bg, mr.bg);
+                const double hotMax = std::max(ml.hotPct, mr.hotPct);
+                const double hotMin = std::min(ml.hotPct, mr.hotPct);
+                const bool linesLow = ml.lineEst < expect - 3 && mr.lineEst < expect - 3;
+                const bool bgAt0 = !bgLightSlider_ || bgLightSlider_->value() == 0;
+                const bool expAtLo = !exposureSpin_ || exposureSpin_->value() <= 100.0;
+                const bool expAtHi = !exposureSpin_ || exposureSpin_->value() >= 1000000.0;
+                const bool lsrAt0 = !laserSlider_ || laserSlider_->value() == 0;
+                const bool lsrAtHi = !laserSlider_ || laserSlider_->value() == 100;
+                int bgD = 0, lsrD = 0, ctrD = 0;
+                double expF = 1.0;
+                if (bgMax > 25.0) {
+                    if (!bgAt0) bgD = -5;
+                    else if (!expAtLo) expF = 0.8;
+                    else ctrD = +5;          // 对比度兜底：拉伸压暗背景
+                } else if (bgMin < 5.0) {
+                    if (!expAtHi) expF = 1.25;
+                    else if (!lsrAtHi) lsrD = +5;
+                } else if (hotMax > 5.5) {
+                    if (!lsrAt0) lsrD = -5;
+                    else if (!expAtLo) expF = 0.8;
+                    else ctrD = -5;          // 压高亮
+                } else if (hotMin < 2.5 && linesLow) {
+                    if (!lsrAtHi) lsrD = +5;
+                    else if (!expAtHi && bgMax < 20.0) expF = 1.25;
+                    else ctrD = +5;          // 提线对比
+                }
+                if (bgD != 0 || lsrD != 0 || expF != 1.0 || ctrD != 0) {
+                    lastTuneNs_.store(nowNs);
+                    emit autoTuneRequest(bgD, lsrD, expF, ctrD);
+                }
+            }
+        }
+    }
     if (doPreview) {
         cv::Mat reducedLeft, reducedRight;
         cv::resize(pairL, reducedLeft, cv::Size(), 0.25, 0.25, cv::INTER_AREA);
@@ -1173,6 +1376,80 @@ void AcquisitionTab::onUpdateImages(QImage left, QImage right) {
     if (!frozenLeft_.empty()) {
         saveCameraBtn_->setEnabled(true);   // 有显示帧才能保存
         saveLaserBtn_->setEnabled(true);
+    }
+}
+
+// 261108 采集参数实时判定刷新（回调线程分析 → 此处 UI 线程渲染）
+void AcquisitionTab::onUpdateJudge(QString report) {
+    if (judgeLbl_) judgeLbl_->setText(report);
+}
+
+// 261108 自动调参执行（UI 线程）：滑杆步进 + N10 重发（扫描中参数热更）
+void AcquisitionTab::onAutoTune(int bgDelta, int laserDelta, double expFactor, int ctrDelta) {
+    if (bgDelta == 0 && laserDelta == 0 && expFactor == 1.0 && ctrDelta == 0) {   // 绿灯停止
+        autoTuneOn_.store(false);
+        if (autoTuneBtn_) {
+            autoTuneBtn_->setChecked(false);
+            autoTuneBtn_->setText(QStringLiteral("自动调节"));
+        }
+        emit statusMessage(QStringLiteral(
+            "✅ 自动调节完成——判定全绿，可以开始采集"));
+        if (judgeLbl_)
+            judgeLbl_->setText(QStringLiteral(
+                "<p style='color:#1a7f37; font-weight:bold;'>✅ 调节完成，可以采集</p>")
+                + judgeLbl_->text());
+        return;
+    }
+    // 边界检测：方向要求超出滑杆范围→停（提示手动介入）
+    const bool expStuck = exposureSpin_
+        && ((expFactor < 1.0 && exposureSpin_->value() <= 100.0)
+         || (expFactor > 1.0 && exposureSpin_->value() >= 1000000.0));
+    const bool bgStuck = bgLightSlider_
+        && ((bgDelta < 0 && bgLightSlider_->value() == 0)
+         || (bgDelta > 0 && bgLightSlider_->value() == 100));
+    const bool lsrStuck = laserSlider_
+        && ((laserDelta < 0 && laserSlider_->value() == 0)
+         || (laserDelta > 0 && laserSlider_->value() == 100));
+    const bool ctrStuck = contrastLSlider_
+        && ((ctrDelta > 0 && contrastLSlider_->value() >= contrastLSlider_->maximum())
+         || (ctrDelta < 0 && contrastLSlider_->value() <= contrastLSlider_->minimum()));
+    if (bgStuck || lsrStuck || expStuck || ctrStuck) {
+        autoTuneOn_.store(false);
+        if (autoTuneBtn_) {
+            autoTuneBtn_->setChecked(false);
+            autoTuneBtn_->setText(QStringLiteral("自动调节"));
+        }
+        emit statusMessage(QStringLiteral(
+            "⚠ 自动调节到达档位边界仍未达标——请手动检查（环境光/增益/曝光）"));
+        return;
+    }
+    if (bgDelta != 0 && bgLightSlider_) {
+        const int v = qBound(0, bgLightSlider_->value() + bgDelta, 100);
+        bgLightSlider_->setValue(v);   // 触发标签刷新
+    }
+    if (laserDelta != 0 && laserSlider_) {
+        const int v = qBound(0, laserSlider_->value() + laserDelta, 100);
+        laserSlider_->setValue(v);
+    }
+    // 重发 N10（参数热更——照抄 onStartScanner 的组包；仅扫描中生效）
+    if (scanner_ && scanner_->isOpen() && previewing_) {
+        ScannerParams p;
+        p.freq = freqSlider_->value();
+        p.background = bgLightSlider_->value();
+        p.laser = laserSlider_->value();
+        const int mode = scannerModeCbx_->currentData().toInt();
+        switch (mode) {
+            case 1: p.tubeT = 1; break;
+            case 2: p.tubeV = 1; break;
+            case 3: p.tubeD = 1; break;
+            case 4: p.tubeC = 1; break;
+            case 5: p.tubeE = 1; break;
+            default: p.laser = 0; break;
+        }
+        scanner_->start(p);
+        if (judgeLbl_)
+            judgeLbl_->setText(judgeLbl_->text()
+                + QStringLiteral("<br><span style='color:#1a73e8;'>⚙ 自动调整中…</span>"));
     }
 }
 
