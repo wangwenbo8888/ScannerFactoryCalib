@@ -96,6 +96,10 @@ struct LaserOpParams {
     float stegerMaxLineWidth  = 0.0f;
     // 4-4 steger 平顶双点去重（2026-10-13 自 09 侧移植; 0=Off 基线, 1=Centroid）
     int   stegerDedupMode     = 0;
+    // 261107 提取器选择（"steger"=默认 / "flat"=FlatCenterExtractor——宽带
+    // 数据集标定/实扫口径契约；参数走 flatJson 独立组）
+    std::string stegerExtractor = "steger";
+    nlohmann::json flatJson;   // "flat" 组原文（空=FlatCenterParams 默认）
     // 4-7 match：视差上界 = |f·Tx| / depthMin × 本系数
     double matchDisparityMarginFactor = 1.05;
     // PJC（对齐 ProjectorJointCalibParams 字段）

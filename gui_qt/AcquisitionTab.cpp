@@ -1244,7 +1244,8 @@ void AcquisitionTab::setLeftImage(cv::Mat& left, uint64_t id) {
             const bool okHot = m.hotPct <= 5.0;   // 261108 下限取消：过曝低无罪（线亮由线数反映），上限防粘连
             // 粘连为信息项不参与判定（碎组件基线失真误报实证；肉眼易辨）
             const bool okWide = true;
-            const bool okLines = std::abs(m.lineEst - expect) <= 5;
+            const int lineTol = expect >= 15 ? 5 : 2;   // 261108 自适应：25线±5、7线±2（fine 基线 7~9 实证）
+            const bool okLines = std::abs(m.lineEst - expect) <= lineTol;
             const bool okBg = m.bg >= 5.0 && m.bg <= 25.0;
             QString s = QString("%1眼：过曝%2 %3 背景%4 %5 线数%6 %7")
                 .arg(tag, QString::number(m.hotPct, 'f', 2) + "%", okHot ? "✓" : "✗")
@@ -1258,18 +1259,18 @@ void AcquisitionTab::setLeftImage(cv::Mat& left, uint64_t id) {
                        + oneEye("L", ml) + "<br>" + oneEye("R", mr);
         const bool allL = (ml.hotPct <= 5.0
                            && ml.bg >= 5.0 && ml.bg <= 25.0
-                           && std::abs(ml.lineEst - expect) <= 5);
+                           && std::abs(ml.lineEst - expect) <= (expect >= 15 ? 5 : 2));
         const bool allR = (mr.hotPct <= 5.0
                            && mr.bg >= 5.0 && mr.bg <= 25.0
-                           && std::abs(mr.lineEst - expect) <= 5);
+                           && std::abs(mr.lineEst - expect) <= (expect >= 15 ? 5 : 2));
         if (allL && allR) {
             report = "<p style='color:#1a7f37; font-weight:bold;'>✅ 可以采集（双眼全过，按此档采满 pose）</p>" + report;
         } else {
             QString tip;
             for (const ShotMetrics* m : {&ml, &mr}) {
                 const char* tag = (m == &ml) ? "L" : "R";
-                if (m->lineEst < expect - 5) tip += QString("%1眼线数不足→升亮度/激光档半档；").arg(tag);
-                if (m->lineEst > expect + 5) tip += QString("%1眼多线→降补光/激光档；").arg(tag);
+                if (m->lineEst < expect - (expect >= 15 ? 5 : 2)) tip += QString("%1眼线数不足→升亮度/激光档半档；").arg(tag);
+                if (m->lineEst > expect + (expect >= 15 ? 5 : 2)) tip += QString("%1眼多线→降补光/激光档；").arg(tag);
                 if (m->hotPct > 5.0) tip += QString("%1眼过曝→降激光档；").arg(tag);
                 if (m->bg > 25.0) tip += QString("%1眼背景%2高→关补光/挡环境光；").arg(tag).arg(int(m->bg));
             }

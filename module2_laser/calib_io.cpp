@@ -111,7 +111,14 @@ void applyLaserParamsJson(const json& j, LaserCalibConfig& c, LaserOpParams& ops
         if (s.contains("maxLabels"))     ops.stegerMaxLabels     = s["maxLabels"].get<int>();
         if (s.contains("maxLineWidth"))  ops.stegerMaxLineWidth  = s["maxLineWidth"].get<float>();
         if (s.contains("dedupMode"))     ops.stegerDedupMode     = s["dedupMode"].get<int>();
+        // 261107 提取器选择：宽带数据集（如精细 7 竖带 30~100px）标定与
+        // 实扫必须同口径（带中心）——"flat" 切 FlatCenterExtractor，参数
+        // 走独立 "flat" 组（FlatCenterParams::fromJson 消费）
+        if (s.contains("extractor"))
+            ops.stegerExtractor = s["extractor"].get<std::string>();
     }
+    if (j.contains("flat") && j["flat"].is_object())
+        ops.flatJson = j["flat"];   // 原文透传（FlatCenterParams::fromJson）
     if (j.contains("match") && j["match"].is_object()) {
         const auto& m = j["match"];
         if (m.contains("disparityMarginFactor"))

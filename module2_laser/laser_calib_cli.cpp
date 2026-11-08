@@ -19,6 +19,7 @@
 #include "region_analyze_cuda.h"
 #include "laser_label_cuda.h"
 #include "steger_fast.h"           // 4-4 产线（2026-09-04 切换, 与原版逐位等价经全流程逐字节验证）
+#include "flat_center.h"           // 261107 4-4 宽带口径（精细竖带带中心——标定/实扫契约）
 #include "undistort_points_cuda.h"
 #include "epipolar_interp_dual_cuda.h"   // 4-6 产线（2026-09-04 切换, Labeled 路径与原版逐位等价）
 #include "laser_match_cuda.h"
@@ -288,6 +289,21 @@ int fc::runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
     StegerExtractorFast stegerR(stegerParams);
     spdlog::info("4-4 StegerExtractorFast x2 (L/R) constructed (maxLineWidth={}, dedupMode={})",
                  stegerParams.maxLineWidth, stegerParams.dedupMode);
+    // 261107 提取器口径契约：宽带数据集（精细 7 竖带）标定用 flat（带中心）
+    // ——与主工程实扫同口径；steger.extractor="flat" 切换（默认 steger 不变）
+    std::unique_ptr<FlatCenterExtractor> flatOpL, flatOpR;
+    if (ops.stegerExtractor == "flat") {
+        FlatCenterParams fp = ops.flatJson.is_object()
+            ? FlatCenterParams::fromJson(ops.flatJson)
+            : FlatCenterParams{};
+        fp.deviceId = cfg.deviceId;
+        flatOpL = std::make_unique<FlatCenterExtractor>(fp);
+        flatOpR = std::make_unique<FlatCenterExtractor>(fp);
+        spdlog::info("4-4 FlatCenterExtractor x2 (L/R) constructed "
+                     "(plateauRatio={}, plateauMinWidth={}, halfRatio={})",
+                     fp.plateauRatio, fp.plateauMinWidth, fp.halfRatio);
+    }
+    const bool useFlatExtractor = (flatOpL != nullptr);
 
     // ----- 4-5 UndistortPoints -----
     // 参数 K/D/R/P 来自 handoff（模块1 输出的内参 + 立体矫正）。
@@ -477,18 +493,30 @@ int fc::runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
                 ++framesSkip;
                 continue;
             }
-            auto stegerResL = stegerL.Execute(*maskResL.d_grayImage,
-                                              *labelResL.d_labeledMask,
-                                              stream, GroupMode::ByLabel);
-            auto stegerResR = stegerR.Execute(*maskResR.d_grayImage,
-                                              *labelResR.d_labeledMask,
-                                              stream, GroupMode::ByLabel);
+            auto stegerResL = useFlatExtractor
+                ? flatOpL->Execute(*maskResL.d_grayImage,
+                                   *labelResL.d_labeledMask,
+                                   stream, GroupMode::ByLabel)
+                : stegerL.Execute(*maskResL.d_grayImage,
+                                  *labelResL.d_labeledMask,
+                                  stream, GroupMode::ByLabel);
+            auto stegerResR = useFlatExtractor
+                ? flatOpR->Execute(*maskResR.d_grayImage,
+                                   *labelResR.d_labeledMask,
+                                   stream, GroupMode::ByLabel)
+                : stegerR.Execute(*maskResR.d_grayImage,
+                                  *labelResR.d_labeledMask,
+                                  stream, GroupMode::ByLabel);
             if (!stegerResL.success || !stegerResR.success) {
                 spdlog::warn("pose {} tube {}: 4-4 steger failed (L={}, R={}), skip",
                              pi, ti, stegerResL.success, stegerResR.success);
                 ++framesSkip;
                 continue;
             }
+            // 261107 行模式排障：逐帧点数+质量消息（drop 原因分布可见）
+            spdlog::info("pose {} tube {}: 4-4 L n={} [{}] | R n={} [{}]",
+                         pi, ti, stegerResL.totalPointCount, stegerResL.message,
+                         stegerResR.totalPointCount, stegerResR.message);
 
             // ----- 4-5 undistort (L + R) -----
             // Execute(d_points, d_line_ids, stream)
