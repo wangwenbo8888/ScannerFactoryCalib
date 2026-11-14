@@ -1443,8 +1443,8 @@ void AcquisitionTab::setLeftImage(cv::Mat& left, uint64_t id) {
             const bool okWide = m.maxRunWidthDs <= 8;
             const int lineTol = expect >= 15 ? 5 : 2;   // 261108 自适应：25线±5、7线±2（fine 基线 7~9 实证）
             const bool okLines = std::abs(m.lineEst - expect) <= lineTol;
-            const bool okBg = m.bg >= 5.0 && m.bg <= 25.0;
-            QString s = QString("%1眼：过曝%2 %3 背景%4 %5 线数%6 %7 游程%8px %9")
+            const bool okBg = true;   // 261114 背景改信息项——线数+游程是直接指标，背景只是间接风险提示
+            QString s = QString("%1眼：过曝%2 %3 背景%4 线数%5 %6 游程%7px %8")
                 .arg(tag, QString::number(m.hotPct, 'f', 2) + "%", okHot ? "✓" : "✗")
                 .arg(QString::number(m.bg, 'f', 0), okBg ? "✓" : "✗")
                 .arg(QString::number(m.lineEst), okLines ? "✓" : "✗")
@@ -1455,11 +1455,9 @@ void AcquisitionTab::setLeftImage(cv::Mat& left, uint64_t id) {
         QString report = QString("<span style='color:#888;'>[%1]</span><br>").arg(now)
                        + oneEye("L", ml) + "<br>" + oneEye("R", mr);
         const bool allL = (ml.hotPct <= 5.0
-                           && ml.bg >= 5.0 && ml.bg <= 25.0
                            && ml.maxRunWidthDs <= 8
                            && std::abs(ml.lineEst - expect) <= (expect >= 15 ? 5 : 2));
         const bool allR = (mr.hotPct <= 5.0
-                           && mr.bg >= 5.0 && mr.bg <= 25.0
                            && mr.maxRunWidthDs <= 8
                            && std::abs(mr.lineEst - expect) <= (expect >= 15 ? 5 : 2));
         if (allL && allR) {
