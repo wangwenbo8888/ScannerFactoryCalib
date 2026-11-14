@@ -40,6 +40,7 @@
 #include <opencv2/calib3d.hpp>   // 261114 findChessboardCorners/drawChessboardCorners（棋盘格实时判定）
 // 261108 目标线数全局缓存（analyzeShot 为 static 函数访问不到成员；spin 变更时同步）
 static std::atomic<int> judgeExpectGlobal{25};
+static std::atomic<int> scanDirectionGlobal{1};   // 261114 游程宽度检查用（0=竖切 1=横切）
 
 #include <spdlog/spdlog.h>
 #include <QTransform>
@@ -392,6 +393,7 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
             this, [this](int) {
         int mode = scannerModeCbx_->currentData().toInt();
         laserMode_.store(mode, std::memory_order_relaxed);   // 261114 判定分流缓存（0=棋盘格）
+        scanDirectionGlobal.store(mode == 1 || mode == 2 ? 1 : 0, std::memory_order_relaxed); // 261114 游程方向
         if (mode >= 1 && mode <= kLaserTypeCount) {
             saveLaserBtn_->setEnabled(true);
             saveLaserBtn_->setText(QStringLiteral("💾 保存到 data_in/laser/%1/pose_NN")
@@ -1169,12 +1171,16 @@ QImage matBgrToQImage(const cv::Mat& mat) {
 
 // 261108 采集参数判定（口径与 tools/calib_shot_monitor.py 同源）：
 // 过曝占比 / 游程>30px 计数 / 中部行线数估计。mask 阈值 120 与标定 config 同口径。
+// 261114 二修：加腐蚀（对齐标定 mask erodeSize=3 全分辨率 ≈ 降采样 1px）＋
+// 逐行游程宽度硬门（对齐标定 laser_label maxRunWidth=30px 全分辨率 ≈ 降采样 8px）——
+// 拍照时提前发现粘连，不再到标定端才被拒帧。
 struct ShotMetrics {
     double hotPct = 0.0;
     int wideRuns = 0;
     int lineEst = 0;
     double bg = 0.0;   // 261108 背景灰度（环境光泄漏指标——右斜 PASS 批
                        // 14~19 稳定 vs 左斜 28~55 波动即残差 6.5 主因）
+    int maxRunWidthDs = 0; // 261114 降采样域最大游程宽度（px）
 };
 static ShotMetrics analyzeShot(const cv::Mat& full) {
     ShotMetrics m;
@@ -1189,6 +1195,9 @@ static ShotMetrics analyzeShot(const cv::Mat& full) {
     m.bg = cv::mean(gray)[0];
     cv::Mat bw;
     cv::threshold(gray, bw, 120, 255, cv::THRESH_BINARY);
+    // 261114 腐蚀 1px（模拟标定 mask erodeSize=3 全分辨率 / 4 ≈ 1px 降采样）
+    // ——刚挨着的线腐蚀后分开；真粘连的仍连着 → 游程宽度暴露
+    cv::erode(bw, bw, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
     // 线数＝CCL 大组件数（v4 终版：逐行游程受断口/扇面稀疏行干扰不可用
     // 〔p50=17/max=27 实证〕；组件数为 4-3 同源口径，噪声以 0.7×第 N 大
     // 面积门滤除；判据放宽 ±3＝辅助级——肉眼数线，面板主打过曝/粘连）
@@ -1211,9 +1220,32 @@ static ShotMetrics analyzeShot(const cv::Mat& full) {
         m.lineEst = static_cast<int>(
             std::count_if(areas.begin(), areas.end(),
                           [gate](int a) { return a >= gate; }));
-        // 粘连＝最大组件 > 2.8×第 expect 大（两线粘连≈2 倍面积）
-        if (static_cast<int>(areas.size()) >= expect && expect >= 1
-            && nth >= 1000 && areas.front() > 3.2 * nth)
+    }
+    // 261114 逐行游程宽度（对齐标定 laser_label maxRunWidth 硬门）：
+    // 腐蚀后的二值图 → 中部行（或列，按 scanDirection）切一刀 → 数连续亮像素段
+    // 降采样域门限 ≈ 全分辨率 30px ÷ 4 ≈ 8px——超过即粘连
+    {
+        const int row = scanDirectionGlobal.load(std::memory_order_relaxed) == 1
+                            ? bw.rows / 2          // 斜线形态：水平切
+                            : -1;                   // 竖线形态：用列切
+        if (row >= 0 && row < bw.rows) {
+            const uchar* r = bw.ptr<uchar>(row);
+            int run = 0;
+            for (int x = 0; x < bw.cols; ++x) {
+                if (r[x] > 0) { ++run; if (run > m.maxRunWidthDs) m.maxRunWidthDs = run; }
+                else run = 0;
+            }
+        } else if (!bw.empty()) {
+            // 竖线形态：中心列切
+            const int col = bw.cols / 2;
+            int run = 0;
+            for (int y = 0; y < bw.rows; ++y) {
+                if (bw.at<uchar>(y, col) > 0) { ++run; if (run > m.maxRunWidthDs) m.maxRunWidthDs = run; }
+                else run = 0;
+            }
+        }
+        // 降采样域粘连门限：全分辨率 30px ÷ 4 = 7.5 → 取 8px
+        if (m.maxRunWidthDs > 8)
             m.wideRuns = 1;
     }
     return m;
@@ -1362,16 +1394,16 @@ void AcquisitionTab::setLeftImage(cv::Mat& left, uint64_t id) {
         const int expect = judgeExpect_.load(std::memory_order_relaxed);
         auto oneEye = [&](const char* tag, const ShotMetrics& m) {
             const bool okHot = m.hotPct <= 5.0;   // 261108 下限取消：过曝低无罪（线亮由线数反映），上限防粘连
-            // 粘连为信息项不参与判定（碎组件基线失真误报实证；肉眼易辨）
-            const bool okWide = true;
+            // 261114 游程宽度升级为硬门（对齐标定 maxRunWidth=30px 口径）
+            const bool okWide = m.maxRunWidthDs <= 8;
             const int lineTol = expect >= 15 ? 5 : 2;   // 261108 自适应：25线±5、7线±2（fine 基线 7~9 实证）
             const bool okLines = std::abs(m.lineEst - expect) <= lineTol;
             const bool okBg = m.bg >= 5.0 && m.bg <= 25.0;
-            QString s = QString("%1眼：过曝%2 %3 背景%4 %5 线数%6 %7")
+            QString s = QString("%1眼：过曝%2 %3 背景%4 %5 线数%6 %7 游程%8px %9")
                 .arg(tag, QString::number(m.hotPct, 'f', 2) + "%", okHot ? "✓" : "✗")
                 .arg(QString::number(m.bg, 'f', 0), okBg ? "✓" : "✗")
-                .arg(QString::number(m.wideRuns) + "条", okWide ? "✓" : "✗")
-                .arg(QString::number(m.lineEst), okLines ? "✓" : "✗");
+                .arg(QString::number(m.lineEst), okLines ? "✓" : "✗")
+                .arg(QString::number(m.maxRunWidthDs), okWide ? "✓" : "✗");
             return s;
         };
         const char* now = QDateTime::currentDateTime().toString("HH:mm:ss").toUtf8().constData();
@@ -1379,9 +1411,11 @@ void AcquisitionTab::setLeftImage(cv::Mat& left, uint64_t id) {
                        + oneEye("L", ml) + "<br>" + oneEye("R", mr);
         const bool allL = (ml.hotPct <= 5.0
                            && ml.bg >= 5.0 && ml.bg <= 25.0
+                           && ml.maxRunWidthDs <= 8
                            && std::abs(ml.lineEst - expect) <= (expect >= 15 ? 5 : 2));
         const bool allR = (mr.hotPct <= 5.0
                            && mr.bg >= 5.0 && mr.bg <= 25.0
+                           && mr.maxRunWidthDs <= 8
                            && std::abs(mr.lineEst - expect) <= (expect >= 15 ? 5 : 2));
         if (allL && allR) {
             report = "<p style='color:#1a7f37; font-weight:bold;'>✅ 可以采集（双眼全过，按此档采满 pose）</p>" + report;
