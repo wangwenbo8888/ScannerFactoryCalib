@@ -280,9 +280,9 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
     previewRow->addLayout(leftCol, 1);
     previewRow->addLayout(rightCol, 1);
     // —— 261108 采集参数实时判定列（右侧）——
-    // 三指标（261108 两批左斜数据标定的窗口）：过曝 2.8~5.0%（右斜成功批
-    // 3.89%）、游程>30px=0（斜线正常 8~22）、中部行线数=目标±1；双眼全过
-    // 才显示「可以采集」。调亮度档时看此面板，绿灯后再正式采集。
+    // 261114 三修（人工指令「标准只看线数」）：硬标准＝双眼线数都恰好=目标值
+    // （与标定 4-3 门禁 expectedLineCount=25 同口径，缺一/多一都不行）；
+    // 过曝/游程降为参考项只显示不卡绿灯——多参数叠加太难调，标定端门禁仍兜底。
     auto* judgeCol = new QVBoxLayout;
     // 261114 判定启用开关（面板最顶上；取消勾选＝跳过分析，面板显示「已禁用」）
     judgeEnabledCheck_ = new QCheckBox(QStringLiteral("启用实时判定"));
@@ -311,9 +311,9 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
     judgeCol->addLayout(judgeTitleRow);
     judgeLbl_ = new QLabel(QStringLiteral(
         "<p style='color:#888;'>（采集预览后实时判定）</p>"
-        "<p>①过曝占比 目标 2.8~5.0%</p>"
-        "<p>②游程>30px 目标 0（无粘连）</p>"
-        "<p>③线数 = 目标±1（双眼）</p>"));
+        "<p><b>硬标准：线数 = 目标值（双眼，缺一多一都不行）</b></p>"
+        "<p>参考项（不卡判定）：过曝≤5%、游程≤8px</p>"
+        "<p style='color:#888;'>绿灯即可保存姿态；标定端仍有安全门禁兜底</p>"));
     judgeLbl_->setAlignment(Qt::AlignTop | Qt::AlignLeft);
     judgeLbl_->setWordWrap(true);
     judgeLbl_->setMinimumWidth(220);
@@ -1210,9 +1210,11 @@ static ShotMetrics analyzeShot(const cv::Mat& full) {
     std::sort(areas.begin(), areas.end(), std::greater<int>());
     const int expect = judgeExpectGlobal.load(std::memory_order_relaxed);
     if (!areas.empty()) {
-        const int nth = areas[std::min<size_t>(areas.size() - 1,
-                                               static_cast<size_t>(std::max(1, expect) - 1))];
-        const int gate = static_cast<int>(0.3 * nth);   // 261114 二修 0.7→0.3：远近亮度差异致暗线被误杀
+        // 261114 四修（人工指令「判定与标定同口径」）：固定面积门 32ds（≈CLI
+        // minArea=500 全分辨率/16）替代 0.3×nth 相对门——相对门会静默滤掉 CLI
+        // 会计入的小碎片，造成「面板 25 / 标定 26」口径分歧（当日实测 17/25 帧
+        // 因此被拒）。真线面积 ≥500ds，32 门远低于真线、远高于噪声，安全。
+        const int gate = 32;
         m.lineEst = static_cast<int>(
             std::count_if(areas.begin(), areas.end(),
                           [gate](int a) { return a >= gate; }));
@@ -1438,39 +1440,39 @@ void AcquisitionTab::setLeftImage(cv::Mat& left, uint64_t id) {
         }
         pmL = mlRaw; pmR = mrRaw; hasPrev = true;
         const int expect = judgeExpect_.load(std::memory_order_relaxed);
+        // 261114 三修（人工指令「标准只看线数」）：硬标准＝双眼线数都恰好=目标值；
+        // 过曝/游程降为参考项——仍显示 ✓/✗ 提示风险，但不卡绿灯（标定端门禁兜底）
         auto oneEye = [&](const char* tag, const ShotMetrics& m) {
-            const bool okHot = m.hotPct <= 5.0;   // 261108 下限取消：过曝低无罪（线亮由线数反映），上限防粘连
-            // 261114 游程宽度升级为硬门（对齐标定 maxRunWidth=30px 口径）
-            const bool okWide = m.maxRunWidthDs <= 8;
-            const int lineTol = 2;   // 261114 收紧：标定端是硬门=恰好N条，差1拒帧——GUI 也要严
-            const bool okLines = std::abs(m.lineEst - expect) <= lineTol;
-            const bool okBg = true;   // 261114 背景改信息项——线数+游程是直接指标，背景只是间接风险提示
-            QString s = QString("%1眼：过曝%2 %3 线数%4 %5 游程%6px %7（背景%8）")
-                .arg(tag, QString::number(m.hotPct, 'f', 2) + "%", okHot ? "✓" : "✗")
-                .arg(QString::number(m.lineEst), okLines ? "✓" : "✗")
-                .arg(QString::number(m.maxRunWidthDs), okWide ? "✓" : "✗")
-                .arg(QString::number(m.bg, 'f', 0));
+            const bool okHot = m.hotPct <= 5.0;         // 参考项：过曝高预示粘连风险
+            const bool okWide = m.maxRunWidthDs <= 8;   // 参考项：游程大预示标定端拒帧
+            const bool okLines = m.lineEst == expect;   // 唯一硬标准：恰好=目标
+            QString s = QString("%1眼：线数%2 %3 ｜ 参考：过曝%4 %5 游程%6px %7")
+                .arg(tag, QString::number(m.lineEst), okLines ? "✓" : "✗")
+                .arg(QString::number(m.hotPct, 'f', 2) + "%", okHot ? "✓" : "✗")
+                .arg(QString::number(m.maxRunWidthDs), okWide ? "✓" : "✗");
             return s;
         };
         const char* now = QDateTime::currentDateTime().toString("HH:mm:ss").toUtf8().constData();
         QString report = QString("<span style='color:#888;'>[%1]</span><br>").arg(now)
                        + oneEye("L", ml) + "<br>" + oneEye("R", mr);
-        const bool allL = (ml.hotPct <= 5.0
-                           && ml.maxRunWidthDs <= 8
-                           && std::abs(ml.lineEst - expect) <= 2);
-        const bool allR = (mr.hotPct <= 5.0
-                           && mr.maxRunWidthDs <= 8
-                           && std::abs(mr.lineEst - expect) <= 2);
+        const bool allL = (ml.lineEst == expect);
+        const bool allR = (mr.lineEst == expect);
         if (allL && allR) {
-            report = "<p style='color:#1a7f37; font-weight:bold;'>✅ 可以采集（双眼全过，按此档采满 pose）</p>" + report;
+            report = "<p style='color:#1a7f37; font-weight:bold;'>✅ 可以采集（双眼线数=目标，按此档采满 pose）</p>" + report;
+            // 线数对但游程偏大：绿灯照给，附灰字提示（部分姿态标定端可能拒帧）
+            if (ml.maxRunWidthDs > 8 || mr.maxRunWidthDs > 8) {
+                report += QStringLiteral(
+                    "<br><span style='color:#888;'>（游程偏大仅供参考：个别姿态标定端"
+                    "可能拒帧，换角度即可）</span>");
+            }
         } else {
             QString tip;
             for (const ShotMetrics* m : {&ml, &mr}) {
                 const char* tag = (m == &ml) ? "L" : "R";
-                if (m->lineEst < expect - 2) tip += QString("%1眼线数不足→升亮度/激光档半档；").arg(tag);
-                if (m->lineEst > expect + 2) tip += QString("%1眼多线→降补光/激光档；").arg(tag);
-                if (m->hotPct > 5.0) tip += QString("%1眼过曝→降激光档；").arg(tag);
-                // 261114 背景不再是判定条件——移除背景相关调参提示
+                if (m->lineEst < expect)
+                    tip += QString("%1眼线数少%2条→升亮度/激光档半档；").arg(tag).arg(expect - m->lineEst);
+                if (m->lineEst > expect)
+                    tip += QString("%1眼多%2条→降亮度/激光档半档；").arg(tag).arg(m->lineEst - expect);
             }
             report = QString("<p style='color:#b3261e; font-weight:bold;'>✗ 继续调整</p>")
                    + report + "<br><span style='color:#b3261e;'>" + tip + "</span>";
