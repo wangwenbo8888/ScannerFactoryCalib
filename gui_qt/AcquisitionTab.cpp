@@ -1218,47 +1218,48 @@ static ShotMetrics analyzeShot(const cv::Mat& full) {
         m.lineEst = static_cast<int>(
             std::count_if(areas.begin(), areas.end(),
                           [gate](int a) { return a >= gate; }));
-        // 261114 三修 激光线彩色叠加：每个检测到的组件用不同颜色着色其像素
-        // （彩虹色循环）——用户直观看到算法认了几条线、每条线覆盖哪些像素
+        // 261114 三修 激光线彩色叠加：每条线不同颜色着色其像素——
+        // 刷新率限 2Hz（500ms 一次）：每帧重建色图→颜色跳来跳去「闪烁看不清」
         {
-            // 构建 label→是否计入线数 的映射
-            std::map<int, bool> labelIsLine;   // label → counted
-            for (int i = 1; i < n; ++i) {
-                const int area = statsv.at<int>(i, cv::CC_STAT_AREA);
-                const int hh = statsv.at<int>(i, cv::CC_STAT_HEIGHT);
-                const int ww = statsv.at<int>(i, cv::CC_STAT_WIDTH);
-                if (area >= 32 && std::max(hh, ww) >= 13)
-                    labelIsLine[i] = (area >= gate);
-            }
-            // 彩虹调色板（25 色循环）
-            static const cv::Scalar kPalette[] = {
-                {0,0,255},{0,64,255},{0,128,255},{0,191,255},{0,255,255},
-                {0,255,191},{0,255,128},{0,255,64},{0,255,0},{64,255,0},
-                {128,255,0},{191,255,0},{255,255,0},{255,191,0},{255,128,0},
-                {255,64,0},{255,0,0},{255,0,64},{255,0,128},{255,0,191},
-                {255,0,255},{191,0,255},{128,0,255},{64,0,255},{0,0,255}
-            };
-            const int palSize = sizeof(kPalette) / sizeof(kPalette[0]);
-            // 灰度图转 BGR 底图
-            cv::cvtColor(gray, m.overlay, cv::COLOR_GRAY2BGR);
-            // 逐像素着色（labels Mat 的值 = 组件编号）
-            int lineIdx = 0;
-            for (const auto& [label, isLine] : labelIsLine) {
-                if (!isLine) continue;
-                const cv::Scalar& color = kPalette[lineIdx % palSize];
-                // 用 label 图直接找该组件的所有像素
-                for (int y = 0; y < labels.rows; ++y) {
-                    for (int x = 0; x < labels.cols; ++x) {
-                        if (labels.at<int>(y, x) == label) {
-                            // 半透明叠加：50% 原图 + 50% 彩色
-                            cv::Vec3b& px = m.overlay.at<cv::Vec3b>(y, x);
-                            px[0] = static_cast<uchar>(0.5 * px[0] + 0.5 * color[0]);
-                            px[1] = static_cast<uchar>(0.5 * px[1] + 0.5 * color[1]);
-                            px[2] = static_cast<uchar>(0.5 * px[2] + 0.5 * color[2]);
+            static auto s_lastOvlTime = std::chrono::steady_clock::now();
+            const auto now2 = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now2 - s_lastOvlTime).count() >= 500) {
+                s_lastOvlTime = now2;
+                // 构建 label→是否计入线数 的映射
+                std::map<int, bool> labelIsLine;
+                for (int i = 1; i < n; ++i) {
+                    const int area = statsv.at<int>(i, cv::CC_STAT_AREA);
+                    const int hh = statsv.at<int>(i, cv::CC_STAT_HEIGHT);
+                    const int ww = statsv.at<int>(i, cv::CC_STAT_WIDTH);
+                    if (area >= 32 && std::max(hh, ww) >= 13)
+                        labelIsLine[i] = (area >= gate);
+                }
+                static const cv::Scalar kPalette[] = {
+                    {0,0,255},{0,64,255},{0,128,255},{0,191,255},{0,255,255},
+                    {0,255,191},{0,255,128},{0,255,64},{0,255,0},{64,255,0},
+                    {128,255,0},{191,255,0},{255,255,0},{255,191,0},{255,128,0},
+                    {255,64,0},{255,0,0},{255,0,64},{255,0,128},{255,0,191},
+                    {255,0,255},{191,0,255},{128,0,255},{64,0,255},{0,0,255}
+                };
+                const int palSize = sizeof(kPalette) / sizeof(kPalette[0]);
+                cv::cvtColor(gray, m.overlay, cv::COLOR_GRAY2BGR);
+                int lineIdx = 0;
+                for (const auto& [label, isLine] : labelIsLine) {
+                    if (!isLine) continue;
+                    const cv::Scalar& color = kPalette[lineIdx % palSize];
+                    for (int y = 0; y < labels.rows; ++y) {
+                        for (int x = 0; x < labels.cols; ++x) {
+                            if (labels.at<int>(y, x) == label) {
+                                cv::Vec3b& px = m.overlay.at<cv::Vec3b>(y, x);
+                                px[0] = static_cast<uchar>(0.5 * px[0] + 0.5 * color[0]);
+                                px[1] = static_cast<uchar>(0.5 * px[1] + 0.5 * color[1]);
+                                px[2] = static_cast<uchar>(0.5 * px[2] + 0.5 * color[2]);
+                            }
                         }
                     }
+                    ++lineIdx;
                 }
-                ++lineIdx;
             }
         }
     }
