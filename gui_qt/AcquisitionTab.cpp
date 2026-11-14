@@ -1263,14 +1263,13 @@ bool AcquisitionTab::analyzeChessboard(const cv::Mat& leftFull, const cv::Mat& r
     analyzeOne(leftFull, l);
     analyzeOne(rightFull, r);
 
-    // 判定：双目全检出 ＋ 平均铺满度 30~80% ＋ 平均过曝 ≤5%（两帧直判——棋盘
-    // 检出/包围盒对抖动不敏感，无需激光线口径的滑动平均）
+    // 判定：双目全检出 ＋ 平均过曝 ≤5%。铺满度为信息项（不同距离标定是正确
+    // 做法——远拍铺满度低但解耦焦距/距离，不做门限只显示参考值 261114）
     const bool bothFound = l.found && r.found;
     const double avgCov = (l.coverage + r.coverage) / 2.0;
     const double avgOver = (l.overexposed + r.overexposed) / 2.0;
     const bool overexpOk = avgOver <= 5.0;
-    const bool coverageOk = bothFound && avgCov >= 30.0 && avgCov <= 80.0;
-    const bool allOk = bothFound && overexpOk && coverageOk;
+    const bool allOk = bothFound && overexpOk;
 
     // HTML 报告（样式/结构与激光判定报告同款：结论置顶＋逐项指标＋调参建议）
     const QString now = QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss"));
@@ -1281,9 +1280,8 @@ bool AcquisitionTab::analyzeChessboard(const cv::Mat& leftFull, const cv::Mat& r
                   .arg(l.found ? QStringLiteral("✓") : QStringLiteral("✗"),
                        r.found ? QStringLiteral("✓") : QStringLiteral("✗"));
     if (bothFound)
-        report += QString("<br>铺满度: %1%2（目标 30~80%）")
-                      .arg(avgCov, 0, 'f', 0)
-                      .arg(coverageOk ? QStringLiteral("✅") : QStringLiteral("⚠"));
+        report += QString("<br>铺满度: %1%（远/中/近都采——信息项）")
+                      .arg(avgCov, 0, 'f', 0);
     report += QString("<br>过曝: %1%2（≤5%）")
                   .arg(avgOver, 0, 'f', 1)
                   .arg(overexpOk ? QStringLiteral("✅") : QStringLiteral("✗"));
@@ -1295,10 +1293,6 @@ bool AcquisitionTab::analyzeChessboard(const cv::Mat& leftFull, const cv::Mat& r
         QString tip;
         if (!bothFound) tip += QStringLiteral("棋盘未完整检出→确保棋盘完整入画、无遮挡、角度别太斜；");
         if (!overexpOk) tip += QStringLiteral("过曝→降曝光或补光；");
-        if (bothFound && !coverageOk) {
-            tip += avgCov < 30.0 ? QStringLiteral("铺满度低→靠近棋盘或换大棋盘；")
-                                 : QStringLiteral("铺满度过高→远离棋盘（太近了）；");
-        }
         report = QStringLiteral("<p style='color:#b3261e; font-weight:bold;'>✗ 继续调整</p>")
                + report + QStringLiteral("<br><span style='color:#b3261e;'>%1</span>").arg(tip);
     }
