@@ -381,6 +381,49 @@ void LaserCalibTab::onWorkerDone(bool ok, QString summary) {
     if (ok) {
         QString outPath = outputEdit_->text().trimmed();
         if (QFileInfo::exists(outPath)) resultView_->loadFile(outPath);
+
+        // 261114 结果摘要弹窗：从输出 JSON 提取关键精度指标（用户要看结论不是 JSON 树）
+        QFile f(outPath);
+        if (f.open(QIODevice::ReadOnly)) {
+            const auto j = QJsonDocument::fromJson(f.readAll()).object();
+            const QString verdict = j["verdict"].toString(j["status"].toString("?"));
+            const double rms = j["pjc"].toObject()["finalSampsonRms"].toDouble();
+            const int framesOk = j["framesOk"].toInt();
+            const int framesSkip = j["framesSkipped"].toInt();
+            const qint64 accum = static_cast<qint64>(j["accumulatedPoints3D"].toDouble());
+            const auto tArr = j["virtualT"].toArray();
+            QString tStr;
+            for (const auto& v : tArr) tStr += QString::number(v.toDouble(), 'f', 1) + " ";
+            const bool pass = (verdict == "PASS");
+
+            QString html = QStringLiteral(
+                "<table cellpadding=4>"
+                "<tr><td><b>verdict</b></td><td>%1</td></tr>"
+                "<tr><td><b>采样残差 rms</b></td><td>%2 px %3</td></tr>"
+                "<tr><td><b>有效帧 / 跳帧</b></td><td>%4 / %5</td></tr>"
+                "<tr><td><b>累积 3D 点</b></td><td>%6</td></tr>"
+                "<tr><td><b>projectorT (mm)</b></td><td>(%7)</td></tr>"
+                "</table><br>%8")
+                .arg(pass ? "<span style='color:#1a7f37; font-weight:bold;'>PASS</span>"
+                          : "<span style='color:#c0392b; font-weight:bold;'>" + verdict + "</span>")
+                .arg(rms, 0, 'f', 4)
+                .arg(rms < 0.15 ? "✓达标" : rms < 0.5 ? "⚠边界" : "✗超标")
+                .arg(framesOk).arg(framesSkip)
+                .arg(accum)
+                .arg(tStr.trimmed())
+                .arg(pass ? "<b style='color:#1a7f37;'>标定精度达标</b>"
+                          : "<b style='color:#c0392b;'>精度未达标，建议改善采集条件后重新标定</b>");
+
+            QMessageBox box(this);
+            box.setWindowTitle(pass ? "激光标定完成 —— 精度达标"
+                                    : "激光标定完成 —— 精度未达标");
+            box.setIcon(pass ? QMessageBox::Information : QMessageBox::Warning);
+            box.setTextFormat(Qt::RichText);
+            box.setText(html);
+            box.setInformativeText(QStringLiteral("结果文件:\n%1").arg(outPath));
+            box.setStandardButtons(QMessageBox::Ok);
+            box.exec();
+        }
     }
 }
 
