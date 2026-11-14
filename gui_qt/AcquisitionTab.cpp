@@ -1475,7 +1475,15 @@ void AcquisitionTab::setLeftImage(cv::Mat& left, uint64_t id) {
             report = QString("<p style='color:#b3261e; font-weight:bold;'>✗ 继续调整</p>")
                    + report + "<br><span style='color:#b3261e;'>" + tip + "</span>";
         }
-        emit updateJudge(report);
+        // 261114 判定报告限 500ms 刷新一次（每帧刷→文字每秒跳 10 次读不到）
+        {
+            static auto s_lastJudgeTime = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - s_lastJudgeTime).count() >= 500) {
+                s_lastJudgeTime = std::chrono::steady_clock::now();
+                emit updateJudge(report);
+            }
+        }
         // 261114 二修 激光线叠加预览：缓存叠加图，每帧都发（持续显示直到下次
         // 分析刷新）——一修只发一帧被下一帧常规预览冲掉＝闪烁看不清
         {
