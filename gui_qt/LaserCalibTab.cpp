@@ -19,6 +19,8 @@
 #include <QFile>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QJsonArray>
+#include <QJsonObject>
 #include <QCheckBox>
 
 #include <spdlog/spdlog.h>
