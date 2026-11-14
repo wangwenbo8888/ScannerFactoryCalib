@@ -6,6 +6,7 @@
 #include "camera/StereoCameraRig.h"
 #include "camera/GalaxyCameraSource.h"
 #include "scanner/ScannerControl.h"
+#include <map>
 
 #include <QComboBox>
 #include <QDateTime>
@@ -1213,24 +1214,52 @@ static ShotMetrics analyzeShot(const cv::Mat& full) {
     if (!areas.empty()) {
         const int nth = areas[std::min<size_t>(areas.size() - 1,
                                                static_cast<size_t>(std::max(1, expect) - 1))];
-        const int gate = static_cast<int>(0.7 * nth);
+        const int gate = static_cast<int>(0.3 * nth);   // 261114 二修 0.7→0.3：远近亮度差异致暗线被误杀
         m.lineEst = static_cast<int>(
             std::count_if(areas.begin(), areas.end(),
                           [gate](int a) { return a >= gate; }));
-        // 261114 激光线叠加预览：每个组件画彩色框（绿=计数入线数、黄=检测到但
-        // 被面积门滤掉、红=超大疑似粘连）——让用户直观看到算法「看到了什么」
-        cv::cvtColor(gray, m.overlay, cv::COLOR_GRAY2BGR);
-        for (int i = 1; i < n; ++i) {
-            const int area = statsv.at<int>(i, cv::CC_STAT_AREA);
-            const int hh = statsv.at<int>(i, cv::CC_STAT_HEIGHT);
-            const int ww = statsv.at<int>(i, cv::CC_STAT_WIDTH);
-            if (area < 32 || std::max(hh, ww) < 13) continue;   // 太小不画
-            const int x = statsv.at<int>(i, cv::CC_STAT_LEFT);
-            const int y = statsv.at<int>(i, cv::CC_STAT_TOP);
-            cv::Scalar color(0, 255, 0);                        // 绿=计数入线数
-            if (area < gate) color = cv::Scalar(0, 255, 255);   // 黄=被0.7门滤掉
-            if (area > 3.2 * nth && nth >= 1000) color = cv::Scalar(0, 0, 255); // 红=疑似粘连
-            cv::rectangle(m.overlay, cv::Rect(x, y, ww, hh), color, 1);
+        // 261114 三修 激光线彩色叠加：每个检测到的组件用不同颜色着色其像素
+        // （彩虹色循环）——用户直观看到算法认了几条线、每条线覆盖哪些像素
+        {
+            // 构建 label→是否计入线数 的映射
+            std::map<int, bool> labelIsLine;   // label → counted
+            for (int i = 1; i < n; ++i) {
+                const int area = statsv.at<int>(i, cv::CC_STAT_AREA);
+                const int hh = statsv.at<int>(i, cv::CC_STAT_HEIGHT);
+                const int ww = statsv.at<int>(i, cv::CC_STAT_WIDTH);
+                if (area >= 32 && std::max(hh, ww) >= 13)
+                    labelIsLine[i] = (area >= gate);
+            }
+            // 彩虹调色板（25 色循环）
+            static const cv::Scalar kPalette[] = {
+                {0,0,255},{0,64,255},{0,128,255},{0,191,255},{0,255,255},
+                {0,255,191},{0,255,128},{0,255,64},{0,255,0},{64,255,0},
+                {128,255,0},{191,255,0},{255,255,0},{255,191,0},{255,128,0},
+                {255,64,0},{255,0,0},{255,0,64},{255,0,128},{255,0,191},
+                {255,0,255},{191,0,255},{128,0,255},{64,0,255},{0,0,255}
+            };
+            const int palSize = sizeof(kPalette) / sizeof(kPalette[0]);
+            // 灰度图转 BGR 底图
+            cv::cvtColor(gray, m.overlay, cv::COLOR_GRAY2BGR);
+            // 逐像素着色（labels Mat 的值 = 组件编号）
+            int lineIdx = 0;
+            for (const auto& [label, isLine] : labelIsLine) {
+                if (!isLine) continue;
+                const cv::Scalar& color = kPalette[lineIdx % palSize];
+                // 用 label 图直接找该组件的所有像素
+                for (int y = 0; y < labels.rows; ++y) {
+                    for (int x = 0; x < labels.cols; ++x) {
+                        if (labels.at<int>(y, x) == label) {
+                            // 半透明叠加：50% 原图 + 50% 彩色
+                            cv::Vec3b& px = m.overlay.at<cv::Vec3b>(y, x);
+                            px[0] = static_cast<uchar>(0.5 * px[0] + 0.5 * color[0]);
+                            px[1] = static_cast<uchar>(0.5 * px[1] + 0.5 * color[1]);
+                            px[2] = static_cast<uchar>(0.5 * px[2] + 0.5 * color[2]);
+                        }
+                    }
+                }
+                ++lineIdx;
+            }
         }
     }
     // 261114 逐行游程宽度（对齐标定 laser_label maxRunWidth 硬门）：
@@ -1447,11 +1476,25 @@ void AcquisitionTab::setLeftImage(cv::Mat& left, uint64_t id) {
                    + report + "<br><span style='color:#b3261e;'>" + tip + "</span>";
         }
         emit updateJudge(report);
-        // 261114 激光线叠加预览：左图叠加帧直发（跳过本帧常规预览 emit——
-        // 两个 Queued 信号按序到达，后发的原图会冲掉先发的叠加）
-        if (!mlRaw.overlay.empty()) {
-            emit updateImages(matBgrToQImage(mlRaw.overlay), matBgrToQImage(mlRaw.overlay));
-            judgeOverlaid = true;
+        // 261114 二修 激光线叠加预览：缓存叠加图，每帧都发（持续显示直到下次
+        // 分析刷新）——一修只发一帧被下一帧常规预览冲掉＝闪烁看不清
+        {
+            static QImage s_ovlL, s_ovlR;
+            static bool s_hasOvl = false;
+            if (!mlRaw.overlay.empty()) {
+                s_ovlL = matBgrToQImage(mlRaw.overlay);
+                s_ovlR = s_ovlL;   // 左右同图（当前只分析左图叠加）
+                s_hasOvl = true;
+            }
+            // 模式切走时清缓存
+            if (laserMode_.load(std::memory_order_relaxed) == 0
+                || !judgeEnabled_.load(std::memory_order_relaxed)) {
+                s_hasOvl = false;
+            }
+            if (s_hasOvl && !s_ovlL.isNull()) {
+                emit updateImages(s_ovlL, s_ovlR);
+                judgeOverlaid = true;
+            }
         }
         // 261108 绿灯→自动停止＋完成提示（一次性任务语义）
         if (autoTuneOn_.load(std::memory_order_relaxed) && (allL && allR)) {
