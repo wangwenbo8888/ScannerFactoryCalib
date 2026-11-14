@@ -1267,25 +1267,28 @@ static ShotMetrics analyzeShot(const cv::Mat& full) {
     // 腐蚀后的二值图 → 中部行（或列，按 scanDirection）切一刀 → 数连续亮像素段
     // 降采样域门限 ≈ 全分辨率 30px ÷ 4 ≈ 8px——超过即粘连
     {
-        // 261114 腐蚀仅在游程测量用——分开的线腐蚀后 still 分开（游程小）；
-        // 粘连的线腐蚀后仍连通（游程大）→ 暴露粘连。线数计数不受影响。
+        // 261114 腐蚀+膨胀（对齐标定 mask erodeSize=3 → laserDilateSize=9 全分辨率
+        // ÷4 ≈ 腐蚀1px + 膨胀2px 降采样）——只做腐蚀不做膨胀时 GUI 看到分开的线
+        // 但标定膨胀后粘连 → 判定与标定结果不一致（二修教训）
         cv::Mat bwEroded;
         cv::erode(bw, bwEroded, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
+        cv::Mat bwDilated;
+        cv::dilate(bwEroded, bwDilated, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5)));
         const int row = scanDirectionGlobal.load(std::memory_order_relaxed) == 1
-                            ? bwEroded.rows / 2     // 斜线形态：水平切
+                            ? bwDilated.rows / 2    // 斜线形态：水平切
                             : -1;                    // 竖线形态：用列切
-        if (row >= 0 && row < bwEroded.rows) {
-            const uchar* r = bwEroded.ptr<uchar>(row);
+        if (row >= 0 && row < bwDilated.rows) {
+            const uchar* r = bwDilated.ptr<uchar>(row);
             int run = 0;
-            for (int x = 0; x < bwEroded.cols; ++x) {
+            for (int x = 0; x < bwDilated.cols; ++x) {
                 if (r[x] > 0) { ++run; if (run > m.maxRunWidthDs) m.maxRunWidthDs = run; }
                 else run = 0;
             }
-        } else if (!bwEroded.empty()) {
-            const int col = bwEroded.cols / 2;
+        } else if (!bwDilated.empty()) {
+            const int col = bwDilated.cols / 2;
             int run = 0;
-            for (int y = 0; y < bwEroded.rows; ++y) {
-                if (bwEroded.at<uchar>(y, col) > 0) { ++run; if (run > m.maxRunWidthDs) m.maxRunWidthDs = run; }
+            for (int y = 0; y < bwDilated.rows; ++y) {
+                if (bwDilated.at<uchar>(y, col) > 0) { ++run; if (run > m.maxRunWidthDs) m.maxRunWidthDs = run; }
                 else run = 0;
             }
         }
