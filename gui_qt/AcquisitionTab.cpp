@@ -37,6 +37,7 @@
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/calib3d.hpp>   // 261114 findChessboardCorners/drawChessboardCorners（棋盘格实时判定）
 // 261108 目标线数全局缓存（analyzeShot 为 static 函数访问不到成员；spin 变更时同步）
 static std::atomic<int> judgeExpectGlobal{25};
 
@@ -281,6 +282,13 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
     // 3.89%）、游程>30px=0（斜线正常 8~22）、中部行线数=目标±1；双眼全过
     // 才显示「可以采集」。调亮度档时看此面板，绿灯后再正式采集。
     auto* judgeCol = new QVBoxLayout;
+    // 261114 判定启用开关（面板最顶上；取消勾选＝跳过分析，面板显示「已禁用」）
+    judgeEnabledCheck_ = new QCheckBox(QStringLiteral("启用实时判定"));
+    judgeEnabledCheck_->setChecked(true);
+    judgeEnabledCheck_->setToolTip(QStringLiteral(
+        "取消勾选则跳过实时判定分析（预览不受影响，面板显示「已禁用」）。\n"
+        "模式0（相机标定）＝棋盘格判定；激光模式＝线质量判定。"));
+    judgeCol->addWidget(judgeEnabledCheck_);
     auto* judgeTitleRow = new QHBoxLayout;
     judgeTitleRow->addWidget(new QLabel(QStringLiteral("采集参数判定")));
     judgeExpectSpin_ = new QSpinBox;
@@ -366,6 +374,10 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
         judgeExpect_.store(v, std::memory_order_relaxed);
         judgeExpectGlobal.store(v, std::memory_order_relaxed);
     });
+    // 261114 判定启用开关 → 回调线程安全缓存（照搬 judgeExpect_ 同步模式）
+    connect(judgeEnabledCheck_, &QCheckBox::toggled, this, [this](bool on) {
+        judgeEnabled_.store(on, std::memory_order_relaxed);
+    });
     connect(freqSlider_,      &QSlider::valueChanged, this, [this](int v){
         freqValLbl_->setText(QString::number(v));
     });
@@ -379,6 +391,7 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
     connect(scannerModeCbx_, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, [this](int) {
         int mode = scannerModeCbx_->currentData().toInt();
+        laserMode_.store(mode, std::memory_order_relaxed);   // 261114 判定分流缓存（0=棋盘格）
         if (mode >= 1 && mode <= kLaserTypeCount) {
             saveLaserBtn_->setEnabled(true);
             saveLaserBtn_->setText(QStringLiteral("💾 保存到 data_in/laser/%1/pose_NN")
@@ -388,7 +401,8 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
             saveLaserBtn_->setText(QStringLiteral("💾 保存激光帧（请先选激光线类型）"));
         }
     });
-    // 初始化按钮文案（不触发上面的信号）
+    // 初始化按钮文案（不触发上面的信号）；261114 模式缓存同步一次（默认0=相机标定）
+    laserMode_.store(scannerModeCbx_->currentData().toInt(), std::memory_order_relaxed);
     if (scannerModeCbx_->currentData().toInt() >= 1) {
         saveLaserBtn_->setText(QStringLiteral("💾 保存到 data_in/laser/%1/pose_NN")
                                    .arg(QString::fromLatin1(
@@ -1144,6 +1158,15 @@ QImage convertMattoQImage(cv::Mat& mat) {
     return QImage();
 }
 
+// 261114 BGR 8UC3 → QImage（棋盘角点叠加帧专用）：包装构造 + copy() 深拷贝
+// （源 Mat 为回调线程局部对象，跨线程 emit 前必须断开数据指针）
+QImage matBgrToQImage(const cv::Mat& mat) {
+    if (mat.empty() || mat.type() != CV_8UC3) return QImage();
+    QImage img(mat.data, mat.cols, mat.rows, static_cast<int>(mat.step),
+               QImage::Format_RGB888);
+    return img.copy();
+}
+
 // 261108 采集参数判定（口径与 tools/calib_shot_monitor.py 同源）：
 // 过曝占比 / 游程>30px 计数 / 中部行线数估计。mask 阈值 120 与标定 config 同口径。
 struct ShotMetrics {
@@ -1197,6 +1220,98 @@ static ShotMetrics analyzeShot(const cv::Mat& full) {
 }
 }  // namespace
 
+// 261114 相机标定棋盘格实时判定（模式0 专用）：双目角点检出（11×8）＋铺满度＋过曝。
+// 相机回调线程执行（与 analyzeShot 同约定：收全分辨率克隆帧，内部 0.25 降采样提速，
+// ≈30Hz 限频窗口内每对一次）；报告经 updateJudge（QueuedConnection）送 UI 线程渲染。
+// 双目均检出时角点叠加帧经 updateImages 直发并返回 true——调用方跳过本帧常规预览
+// emit（两个 Queued 信号按序到达，后发的原图会冲掉先发的叠加）。
+bool AcquisitionTab::analyzeChessboard(const cv::Mat& leftFull, const cv::Mat& rightFull) {
+    // 棋盘格参数：11×8 内角点（与 CameraCalibTab / data_in camera 标定口径一致）
+    const cv::Size boardSize(11, 8);
+
+    struct BoardResult {
+        bool found = false;
+        double coverage = 0.0;     // 角点包围盒面积占画面比 %
+        double overexposed = 0.0;  // 过曝占比 %（>235，与 analyzeShot 同口径）
+        cv::Mat overlay;           // 角点叠加画布（BGR 小图；未检出时为空）
+    };
+
+    auto analyzeOne = [&](const cv::Mat& full, BoardResult& r) {
+        if (full.empty()) return;
+        // 0.25 降采样（与 analyzeShot 同款：全分辨率角点检测太慢，回调线程拖不起）
+        cv::Mat small;
+        cv::resize(full, small, cv::Size(), 0.25, 0.25, cv::INTER_AREA);
+        const int hot = cv::countNonZero(small > 235);
+        r.overexposed = 100.0 * hot / (small.rows * small.cols);
+        // 棋盘格角点检测
+        std::vector<cv::Point2f> corners;
+        const bool found = cv::findChessboardCorners(small, boardSize, corners,
+            cv::CALIB_CB_ADAPTIVE_THRESH | cv::CALIB_CB_NORMALIZE_IMAGE);
+        if (found && corners.size() == static_cast<size_t>(boardSize.area())) {
+            r.found = true;
+            // 铺满度：角点包围盒面积 / 图像面积（比例值，与降采样无关）
+            const cv::Rect bbox = cv::boundingRect(corners);
+            r.coverage = 100.0 * static_cast<double>(bbox.area())
+                       / (small.rows * small.cols);
+            // 角点叠加：灰度转 BGR 画彩点（drawChessboardCorners 需 8UC3 输入）
+            cv::cvtColor(small, r.overlay, cv::COLOR_GRAY2BGR);
+            cv::drawChessboardCorners(r.overlay, boardSize, corners, true);
+        }
+    };
+
+    BoardResult l, r;
+    analyzeOne(leftFull, l);
+    analyzeOne(rightFull, r);
+
+    // 判定：双目全检出 ＋ 平均铺满度 30~80% ＋ 平均过曝 ≤5%（两帧直判——棋盘
+    // 检出/包围盒对抖动不敏感，无需激光线口径的滑动平均）
+    const bool bothFound = l.found && r.found;
+    const double avgCov = (l.coverage + r.coverage) / 2.0;
+    const double avgOver = (l.overexposed + r.overexposed) / 2.0;
+    const bool overexpOk = avgOver <= 5.0;
+    const bool coverageOk = bothFound && avgCov >= 30.0 && avgCov <= 80.0;
+    const bool allOk = bothFound && overexpOk && coverageOk;
+
+    // HTML 报告（样式/结构与激光判定报告同款：结论置顶＋逐项指标＋调参建议）
+    const QString now = QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss"));
+    QString report = QString("<span style='color:#888;'>[%1]</span><br>").arg(now);
+    report += bothFound ? QStringLiteral("✅ 双目棋盘检出（11×8）")
+                        : QStringLiteral("✗ 棋盘未检出");
+    report += QString("<br>左: %1 | 右: %2")
+                  .arg(l.found ? QStringLiteral("✓") : QStringLiteral("✗"),
+                       r.found ? QStringLiteral("✓") : QStringLiteral("✗"));
+    if (bothFound)
+        report += QString("<br>铺满度: %1%2（目标 30~80%）")
+                      .arg(avgCov, 0, 'f', 0)
+                      .arg(coverageOk ? QStringLiteral("✅") : QStringLiteral("⚠"));
+    report += QString("<br>过曝: %1%2（≤5%）")
+                  .arg(avgOver, 0, 'f', 1)
+                  .arg(overexpOk ? QStringLiteral("✅") : QStringLiteral("✗"));
+    if (allOk) {
+        report = QStringLiteral(
+            "<p style='color:#1a7f37; font-weight:bold;'>✅ 可以采集（双眼全过，按此档采满标定帧）</p>")
+            + report;
+    } else {
+        QString tip;
+        if (!bothFound) tip += QStringLiteral("棋盘未完整检出→确保棋盘完整入画、无遮挡、角度别太斜；");
+        if (!overexpOk) tip += QStringLiteral("过曝→降曝光或补光；");
+        if (bothFound && !coverageOk) {
+            tip += avgCov < 30.0 ? QStringLiteral("铺满度低→靠近棋盘或换大棋盘；")
+                                 : QStringLiteral("铺满度过高→远离棋盘（太近了）；");
+        }
+        report = QStringLiteral("<p style='color:#b3261e; font-weight:bold;'>✗ 继续调整</p>")
+               + report + QStringLiteral("<br><span style='color:#b3261e;'>%1</span>").arg(tip);
+    }
+    emit updateJudge(report);
+
+    // 角点叠加预览：双目均检出才发（让用户直观看到检测到了什么；未检出发原图）
+    if (bothFound) {
+        emit updateImages(matBgrToQImage(l.overlay), matBgrToQImage(r.overlay));
+        return true;
+    }
+    return false;
+}
+
 // 左右帧配对（SDK 回调线程调用）：轮次制——左右各有未消费新帧即成一对，后到者触发。
 // 2026-09-27 修复：旧版照搬 LeadScanK2 用 frameID 严格相等（m_iLeftId==m_iRightId），
 // 单边多一帧（左右布防间隙抢到触发脉冲 / ok=0 失败帧占号 / 单边丢帧）后 ID 永久错位 1，
@@ -1208,6 +1323,7 @@ static ShotMetrics analyzeShot(const cv::Mat& full) {
 void AcquisitionTab::setLeftImage(cv::Mat& left, uint64_t id) {
     cv::Mat pairL, pairR;
     bool doPreview = false;
+    bool judgeOverlaid = false;   // 261114 棋盘角点叠加帧已直发→跳过本帧常规预览 emit
     {
         std::lock_guard<std::mutex> lk(pairMtx_);
         *m_pLeft = left;
@@ -1227,7 +1343,17 @@ void AcquisitionTab::setLeftImage(cv::Mat& left, uint64_t id) {
     ++pairCount_;
     ++pairCount_;
     // 261108 采集参数判定：每 3 对（≈10Hz）分析一次（0.25 降采样 ~3ms）
-    if (doPreview && !pairL.empty() && !pairR.empty()) {   // 261108 每对分析（3ms 无压力——滞后主因曾是间隔+全图CCL）
+    // 261114 判定分流（置于激光判定之前）：开关关→面板提示已禁用；模式0（相机标定）
+    // →棋盘格判定（双目检出时角点叠加帧直发，judgeOverlaid 置位跳过本帧常规预览
+    // emit，防后到原图冲掉叠加）；其余＝激光线判定（261108 原逻辑不动）
+    if (doPreview && !pairL.empty() && !pairR.empty()
+        && !judgeEnabled_.load(std::memory_order_relaxed)) {
+        emit updateJudge(QStringLiteral(
+            "<p style='color:#888; font-weight:bold;'>实时判定已禁用</p>"));
+    } else if (doPreview && !pairL.empty() && !pairR.empty()
+               && laserMode_.load(std::memory_order_relaxed) == 0) {
+        judgeOverlaid = analyzeChessboard(pairL, pairR);
+    } else if (doPreview && !pairL.empty() && !pairR.empty()) {   // 261108 每对分析（3ms 无压力——滞后主因曾是间隔+全图CCL）
         const ShotMetrics mlRaw = analyzeShot(pairL);
         const ShotMetrics mrRaw = analyzeShot(pairR);
         // 两帧滑动平均（调参抖动滤波；首帧直通）
@@ -1326,7 +1452,7 @@ void AcquisitionTab::setLeftImage(cv::Mat& left, uint64_t id) {
             }
         }
     }
-    if (doPreview) {
+    if (doPreview && !judgeOverlaid) {   // 261114 棋盘角点叠加帧已直发则跳过（后到原图会冲掉叠加）
         cv::Mat reducedLeft, reducedRight;
         cv::resize(pairL, reducedLeft, cv::Size(), 0.25, 0.25, cv::INTER_AREA);
         cv::resize(pairR, reducedRight, cv::Size(), 0.25, 0.25, cv::INTER_AREA);

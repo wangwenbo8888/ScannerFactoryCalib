@@ -89,6 +89,11 @@ private:
     // 左右对比度滑条 → 相机源（Galaxy 逐帧 LUT）＋QSettings 持久化（261002）
     void applyContrastFromUi();
 
+    // 261114 模式0（相机标定）棋盘格实时判定（相机回调线程执行）：角点检出/铺满度/
+    // 过曝 → updateJudge 送 UI；双目检出时角点叠加帧经 updateImages 直发并返回
+    // true，调用方据此跳过本帧常规预览 emit（防后到原图冲掉叠加）
+    bool analyzeChessboard(const cv::Mat& leftFull, const cv::Mat& rightFull);
+
     // —— 连续存储（独立写盘线程，全分辨率左右成对帧）——
     void stopRecord();             // 停止存储（幂等；join 留给下次 start 与析构）
     void enqueueRecordPair(cv::Mat left, cv::Mat right);  // 回调线程：已克隆的私有整帧入队
@@ -167,8 +172,11 @@ private:
     // 261108 采集参数实时判定面板（预览行第三列）
     QLabel* judgeLbl_ = nullptr;          // 富文本判定报告
     QSpinBox* judgeExpectSpin_ = nullptr; // 目标线数（左斜/右斜 25、精细 7）
+    QCheckBox* judgeEnabledCheck_ = nullptr;  // 261114 判定启用开关（默认开；取消勾选跳过判定）
     int judgeSkip_ = 0;                   // 分析降频计数（每 10 对分析一次 ≈3Hz）
     std::atomic<int> judgeExpect_{25};    // spin 的回调线程安全缓存
+    std::atomic<bool> judgeEnabled_{true};  // 261114 开关的回调线程安全缓存（默认开）
+    std::atomic<int> laserMode_{0};         // 261114 当前激光模式缓存（0=相机标定棋盘格判定、≥1=激光线判定；回调线程分流用）
     // 261108 自动调参 V1（补光/激光两参，N10 重发；曝光/增益留 V2）
     std::atomic<bool> autoTuneOn_{false};
     std::atomic<long long> lastTuneNs_{0};
