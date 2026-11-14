@@ -1181,6 +1181,7 @@ struct ShotMetrics {
     double bg = 0.0;   // 261108 背景灰度（环境光泄漏指标——右斜 PASS 批
                        // 14~19 稳定 vs 左斜 28~55 波动即残差 6.5 主因）
     int maxRunWidthDs = 0; // 261114 降采样域最大游程宽度（px）
+    cv::Mat overlay;       // 261114 激光线叠加预览图（BGR 小图；空=不叠加）
 };
 static ShotMetrics analyzeShot(const cv::Mat& full) {
     ShotMetrics m;
@@ -1195,12 +1196,8 @@ static ShotMetrics analyzeShot(const cv::Mat& full) {
     m.bg = cv::mean(gray)[0];
     cv::Mat bw;
     cv::threshold(gray, bw, 120, 255, cv::THRESH_BINARY);
-    // 261114 腐蚀 1px（模拟标定 mask erodeSize=3 全分辨率 / 4 ≈ 1px 降采样）
-    // ——刚挨着的线腐蚀后分开；真粘连的仍连着 → 游程宽度暴露
-    cv::erode(bw, bw, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
-    // 线数＝CCL 大组件数（v4 终版：逐行游程受断口/扇面稀疏行干扰不可用
-    // 〔p50=17/max=27 实证〕；组件数为 4-3 同源口径，噪声以 0.7×第 N 大
-    // 面积门滤除；判据放宽 ±3＝辅助级——肉眼数线，面板主打过曝/粘连）
+    // 线数＝CCL 大组件数——用腐蚀前的原图（261114 一修教训：腐蚀后细线
+    // 1~3px 被面积门≥32 滤掉→线数骤降误报「线不足」；线数口径维持 v4 终版）
     cv::Mat labels, statsv, centv;
     const int n = cv::connectedComponentsWithStats(bw, labels, statsv, centv, 8);
     std::vector<int> areas;
@@ -1220,27 +1217,45 @@ static ShotMetrics analyzeShot(const cv::Mat& full) {
         m.lineEst = static_cast<int>(
             std::count_if(areas.begin(), areas.end(),
                           [gate](int a) { return a >= gate; }));
+        // 261114 激光线叠加预览：每个组件画彩色框（绿=计数入线数、黄=检测到但
+        // 被面积门滤掉、红=超大疑似粘连）——让用户直观看到算法「看到了什么」
+        cv::cvtColor(gray, m.overlay, cv::COLOR_GRAY2BGR);
+        for (int i = 1; i < n; ++i) {
+            const int area = statsv.at<int>(i, cv::CC_STAT_AREA);
+            const int hh = statsv.at<int>(i, cv::CC_STAT_HEIGHT);
+            const int ww = statsv.at<int>(i, cv::CC_STAT_WIDTH);
+            if (area < 32 || std::max(hh, ww) < 13) continue;   // 太小不画
+            const int x = statsv.at<int>(i, cv::CC_STAT_LEFT);
+            const int y = statsv.at<int>(i, cv::CC_STAT_TOP);
+            cv::Scalar color(0, 255, 0);                        // 绿=计数入线数
+            if (area < gate) color = cv::Scalar(0, 255, 255);   // 黄=被0.7门滤掉
+            if (area > 3.2 * nth && nth >= 1000) color = cv::Scalar(0, 0, 255); // 红=疑似粘连
+            cv::rectangle(m.overlay, cv::Rect(x, y, ww, hh), color, 1);
+        }
     }
     // 261114 逐行游程宽度（对齐标定 laser_label maxRunWidth 硬门）：
     // 腐蚀后的二值图 → 中部行（或列，按 scanDirection）切一刀 → 数连续亮像素段
     // 降采样域门限 ≈ 全分辨率 30px ÷ 4 ≈ 8px——超过即粘连
     {
+        // 261114 腐蚀仅在游程测量用——分开的线腐蚀后 still 分开（游程小）；
+        // 粘连的线腐蚀后仍连通（游程大）→ 暴露粘连。线数计数不受影响。
+        cv::Mat bwEroded;
+        cv::erode(bw, bwEroded, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
         const int row = scanDirectionGlobal.load(std::memory_order_relaxed) == 1
-                            ? bw.rows / 2          // 斜线形态：水平切
-                            : -1;                   // 竖线形态：用列切
-        if (row >= 0 && row < bw.rows) {
-            const uchar* r = bw.ptr<uchar>(row);
+                            ? bwEroded.rows / 2     // 斜线形态：水平切
+                            : -1;                    // 竖线形态：用列切
+        if (row >= 0 && row < bwEroded.rows) {
+            const uchar* r = bwEroded.ptr<uchar>(row);
             int run = 0;
-            for (int x = 0; x < bw.cols; ++x) {
+            for (int x = 0; x < bwEroded.cols; ++x) {
                 if (r[x] > 0) { ++run; if (run > m.maxRunWidthDs) m.maxRunWidthDs = run; }
                 else run = 0;
             }
-        } else if (!bw.empty()) {
-            // 竖线形态：中心列切
-            const int col = bw.cols / 2;
+        } else if (!bwEroded.empty()) {
+            const int col = bwEroded.cols / 2;
             int run = 0;
-            for (int y = 0; y < bw.rows; ++y) {
-                if (bw.at<uchar>(y, col) > 0) { ++run; if (run > m.maxRunWidthDs) m.maxRunWidthDs = run; }
+            for (int y = 0; y < bwEroded.rows; ++y) {
+                if (bwEroded.at<uchar>(y, col) > 0) { ++run; if (run > m.maxRunWidthDs) m.maxRunWidthDs = run; }
                 else run = 0;
             }
         }
@@ -1432,6 +1447,12 @@ void AcquisitionTab::setLeftImage(cv::Mat& left, uint64_t id) {
                    + report + "<br><span style='color:#b3261e;'>" + tip + "</span>";
         }
         emit updateJudge(report);
+        // 261114 激光线叠加预览：左图叠加帧直发（跳过本帧常规预览 emit——
+        // 两个 Queued 信号按序到达，后发的原图会冲掉先发的叠加）
+        if (!mlRaw.overlay.empty()) {
+            emit updateImages(matBgrToQImage(mlRaw.overlay), matBgrToQImage(mlRaw.overlay));
+            judgeOverlaid = true;
+        }
         // 261108 绿灯→自动停止＋完成提示（一次性任务语义）
         if (autoTuneOn_.load(std::memory_order_relaxed) && (allL && allR)) {
             emit autoTuneRequest(0, 0, 1.0, 0);
