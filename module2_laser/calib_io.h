@@ -126,6 +126,11 @@ struct LaserOpParams {
     // 弱几何数据集（如精细 7 竖线 43% 组合缺失）共识 median 被污染时，
     // 用同机强数据集（如右斜 25 线）的 projectorT 作先验初值压盆地
     std::vector<double> pjcInitialT = {};
+    // 261114 坏线剔除（人工指令）：PJC 拟合前按线号丢弃物理性坏线（如汇聚区
+    // 残差 20~80 倍的线）；空=不剔除（行为不变）。键 pjc.excludeLines（1 起
+    // 线号，与 PLY/labeler 一致）。产物 emissionCurves 少对应曲线——CMTT 表
+    // 该线无条目，扫描时该线不出点（临时方案，机械修复后应清空此键重标）。
+    std::vector<int> pjcExcludeLines = {};
     // PJC 验收门禁阈值（2026-10-04 外置；默认＝CLI 原硬编码 AcceptanceCfg）
     double pjcAccA1MaxLineRms      = 0.5;
     double pjcAccA2MaxP95          = 1.5;

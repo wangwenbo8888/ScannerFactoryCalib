@@ -144,6 +144,10 @@ void applyLaserParamsJson(const json& j, LaserCalibConfig& c, LaserOpParams& ops
         && p["initialT"].size() == 3) {
         ops.pjcInitialT = p["initialT"].get<std::vector<double>>();
     }
+    // 261114 坏线剔除（int 数组；空=忽略）——见 calib_io.h pjcExcludeLines 注释
+    if (p.contains("excludeLines") && p["excludeLines"].is_array()) {
+        ops.pjcExcludeLines = p["excludeLines"].get<std::vector<int>>();
+    }
         if (p.contains("useBlockJtJ"))          ops.pjcUseBlockJtJ          = p["useBlockJtJ"].get<bool>();
         if (p.contains("anomalyRmsThreshold"))  ops.pjcAnomalyRmsThreshold  = p["anomalyRmsThreshold"].get<double>();
         if (p.contains("robustEnabled"))        ops.pjcRobustEnabled        = p["robustEnabled"].get<bool>();

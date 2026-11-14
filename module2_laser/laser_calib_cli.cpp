@@ -709,6 +709,22 @@ int fc::runLaserCalibRaw(const std::string& inDir, const std::string& outPath) {
             for (auto& kv : poseByLine)
                 byLine[kv.first].push_back(std::move(kv.second));
         }
+        // 261114 坏线剔除（人工指令）：物理性坏线（汇聚区残差 20~80 倍）拖垮
+        // 共享 T 拟合与 F7 漂移验收——按 config pjc.excludeLines 丢弃（1 起线号）。
+        // 产物少对应发射曲线（CMTT/扫描该线无表条目→不出点）；机械修复后清空
+        // 此键重标即恢复全 25 线。
+        if (!ops.pjcExcludeLines.empty()) {
+            int dropped = 0;
+            std::string ids;
+            for (int lid : ops.pjcExcludeLines) {
+                const auto it = byLine.find(lid);
+                if (it != byLine.end()) { byLine.erase(it); ++dropped; }
+                if (!ids.empty()) ids += ",";
+                ids += std::to_string(lid);
+            }
+            spdlog::warn("pjc.excludeLines: dropped {}/{} lines [{}], {} remain",
+                         dropped, ops.pjcExcludeLines.size(), ids, byLine.size());
+        }
 
         calib::MultiLineInput mlIn;
         for (auto& kv : byLine) mlIn.lines.push_back(std::move(kv.second));
