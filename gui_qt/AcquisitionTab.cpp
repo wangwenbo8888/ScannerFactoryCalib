@@ -540,8 +540,7 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
         spdlog::info("[Scanner] G02 温度 A:{:.1f} B:{:.1f} C:{:.1f} D:{:.1f}", a, b, c, d);
     };
 
-    // 串口通讯监视弹窗：随软件打开自动弹出（非模态，不挡主界面操作），
-    // 关掉后可点「🖥 串口监视」重开
+    // 串口通讯监视弹窗：261114 改为默认不弹出（调试时手动点「🖥 串口监视」打开）
     monitor_ = new SerialMonitorDialog(this);
     connect(this, &AcquisitionTab::serialTx, monitor_, &SerialMonitorDialog::appendTx);
     connect(this, &AcquisitionTab::serialRx, monitor_, &SerialMonitorDialog::appendRx);
@@ -554,8 +553,7 @@ AcquisitionTab::AcquisitionTab(QWidget* parent) : QWidget(parent) {
     // 开机自动：开串口 → 开设备（注册帧回调）。
     // 扫描仪启动留给用户点（onStartScanner 里发 N10 + 自动进预览）。
     // 延迟到事件循环启动后执行，避免在构造函数里阻塞 UI
-    QTimer::singleShot(0, this, [this] {
-        monitor_->show();   // 串口监视弹窗随软件打开自动弹出
+    QTimer::singleShot(0, this, [this]() {
         autoStart();
     });
 }
@@ -1447,11 +1445,11 @@ void AcquisitionTab::setLeftImage(cv::Mat& left, uint64_t id) {
             const int lineTol = expect >= 15 ? 5 : 2;   // 261108 自适应：25线±5、7线±2（fine 基线 7~9 实证）
             const bool okLines = std::abs(m.lineEst - expect) <= lineTol;
             const bool okBg = true;   // 261114 背景改信息项——线数+游程是直接指标，背景只是间接风险提示
-            QString s = QString("%1眼：过曝%2 %3 背景%4 线数%5 %6 游程%7px %8")
+            QString s = QString("%1眼：过曝%2 %3 线数%4 %5 游程%6px %7（背景%8）")
                 .arg(tag, QString::number(m.hotPct, 'f', 2) + "%", okHot ? "✓" : "✗")
-                .arg(QString::number(m.bg, 'f', 0), okBg ? "✓" : "✗")
                 .arg(QString::number(m.lineEst), okLines ? "✓" : "✗")
-                .arg(QString::number(m.maxRunWidthDs), okWide ? "✓" : "✗");
+                .arg(QString::number(m.maxRunWidthDs), okWide ? "✓" : "✗")
+                .arg(QString::number(m.bg, 'f', 0));
             return s;
         };
         const char* now = QDateTime::currentDateTime().toString("HH:mm:ss").toUtf8().constData();
@@ -1472,7 +1470,7 @@ void AcquisitionTab::setLeftImage(cv::Mat& left, uint64_t id) {
                 if (m->lineEst < expect - (expect >= 15 ? 5 : 2)) tip += QString("%1眼线数不足→升亮度/激光档半档；").arg(tag);
                 if (m->lineEst > expect + (expect >= 15 ? 5 : 2)) tip += QString("%1眼多线→降补光/激光档；").arg(tag);
                 if (m->hotPct > 5.0) tip += QString("%1眼过曝→降激光档；").arg(tag);
-                if (m->bg > 25.0) tip += QString("%1眼背景%2高→关补光/挡环境光；").arg(tag).arg(int(m->bg));
+                // 261114 背景不再是判定条件——移除背景相关调参提示
             }
             report = QString("<p style='color:#b3261e; font-weight:bold;'>✗ 继续调整</p>")
                    + report + "<br><span style='color:#b3261e;'>" + tip + "</span>";
