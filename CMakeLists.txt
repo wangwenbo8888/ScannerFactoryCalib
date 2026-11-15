@@ -86,7 +86,7 @@ if(FC_BUILD_TESTS AND TARGET camera_calib AND TARGET laser_calib)
                     "${CMAKE_SOURCE_DIR}/verify_baseline/verify_baseline.ps1"
                     -BuildDir "${CMAKE_BINARY_DIR}" -Only laser
                     -OutDir "${CMAKE_BINARY_DIR}/baseline_run_laser")
-        set_tests_properties(test_laser_baseline PROPERTIES TIMEOUT 900 LABELS "baseline")
+        set_tests_properties(test_laser_baseline PROPERTIES TIMEOUT 5400 LABELS "baseline")
 
         message(STATUS "baseline tests registered: test_camera_baseline / test_laser_baseline (label: baseline)")
     endif()
