@@ -46,8 +46,8 @@ add_library(fc1_chess STATIC chessboard_corner.cpp chessboard_corner.h)
 target_include_directories(fc1_chess PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(fc1_chess PUBLIC ${OpenCV_LIBS} spdlog::spdlog)
 
-# === 模块1 I/O（calib_io 读 config/温度/图像 + 写交接 json；calib_runner=GUI 分步 API） ===
-add_library(fc1_io STATIC calib_io.cpp calib_io.h calib_runner.cpp calib_runner.h)
+# === 模块1 I/O（calib_io 读 config/温度/图像 + 写交接 json） ===
+add_library(fc1_io STATIC calib_io.cpp calib_io.h calib_runner.cpp calib_runner.h)  # 261120：calib_runner=GUI 分步 API（build_fc_all 需要）
 target_include_directories(fc1_io PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(fc1_io PUBLIC fc1_ops ${OpenCV_LIBS} nlohmann_json::nlohmann_json spdlog::spdlog)
 

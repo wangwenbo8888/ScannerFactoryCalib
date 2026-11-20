@@ -7,21 +7,6 @@ data_out/*
 !data_in/.gitkeep
 !data_out/.gitkeep
 
-# 关闭 GUI 时自动备份的标定图像（运行时数据，不入库）
-data_bak/
-
-# 调试诊断文件（ofstream/spdlog file sink 生成，不入库）
-debug.txt
-factory_calib.log
-
-# test assets unified under the root directory (2026-10-05): binary images and sidecar stay on disk, gold-standard JSON/parameters are checked into the repo
-/test_data/**/*.png
-/test_data/**/*.bmp
-/test_data/**/*.bin
-
-# 261101 移植：模块内本地数据集（E 机运行时资产，不入库；缺席时相关测试按约定 SKIP）
+# 测试数据集（真实样本图与 GB 级标定产物 bin，不入库；261114 换血时补）
 module1_camera/test_data/
 module2_laser/test_data/
-
-# 分析工具运行输出（不入库）
-module1_camera/tools/analyze_camera_calib/out/

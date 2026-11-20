@@ -4,9 +4,7 @@ find_package(OpenCV 4.13 REQUIRED COMPONENTS
 find_package(Eigen3 3.4 REQUIRED)
 # E(2026-09-03): 链接 OpenMP——此前 curve_map 行级 #pragma omp 被静默忽略（61 档生成串行）；
 # 写法对齐 09 侧（modules/09_operatorlib/CMakeLists.txt:49,65）
-# 注：限定 COMPONENTS CXX——本工程 CUDA 语言已启用，不限定时 FindOpenMP 会连带要求
-# OpenMP_CUDA（MSVC 无 CUDA OpenMP 实现而误报失败）；模块仅消费 OpenMP::OpenMP_CXX
-find_package(OpenMP REQUIRED COMPONENTS CXX)
+find_package(OpenMP REQUIRED COMPONENTS CXX)   # 261120 修：限定 CXX——CUDA 工程中 FindOpenMP 连带探测 OpenMP_CUDA（nvcc 不支持）致整包失败（与主工程 09 同款修复）
 
 file(GLOB_RECURSE M2_OP_CPP "${CMAKE_CURRENT_SOURCE_DIR}/operators/*.cpp")
 file(GLOB_RECURSE M2_OP_CU  "${CMAKE_CURRENT_SOURCE_DIR}/operators/*.cu")
@@ -81,17 +79,19 @@ if(EXISTS "${OpenCV_DIR}/x64/vc17/lib/opencv_imgcodecs4130.lib")
     set(FC2_IMGCODECS_LIB "${OpenCV_DIR}/x64/vc17/lib/opencv_imgcodecs4130.lib")
 elseif(EXISTS "${OpenCV_DIR}/lib/opencv_imgcodecs4130.lib")
     set(FC2_IMGCODECS_LIB "${OpenCV_DIR}/lib/opencv_imgcodecs4130.lib")
+elseif(EXISTS "${OpenCV_DIR}/opencv_imgcodecs4130.lib")   # 261120：OpenCV_DIR 直接就是 lib 目录的布局（F:/opencv4.13/install/x64/vc17/lib）
+    set(FC2_IMGCODECS_LIB "${OpenCV_DIR}/opencv_imgcodecs4130.lib")
 endif()
 
 if(TARGET fc2_ops AND FC2_IMGCODECS_LIB)
-    # 将 laser_calib_cli.cpp 也编进 fc2_io（FC2_BUILDING_LIB 让它跳过 main()），
+    # laser_calib_cli.cpp 也编进 fc2_io（FC2_BUILDING_LIB 让它跳过 main()），
     # calib_runner 三件套 = GUI 进程内调用入口（与产线 GUI 库链接约定一致）
     add_library(fc2_io STATIC calib_io.cpp calib_io.h
                             calib_runner.cpp calib_runner.h
-                            laser_calib_cli.cpp
-                            laser_calib_runner_internal.h)
-    target_include_directories(fc2_io PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+                            laser_calib_runner_internal.h
+                            laser_calib_cli.cpp)
     target_compile_definitions(fc2_io PRIVATE FC2_BUILDING_LIB)
+    target_include_directories(fc2_io PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(fc2_io PUBLIC
         fc2_ops ${OpenCV_LIBS} ${FC2_IMGCODECS_LIB}
         nlohmann_json::nlohmann_json spdlog::spdlog)
@@ -140,7 +140,7 @@ endif()
 if(FC_BUILD_TESTS)
     foreach(t ${M2_TESTS})
         get_filename_component(tname ${t} NAME_WE)
-        set(tname "fc2_${tname}")  # 加 fc2_ 前缀避免与模块1测试同名冲突（合入 build_fc_all）
+        set(tname "fc2_${tname}")  # fc2_ 前缀避免与模块1测试同名冲突（合编 build_fc_all）——261120 采用 260705 方案
         add_executable(${tname} ${t})
         if(TARGET fc2_ops)
             target_link_libraries(${tname} PRIVATE fc2_ops GTest::gtest_main)
