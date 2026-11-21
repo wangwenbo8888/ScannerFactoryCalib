@@ -3,6 +3,8 @@
 #include <opencv2/core.hpp>
 #include <opencv2/calib3d.hpp>
 
+#include <thread>
+#include <exception>
 #include <fstream>
 #include <algorithm>
 #include <cmath>
@@ -118,8 +120,28 @@ public:
 
         spdlog::info("Valid frames: " + std::to_string(result.valid_frames_count) + "/" + std::to_string(left_points.size()));
 
-        calibrateMonocular(object_points, valid_left, result.left);
-        calibrateMonocular(object_points, valid_right, result.right);
+        // 【A1-261114 批次四' · 左右目内参并行】两眼 calibrateMonocular 完全独立
+        // （各自单线程确定性计算, 无共享可变状态）→ std::thread 并行结果与串行
+        // 逐位一致（E2 实验已验证, 当时因角点占大头仅省 3s 未采纳; TermCriteria
+        // 修复后内参 ~3.9s, 并行省 ~1.8s）。
+        {
+            std::exception_ptr eptr = nullptr;
+            std::thread rightEye([&]() {
+                try {
+                    calibrateMonocular(object_points, valid_right, result.right);
+                } catch (...) {
+                    eptr = std::current_exception();
+                }
+            });
+            try {
+                calibrateMonocular(object_points, valid_left, result.left);
+            } catch (...) {
+                rightEye.join();
+                throw;
+            }
+            rightEye.join();
+            if (eptr) std::rethrow_exception(eptr);
+        }
 
         computeQualityMetrics(result);
 
@@ -265,12 +287,15 @@ private:
 
         if (params_.use_calibrateCameraRO) {
             cv::Mat new_obj_points;
+            // A1-261114: TermCriteria 修复——OpenCV 默认 EPS=DBL_EPSILON(2.2e-16) 永不可达
+            // → 恒跑满 30 轮。改为 1e-10 让 LM 收敛后自然停止（典型 8-15 轮）。
             result.rms_error = cv::calibrateCameraRO(
                 object_points, image_points, params_.imageSize(),
                 0,
                 result.camera_matrix, result.dist_coeffs,
                 result.rvecs, result.tvecs, new_obj_points,
-                params_.calib_flags);
+                params_.calib_flags,
+                cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 30, 1e-10));
         } else {
             result.rms_error = cv::calibrateCamera(
                 object_points, image_points, params_.imageSize(),

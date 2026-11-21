@@ -621,6 +621,113 @@ TEST_F(ProjectorJointCalibTest, MultiLineSyntheticWithNoise) {
     EXPECT_NEAR(r.projectorT[2], sc.t_true[2], 8.0);
 }
 
+// ============================================================================
+// 解析雅可比（B3-261114）：FD ↔ 解析等价对拍
+// 同起点同迭代数 → 轨迹重合度即雅可比装配正确性检验（漏项/反号是 O(1) 误差必被抓）
+// ============================================================================
+
+namespace {
+void expectMultiResultsClose(const MultiLineResult& a, const MultiLineResult& b,
+                             double tTol, double cTol) {
+    ASSERT_EQ(a.success, b.success);
+    for (int k = 0; k < 3; ++k)
+        EXPECT_NEAR(a.projectorT[k], b.projectorT[k], tTol) << "t[" << k << "]";
+    ASSERT_EQ(a.emissionCurves.size(), b.emissionCurves.size());
+    for (size_t l = 0; l < a.emissionCurves.size(); ++l)
+        for (int k = 0; k < 6; ++k)
+            EXPECT_NEAR(a.emissionCurves[l].coeffs[k], b.emissionCurves[l].coeffs[k], cTol)
+                << "line " << l << " coeff " << k;
+}
+} // namespace
+
+// 1 步 L2（F7/探针口径）：第一步 LM 步由 J 决定——FD(eps=1e-7 截断 ~1e-6 相对) 与
+// 解析在同起点的步后状态差应 ~1e-5 量级（首步 ~10mm 位移 × 1e-6）
+TEST_F(ProjectorJointCalibTest, AnalyticJacOneStepMatchesFD_L2) {
+    auto sc = makeMultiScene(8, 300, 0.0, 42, 4);
+    ProjectorJointCalibParams p1 = params_;
+    p1.maxIterations = 1;
+    p1.robustEnabled = false;
+    p1.irlsMaxRounds = 0;
+    p1.jacThreads = 1;
+    ProjectorJointCalib opFD(p1);
+    auto rFD = opFD.ExecuteMultiLine(sc.input);
+    ASSERT_TRUE(rFD.success) << rFD.message;
+
+    ProjectorJointCalibParams p2 = p1;
+    p2.analyticJacobians = true;
+    ProjectorJointCalib opAN(p2);
+    auto rAN = opAN.ExecuteMultiLine(sc.input);
+    ASSERT_TRUE(rAN.success) << rAN.message;
+
+    expectMultiResultsClose(rFD, rAN, 1e-4, 1e-5);
+}
+
+// 鲁棒核多步（噪声触发 Huber 内/尾区与 Cauchy 相, 覆盖 w_rob' 分支与 α 全式）
+TEST_F(ProjectorJointCalibTest, AnalyticJacRobustMatchesFD) {
+    auto sc = makeMultiScene(8, 300, 0.2, 7, 4);
+    ProjectorJointCalibParams p1 = params_;
+    p1.maxIterations = 5;
+    p1.robustEnabled = true;
+    p1.irlsMaxRounds = 0;
+    p1.jacThreads = 1;
+    ProjectorJointCalib opFD(p1);
+    auto rFD = opFD.ExecuteMultiLine(sc.input);
+    ASSERT_TRUE(rFD.success) << rFD.message;
+
+    ProjectorJointCalibParams p2 = p1;
+    p2.analyticJacobians = true;
+    ProjectorJointCalib opAN(p2);
+    auto rAN = opAN.ExecuteMultiLine(sc.input);
+    ASSERT_TRUE(rAN.success) << rAN.message;
+
+    expectMultiResultsClose(rFD, rAN, 1e-3, 1e-4);
+}
+
+// IRLS 外部权（robustW 冻结 → 解析导数≡0 分支）
+TEST_F(ProjectorJointCalibTest, AnalyticJacIRLSMatchesFD) {
+    auto sc = makeMultiScene(8, 300, 0.2, 7, 4);
+    ProjectorJointCalibParams p1 = params_;
+    p1.maxIterations = 4;
+    p1.robustEnabled = true;
+    p1.irlsMaxRounds = 1;
+    p1.jacThreads = 1;
+    ProjectorJointCalib opFD(p1);
+    auto rFD = opFD.ExecuteMultiLine(sc.input);
+    ASSERT_TRUE(rFD.success) << rFD.message;
+
+    ProjectorJointCalibParams p2 = p1;
+    p2.analyticJacobians = true;
+    ProjectorJointCalib opAN(p2);
+    auto rAN = opAN.ExecuteMultiLine(sc.input);
+    ASSERT_TRUE(rAN.success) << rAN.message;
+
+    expectMultiResultsClose(rFD, rAN, 1e-3, 1e-4);
+}
+
+// 全程收敛等价（终点同盆, 终态指标差在数值门内）
+TEST_F(ProjectorJointCalibTest, AnalyticJacFullSolveMatchesFD) {
+    auto sc = makeMultiScene(8, 400, 0.1, 11, 4);
+    ProjectorJointCalibParams p1 = params_;
+    p1.maxIterations = 60;
+    p1.robustEnabled = true;
+    p1.irlsMaxRounds = 1;
+    p1.jacThreads = 1;
+    ProjectorJointCalib opFD(p1);
+    auto rFD = opFD.ExecuteMultiLine(sc.input);
+    ASSERT_TRUE(rFD.success) << rFD.message;
+
+    ProjectorJointCalibParams p2 = p1;
+    p2.analyticJacobians = true;
+    ProjectorJointCalib opAN(p2);
+    auto rAN = opAN.ExecuteMultiLine(sc.input);
+    ASSERT_TRUE(rAN.success) << rAN.message;
+
+    // 终点比较：t 收敛到同极小点（容差按优化器收敛水平）
+    expectMultiResultsClose(rFD, rAN, 5e-3, 5e-3);
+    EXPECT_NEAR(rFD.finalSampsonRms, rAN.finalSampsonRms,
+                1e-3 * std::max(1.0, rFD.finalSampsonRms));
+}
+
 // 对照: 同一多线数据混喂单线 Execute 应崩坏（rms 高）, ExecuteMultiLine 应正常
 TEST_F(ProjectorJointCalibTest, MultiLineVsMixedSingleLine) {
     auto sc = makeMultiScene(8, 800, 0.2, 7, 5);

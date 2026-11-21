@@ -5,7 +5,9 @@
 //       CurveMapGenerator 换成 CurveMapCuda（GPU 求交）。
 // 复用: TempParamInterpolator / rescaleCurve / cmttTierGridMatches / CmttBuilder
 //       均为现有算子公开 API，本目录不改任何现有算子。
-// 差异声明: 档级串行（GPU 内部已高度并行）；产物 sidecar 结构与生产一致，
+// 差异声明: 档级双执行流流水线（2026-11-14，原子领档；tierThreads 1=串行回退,
+//           0/负=自动→2——GPU 默认流全局串行天花板下 2 流即饱和, 与 CPU 版
+//           "0=min(硬件线程-2,16)" 语义不同）; 产物 sidecar 结构与生产一致，
 //           字节级不保证与 CPU 版逐位相同（浮点边界），见 curve_map_cuda.h。
 
 #pragma once

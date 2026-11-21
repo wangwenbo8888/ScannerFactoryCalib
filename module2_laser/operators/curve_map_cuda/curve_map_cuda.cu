@@ -319,22 +319,25 @@ CurveMapResult CurveMapCuda::Generate(const CurveMapInput& in) {
         std::vector<std::vector<GroupBuild>> rowGroups((size_t)nRows);
         uint32_t totalEntries = 0;
         uint32_t rowsWithData = 0;
+        result.covers.reserve(nEntries);
 
         size_t i = 0;
         while (i < nEntries) {
             const int r = ents[i].rowAbs;
             const int l = ents[i].line;
             size_t j = i;
+            while (j < nEntries && ents[j].rowAbs == r && ents[j].line == l) ++j;
             GroupBuild g;
             g.lid = static_cast<uint8_t>(l + 1);
             g.anchor = ents[i].uLq;
+            g.words.reserve(j - i);
             uint16_t prevUL = 0;
             int32_t prevDint = 0;
             bool first = true;
             int sinceAnchor = 0;
-            while (j < nEntries && ents[j].rowAbs == r && ents[j].line == l) {
-                const uint16_t uLq = ents[j].uLq;
-                const int32_t dInt = ents[j].dInt;
+            for (size_t q = i; q < j; ++q) {
+                const uint16_t uLq = ents[q].uLq;
+                const int32_t dInt = ents[q].dInt;
                 const int32_t dd = dInt - prevDint;
                 const int32_t du = first ? 0 : (int32_t)(uLq - prevUL);
                 const bool overZigzag = zigzagEnc(dd) > 0x3FF;
@@ -350,7 +353,6 @@ CurveMapResult CurveMapCuda::Generate(const CurveMapInput& in) {
                 prevUL = uLq; prevDint = dInt;
                 first = false;
                 sinceAnchor = needEscape ? 0 : sinceAnchor + 1;
-                ++j;
             }
             g.count = static_cast<uint32_t>(j - i);
             rowGroups[(size_t)r].push_back(std::move(g));
@@ -394,6 +396,8 @@ CurveMapResult CurveMapCuda::Generate(const CurveMapInput& in) {
         h.entryCount = totalEntries;
         h.rowMin = static_cast<uint32_t>(rowMin);
         h.dataRows = static_cast<uint32_t>(nRows);
+        buf.reserve(sizeof(HeaderV1) + ((size_t)nRows + 1) * sizeof(uint64_t)
+                    + result.covers.size() * 11 + result.entryCount * 2 + 65536);
         writePOD(buf, h);
         const size_t indexPos = buf.size();
         std::vector<uint64_t> offsets((size_t)nRows + 1, 0);
@@ -406,7 +410,8 @@ CurveMapResult CurveMapCuda::Generate(const CurveMapInput& in) {
                 writePOD(buf, g.anchor);
                 const uint32_t wn = static_cast<uint32_t>(g.words.size());
                 writePOD(buf, wn);
-                for (uint16_t w : g.words) writePOD(buf, w);
+                const uint8_t* wp = reinterpret_cast<const uint8_t*>(g.words.data());
+                buf.insert(buf.end(), wp, wp + g.words.size() * sizeof(uint16_t));
             }
         }
         offsets[(size_t)nRows] = buf.size();

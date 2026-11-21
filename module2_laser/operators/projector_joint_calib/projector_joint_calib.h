@@ -29,6 +29,8 @@ struct ProjectorJointCalibParams {
     int    curveDegree          = 3;       // 曲线阶数：2=二阶多项式, 3=三阶/隐式6参数
     bool   useCeres             = false;  // 优化后端：false=手写LM, true=Ceres(需BUILD_CERES)
     bool   useBlockJtJ          = true;   // B·块稀疏GN：true=按线 J_lᵀJ_l 累加 H/g（弃 M×P 稠密 J），false=稠密 JᵀJ 回退
+    int    jacThreads           = 0;      // 雅可比装配 OpenMP 线程（0=auto, 1=串行逐位一致路径, >1 指定；F7 任务内须置 1 防超订阅）
+    bool   analyticJacobians    = true;   // B3-261114 解析雅可比（真数据门: rms relDiff 7.5e-9/t 差 1e-6mm/A5-A7 一致）: t 列+C 列一次逐点解析装配替代 3 全量+6L 线内差分；Phase B(uR 行)自动回差分。false=回 FD 差分路径
 
     double anomalyRmsThreshold  = 0.15;   // 异常拟合检测：finalSampsonRms 超此值则判 Warning（实测 σ=0.2 正常≈0.045，伪极小值陷阱≈0.48）
 
@@ -73,7 +75,9 @@ struct ProjectorJointCalibParams {
             {"cauchyToL2Thresh", cauchyToL2Thresh},
             {"topologyEpsilon", topologyEpsilon},
             {"anomalyRmsThreshold", anomalyRmsThreshold},
-            {"useBlockJtJ", useBlockJtJ}
+            {"useBlockJtJ", useBlockJtJ},
+            {"jacThreads", jacThreads},
+            {"analyticJacobians", analyticJacobians}
         };
     }
 
@@ -92,6 +96,8 @@ struct ProjectorJointCalibParams {
         if (j.contains("topologyEpsilon")) p.topologyEpsilon = j.at("topologyEpsilon").get<double>();
         if (j.contains("anomalyRmsThreshold")) p.anomalyRmsThreshold = j.at("anomalyRmsThreshold").get<double>();
         if (j.contains("useBlockJtJ")) p.useBlockJtJ = j.at("useBlockJtJ").get<bool>();
+        if (j.contains("jacThreads")) p.jacThreads = j.at("jacThreads").get<int>();
+        if (j.contains("analyticJacobians")) p.analyticJacobians = j.at("analyticJacobians").get<bool>();
         p.validate();
         return p;
     }
@@ -153,6 +159,15 @@ struct ProjectorJointCalibResult {
 // lines[i] = 该线的全部姿态点集（跨姿态聚合）；同一物理光心、不同发射曲线。
 // ============================================================================
 
+/// 单姿态降噪预计算条目（F7 短解共享缓存，2026-11-14）
+struct MultiLinePoseDenoise {
+    /// 过 minPointsPerPose 门（denoisePoses 对不足姿态整体 continue 的语义）
+    bool   passed = false;
+    double thickness = 0.0;         // 帧内点 RMS 离面厚度 (mm)（passed 时有效）
+    int    pointCount = 0;          // 降噪后点数（passed 时有效）
+    std::vector<cv::Vec3d> points;  // 降噪点（passed 时有效）
+};
+
 struct MultiLineInput {
     /// 每条线一组 PosePointSet（lines[lineIdx][poseIdx]）
     std::vector<std::vector<PosePointSet>> lines;
@@ -164,7 +179,23 @@ struct MultiLineInput {
     double baseline        = 0.0;   // 右基线 B = |P2(0,3)|/f（mm）；enableRightTerm 时须 >0
     bool   enableRightTerm = false; // 默认 false：残差布局/行为与现状逐位一致
     double rightTermWeight = 1.0;   // 像素域相对权重（1 ⇔ 1px uR ≡ 1px Sampson）
+
+    // —— F7 预计算降噪缓存（可选，2026-11-14 性能优化；空=现场计算，行为不变）——
+    // 与 lines 同构 [line][pose]。剔线/剔姿态（F7 漂移解）须同步删除对应缓存
+    // 条目；结构不符（尺寸不匹配）时 ExecuteMultiLine 自动回退现场计算。
+    // 须以与消费方一致的参数族构建（见 buildMultiLineDenoiseCache）。
+    std::vector<std::vector<MultiLinePoseDenoise>> denoiseCache;
 };
+
+/// 预计算逐线×逐姿态降噪缓存（与 ExecuteMultiLine Step 0 同实现）。
+/// denoisePoses 逐姿态独立 → 缓存可对任意线/姿态子集按原序精确重组，
+/// 与现场计算逐位一致（纯缓存，不改变计算序）。F7 的 28 个短解共享一份
+/// 缓存免重复降噪（~70-90ms×28 CPU → 1 次）。
+/// @param params 须与消费方 ExecuteMultiLine 实例的参数族一致
+///               （F7 短解用默认参数族: planeFitInlierThresh/curveDegree/minPointsPerPose）
+SCANNER_API std::vector<std::vector<MultiLinePoseDenoise>>
+buildMultiLineDenoiseCache(const std::vector<std::vector<PosePointSet>>& lines,
+                           const ProjectorJointCalibParams& params);
 
 struct MultiLineResult {
     bool               success = false;
@@ -208,6 +239,10 @@ struct MultiLineResult {
     // —— F8 右目重投影残差诊断（Phase B）——
     bool   rightTermUsed = false;
     int    phaseBIters = 0;
+    /// Phase-A（主循环＋IRLS 收敛、Phase B 入口前）的 t。
+    /// F7 漂移解禁用 Phase B（对齐盆地探针先例, uR 不进漂移/盆地口径）→
+    /// 漂移参考须取同口径的 Phase-A t, 否则 ‖t_PB−t_PA‖ 常量偏置污染 A5/A6/A7。
+    cv::Vec3d phaseAT = cv::Vec3d(0, 0, 0);
     double urBiasPreRms  = 0.0;       // Phase B 入口 |ΔuR| rms（px）
     double urBiasPostRms = 0.0;       // Phase B 结束 |ΔuR| rms（px）
     std::vector<double> urBiasPrePerLine;   // 逐线带符号均值（px, 与 usedLineIdx 对应）

@@ -6,9 +6,13 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <vector>
 #include <algorithm>
 #include <stdexcept>
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 
 #if defined(BUILD_CERES)
 #include <ceres/ceres.h>
@@ -187,6 +191,12 @@ double sampsonRmsRaw(const std::vector<cv::Vec3d>& pts, const cv::Vec3d& t,
 ProjectorJointCalib::ProjectorJointCalib(const ProjectorJointCalibParams& params)
     : params_(params)
 {
+    // 【W1-261117 验证期回退开关】JMW_PJC_ANALYTIC=0 → 强制差分雅可比旧路径（B3 解析为默认）。
+    // 产线 07 硬编码默认构造、pjc.analyticJacobians 配置键够不着，env 为唯一运行时通道
+    // （先例 JMW_LMV5）；终验后可移除。fc/09 两侧同款，保持逐字同步。
+    if (const char* sw = std::getenv("JMW_PJC_ANALYTIC")) {
+        if (sw[0] == '0') params_.analyticJacobians = false;
+    }
     params_.validate();
 }
 
@@ -463,12 +473,18 @@ ProjectorJointCalibResult ProjectorJointCalib::Execute(const ProjectorJointCalib
             t = tBest;
             for (int k = 0; k < 6; ++k) C[k] = Cbest[k];
             lambdaReg = std::max(lambdaReg * params_.lambdaDecay, lambdaRegMin);
-            computeResiduals(cleanPts, t, C, f, pp, np, lambdaReg, r0, cost0);
-            costHist.push_back(cost0);
+            // 【B1-261114 · relDrop30 数据项口径】与多线版修复（:1506/:1528）同款：
+            // cost0 含 λReg·(A'²+B'²+Cc'²) 尾项, λReg 每迭代 ×0.95 衰减使正则项持续
+            // 缩小 → 数据零改善时 relDrop30 仍可 >5%（喂饱假下降）→ 单线解恒跑满
+            // 100 迭代。改推数据项 costS（与 λReg 无关）——优化路径逐位不变, 仅终止
+            // 时机变。trial 接受比较仍用全量 cost0（不动）。
+            double costS0 = 0.0;
+            computeResiduals(cleanPts, t, C, f, pp, np, lambdaReg, r0, cost0, &costS0);
+            costHist.push_back(costS0);
             if (stepNorm < params_.convergenceThreshold) break;
             if (iter >= 30) {
                 const double ref = costHist[iter - 30];
-                const double relDrop30 = (ref > 1e-15) ? (ref - cost0) / ref : 0.0;
+                const double relDrop30 = (ref > 1e-15) ? (ref - costS0) / ref : 0.0;
                 if (relDrop30 < 0.05) break;   // 30-iter 窗口 cost 平台：防 tz 末期漂移
             }
             if (!improved && lambda >= 1e8) break;
@@ -813,9 +829,13 @@ static RightTermCtx freezeRightCtx(
     return ctx;
 }
 
+// P0-2: costSOut 可选拆分输出（点部分代价, 不含 λReg·quad 正则项）——与单线版
+// computeResiduals 的 costSOut 先例同款; 组合式 cost 不变, 传参与否数值零变化。
+// 消费方: 主循环接受步免全量重算（点部分复用试探值, 仅正则部分随 λReg 重写）。
 void computeMultiResiduals(const MultiLineData& d, const cv::Vec3d& t,
                            const std::vector<std::array<double, 6>>& Cs,
-                           Eigen::VectorXd& r, double& cost) {
+                           Eigen::VectorXd& r, double& cost,
+                           double* costSOut = nullptr) {
     const size_t L = d.linePts->size();
     size_t nTotal = 0;
     for (size_t l = 0; l < L; ++l) nTotal += (*d.linePts)[l].size();
@@ -907,6 +927,124 @@ void computeMultiResiduals(const MultiLineData& d, const cv::Vec3d& t,
             s += Cs[l][0]*Cs[l][0] + Cs[l][1]*Cs[l][1] + Cs[l][2]*Cs[l][2];
         return s;
     }();
+    if (costSOut) *costSOut = costS;
+}
+
+// 【C2-261114 · 按线并行残差评估】jacThreads>1 且 L>=2 时主解/探针/阶梯重试走此
+// 路径（F7 任务 jacThreads=1 自动豁免＝旧串行路径逐位不变）。逐点算术逐字镜像
+// computeMultiResiduals（含 uR 行/robustW/兜底段）；行域按线严格不相交 → r 向量
+// 逐位一致。costS 线内累加＋线间 l 升序合并（浮点结合律变化, 相对差 ~1e-15）→
+// 数值门口径（B3 解析雅可比先例 rms relDiff 7.5e-9）。分线写入＋固定序合并 →
+// 结果与并行线程数/调度序无关。
+void computeMultiResidualsPar(const MultiLineData& d, const cv::Vec3d& t,
+                              const std::vector<std::array<double, 6>>& Cs,
+                              Eigen::VectorXd& r, double& cost,
+                              double* costSOut, int threads) {
+    const size_t L = d.linePts->size();
+    std::vector<Eigen::Index> off(L, 0);
+    size_t nTotal = 0;
+    for (size_t l = 0; l < L; ++l) {
+        off[l] = static_cast<Eigen::Index>(nTotal);
+        nTotal += (*d.linePts)[l].size();
+    }
+    const bool rtOn = d.urCtx && d.urCtx->on;
+    r.resize(static_cast<Eigen::Index>(nTotal + (rtOn ? nTotal : 0) + 3 * L));
+    std::vector<double> costSl(L, 0.0);
+    auto evalLine = [&](size_t l) {
+        const auto& pts = (*d.linePts)[l];
+        const NormParams& np = (*d.nps)[l];
+        const double C[6] = {Cs[l][0], Cs[l][1], Cs[l][2], Cs[l][3], Cs[l][4], Cs[l][5]};
+        double Craw[6] = {0,0,0,0,0,0};
+        if (rtOn) denormalizeCurve(Cs[l].data(), np, Craw);
+        double cS = 0.0;
+        Eigen::Index ri = off[l];
+        size_t ptIdx = 0;
+        const size_t nPoses = d.ptsPerPose && !d.ptsPerPose->empty()
+            ? (*d.ptsPerPose)[l].size() : 0;
+        for (size_t pi = 0; pi < nPoses; ++pi) {
+            const double Ws = (d.poseW && !d.poseW->empty())
+                ? (*d.poseW)[l][pi] : 1.0;
+            const int nPts = (*d.ptsPerPose)[l][pi];
+            for (int k = 0; k < nPts; ++k, ++ptIdx) {
+                const ProjSample s = projectNorm(pts[ptIdx], t, d.f, d.pp, np);
+                double F, Fu, Fv;
+                evalCurve(C, s.up, s.vp, F, Fu, Fv);
+                double denom = std::sqrt(Fu * Fu + Fv * Fv);
+                if (denom < 1e-12) denom = 1e-12;
+                double w = s.Zp / d.f;
+                if (w < 1e-6) w = 1e-6;
+                const double dd = F / denom;
+                double wt = Ws * w;
+                if (d.robustW) wt *= (*d.robustW)[static_cast<size_t>(ri)];
+                else wt *= robustWeight(dd, d.huberDelta, d.cauchyC);
+                r(ri) = std::sqrt(wt) * dd;
+                cS += wt * dd * dd;
+                if (rtOn) {
+                    const Eigen::Index urRow = d.urCtx->nTotal + ri;
+                    if (d.urCtx->mask[static_cast<size_t>(ri)]) {
+                        double dur; bool dual;
+                        if (evalRightResidual(pts[ptIdx], t, Craw, d.f, d.pp,
+                                              d.urCtx->B, d.urCtx->gates, dur, dual)) {
+                            const double rho = std::sqrt(Fu*Fu/(np.su*np.su) + Fv*Fv/(np.sv*np.sv)) / denom;
+                            const double wtU = Ws * d.urCtx->lambda_ * d.urCtx->ramp;
+                            r(urRow) = std::sqrt(wtU) * dur * rho;
+                            cS += wtU * dur * dur * rho * rho;
+                        } else r(urRow) = 0.0;
+                    } else r(urRow) = 0.0;
+                }
+                ++ri;
+            }
+        }
+        for (; ptIdx < pts.size(); ++ptIdx, ++ri) {   // 兜底（无姿态分组; 镜像 :884-908）
+            const ProjSample s = projectNorm(pts[ptIdx], t, d.f, d.pp, np);
+            double F, Fu, Fv;
+            evalCurve(C, s.up, s.vp, F, Fu, Fv);
+            double denom = std::sqrt(Fu * Fu + Fv * Fv);
+            if (denom < 1e-12) denom = 1e-12;
+            double w = s.Zp / d.f;
+            if (w < 1e-6) w = 1e-6;
+            const double dd = F / denom;
+            r(ri) = std::sqrt(w) * dd;
+            cS += w * dd * dd;
+            if (rtOn) {
+                const Eigen::Index urRow = d.urCtx->nTotal + ri;
+                if (d.urCtx->mask[static_cast<size_t>(ri)]) {
+                    double dur; bool dual;
+                    if (evalRightResidual(pts[ptIdx], t, Craw, d.f, d.pp,
+                                          d.urCtx->B, d.urCtx->gates, dur, dual)) {
+                        const double rho = std::sqrt(Fu*Fu/(np.su*np.su) + Fv*Fv/(np.sv*np.sv)) / denom;
+                        const double wtU = d.urCtx->lambda_ * d.urCtx->ramp;
+                        r(urRow) = std::sqrt(wtU) * dur * rho;
+                        cS += wtU * dur * dur * rho * rho;
+                    } else r(urRow) = 0.0;
+                } else r(urRow) = 0.0;
+            }
+        }
+        return cS;
+    };
+    const bool par = threads > 1 && L >= 2;
+#if defined(_OPENMP)
+    #pragma omp parallel for num_threads(par ? threads : 1) schedule(dynamic) if(par)
+#endif
+    for (int li = 0; li < static_cast<int>(L); ++li)
+        costSl[static_cast<size_t>(li)] = evalLine(static_cast<size_t>(li));
+    // 尾段（正则行+cost 组装）逐字镜像串行版 :911-923; costS 按线 l 升序合并
+    double costS = 0.0;
+    for (size_t l = 0; l < L; ++l) costS += costSl[l];
+    const double sl = std::sqrt(d.lambdaReg);
+    Eigen::Index rr = (rtOn ? 2 : 1) * static_cast<Eigen::Index>(nTotal);
+    for (size_t l = 0; l < L; ++l) {
+        r(rr++) = sl * Cs[l][0];
+        r(rr++) = sl * Cs[l][1];
+        r(rr++) = sl * Cs[l][2];
+    }
+    cost = costS + d.lambdaReg * [&]{
+        double s = 0.0;
+        for (size_t l = 0; l < L; ++l)
+            s += Cs[l][0]*Cs[l][0] + Cs[l][1]*Cs[l][1] + Cs[l][2]*Cs[l][2];
+        return s;
+    }();
+    if (costSOut) *costSOut = costS;
 }
 
 // 线内残差（A·线内雅可比）: 仅算第 li 线——点行段写入 r_out 的 [off, off+n_li),
@@ -923,6 +1061,12 @@ void computeMultiResidualsLine(const MultiLineData& d, size_t li,
     const auto& pts = (*d.linePts)[li];
     const NormParams& np = (*d.nps)[li];
     const double C[6] = {Cs[li][0], Cs[li][1], Cs[li][2], Cs[li][3], Cs[li][4], Cs[li][5]};
+    // 【F8 雅可比缺口补丁 2026-11-08】线内版补算 uR 行（全量版 computeMultiResiduals
+    // 在 rtOn 时写 [nTotal, 2·nTotal)，线内版此前只写 Sampson 段——C_l 列的 uR
+    // 雅可比因此恒零。此处逐字镜像全量版主路径算术（含 Ws/rho/门控）。
+    const bool rtOn = d.urCtx && d.urCtx->on;
+    double Craw[6] = {0,0,0,0,0,0};
+    if (rtOn) denormalizeCurve(Cs[li].data(), np, Craw);
     size_t ptIdx = 0;
     const size_t nPoses = d.ptsPerPose && !d.ptsPerPose->empty()
         ? (*d.ptsPerPose)[li].size() : 0;
@@ -944,6 +1088,20 @@ void computeMultiResidualsLine(const MultiLineData& d, size_t li,
             else wt *= robustWeight(dd, d.huberDelta, d.cauchyC);
             r_out(ri) = std::sqrt(wt) * dd;
             costS += wt * dd * dd;
+            if (rtOn) {
+                const Eigen::Index urRow = d.urCtx->nTotal + ri;
+                if (d.urCtx->mask[static_cast<size_t>(ri)]) {
+                    double dur; bool dual;
+                    if (evalRightResidual(pts[ptIdx], t, Craw, d.f, d.pp,
+                                          d.urCtx->B, d.urCtx->gates, dur, dual)) {
+                        const double rho =
+                            std::sqrt(Fu*Fu/(np.su*np.su) + Fv*Fv/(np.sv*np.sv)) / denom;
+                        const double wtU = Ws * d.urCtx->lambda_ * d.urCtx->ramp;
+                        r_out(urRow) = std::sqrt(wtU) * dur * rho;
+                        costS += wtU * dur * dur * rho * rho;
+                    } else r_out(urRow) = 0.0;
+                } else r_out(urRow) = 0.0;
+            }
             ++ri;
         }
     }
@@ -959,6 +1117,20 @@ void computeMultiResidualsLine(const MultiLineData& d, size_t li,
         const double dd = F / denom;
         r_out(ri) = std::sqrt(w) * dd;
         costS += w * dd * dd;
+        if (rtOn) {   // 镜像全量版兜底段（无 Ws）
+            const Eigen::Index urRow = d.urCtx->nTotal + ri;
+            if (d.urCtx->mask[static_cast<size_t>(ri)]) {
+                double dur; bool dual;
+                if (evalRightResidual(pts[ptIdx], t, Craw, d.f, d.pp,
+                                      d.urCtx->B, d.urCtx->gates, dur, dual)) {
+                    const double rho =
+                        std::sqrt(Fu*Fu/(np.su*np.su) + Fv*Fv/(np.sv*np.sv)) / denom;
+                    const double wtU = d.urCtx->lambda_ * d.urCtx->ramp;
+                    r_out(urRow) = std::sqrt(wtU) * dur * rho;
+                    costS += wtU * dur * dur * rho * rho;
+                } else r_out(urRow) = 0.0;
+            } else r_out(urRow) = 0.0;
+        }
     }
     const double sl = std::sqrt(d.lambdaReg);
     regOut[0] = sl * Cs[li][0];
@@ -968,6 +1140,42 @@ void computeMultiResidualsLine(const MultiLineData& d, size_t li,
 }
 
 } // namespace
+
+// ============================================================================
+// buildMultiLineDenoiseCache — F7 预计算降噪缓存
+// denoisePoses 逐姿态独立（每姿态: PCA 平面拟合→内点投影→面内多项式拟合）→
+// 按 (line, pose) 一次预计算后可对任意线/姿态子集按原序精确重组，与整线调用
+// denoisePoses 的输出逐位一致（纯缓存，不改变计算序）。单姿态调用与整线调用
+// 中同一姿态的输出逐位一致（无跨姿态状态）。
+// ============================================================================
+std::vector<std::vector<MultiLinePoseDenoise>>
+buildMultiLineDenoiseCache(const std::vector<std::vector<PosePointSet>>& lines,
+                           const ProjectorJointCalibParams& params) {
+    std::vector<std::vector<MultiLinePoseDenoise>> cache(lines.size());
+    for (size_t l = 0; l < lines.size(); ++l) {
+        cache[l].reserve(lines[l].size());
+        for (size_t p = 0; p < lines[l].size(); ++p) {
+            MultiLinePoseDenoise e;
+            // 与 denoisePoses 首行同门: 不足 minPointsPerPose 的姿态整体跳过
+            if (static_cast<int>(lines[l][p].points3d.size()) >= params.minPointsPerPose) {
+                int vp = 0;
+                std::vector<double> th;
+                std::vector<int> cnt;
+                auto pts = denoisePoses({lines[l][p]}, params.planeFitInlierThresh,
+                                        params.curveDegree, params.minPointsPerPose,
+                                        vp, &th, &cnt);
+                if (vp == 1) {   // 单姿态调用: 过门即 vp==1（含产出 0 点的空姿态）
+                    e.passed = true;
+                    e.thickness = th.empty() ? 0.0 : th.front();
+                    e.pointCount = cnt.empty() ? 0 : cnt.front();
+                    e.points = std::move(pts);
+                }
+            }
+            cache[l].push_back(std::move(e));
+        }
+    }
+    return cache;
+}
 
 MultiLineResult ProjectorJointCalib::ExecuteMultiLine(const MultiLineInput& input) {
     MultiLineResult result;
@@ -1009,13 +1217,27 @@ MultiLineResult ProjectorJointCalib::ExecuteMultiLine(const MultiLineInput& inpu
         const auto tDenoise0 = tNow();
         {
             std::vector<double> allSigma;
+            // F7 预计算缓存: 与 lines 结构同构时逐姿态按原序重组（与 denoisePoses
+            // 输出逐位一致——每姿态计算独立, 重组仅拼接）; 结构不符回退现场计算
+            const bool cacheHit = input.denoiseCache.size() == input.lines.size();
             for (size_t l = 0; l < input.lines.size(); ++l) {
                 int vp = 0;
                 std::vector<double> thickness;
                 std::vector<int> counts;
-                auto pts = denoisePoses(input.lines[l], inlierThresh,
-                                        params_.curveDegree, params_.minPointsPerPose,
-                                        vp, &thickness, &counts);
+                std::vector<cv::Vec3d> pts;
+                if (cacheHit && input.denoiseCache[l].size() == input.lines[l].size()) {
+                    for (const auto& e : input.denoiseCache[l]) {
+                        if (!e.passed) continue;   // denoisePoses 的 continue 语义
+                        thickness.push_back(e.thickness);
+                        counts.push_back(e.pointCount);
+                        pts.insert(pts.end(), e.points.begin(), e.points.end());
+                        ++vp;
+                    }
+                } else {
+                    pts = denoisePoses(input.lines[l], inlierThresh,
+                                       params_.curveDegree, params_.minPointsPerPose,
+                                       vp, &thickness, &counts);
+                }
                 if (vp < params_.minPoses || pts.empty()) continue;   // 弱线弃用
                 linePts.push_back(std::move(pts));
                 ptsPerPose.push_back(std::move(counts));
@@ -1107,9 +1329,29 @@ MultiLineResult ProjectorJointCalib::ExecuteMultiLine(const MultiLineInput& inpu
         double huberDelta = params_.robustEnabled ? params_.huberDelta0 : 0.0;
 
         const int P = 3 + static_cast<int>(6 * L);
+        // 【C2-261114 · 评估路径分派】jacThreads>1 且 L>=2 → 按线并行评估（r 逐位
+        // 一致, costS 数值门）; F7 任务 jacThreads=1 自动走旧串行路径（逐位不变）。
+        // 与 jac 装配共用同一旋钮（超订阅防护语义不变）。
+        int evalT = params_.jacThreads;
+#if defined(_OPENMP)
+        if (evalT <= 0) evalT = omp_get_max_threads();
+#else
+        if (evalT <= 0) evalT = 1;
+#endif
+        const bool evalPar = (evalT > 1 && L >= 2);
+        auto evalResiduals = [&](const cv::Vec3d& te,
+                                 const std::vector<std::array<double, 6>>& Ce,
+                                 Eigen::VectorXd& re, double& coste,
+                                 double* costSe = nullptr) {
+            if (evalPar)
+                computeMultiResidualsPar(mdata, te, Ce, re, coste, costSe, evalT);
+            else
+                computeMultiResiduals(mdata, te, Ce, re, coste, costSe);
+        };
         Eigen::VectorXd r0;
         double cost0;
-        computeMultiResiduals(mdata, t, Cs, r0, cost0);
+        double costS0 = 0.0;   // P0-2: 点部分代价（与正则项拆分跟踪, 供接受步重拼 cost）
+        evalResiduals(t, Cs, r0, cost0, &costS0);
         ++evalCount;
 
         // —— B·块稀疏 Gauss-Newton 累加（useBlockJtJ=true，主循环与 IRLS 两处共用）——
@@ -1124,27 +1366,155 @@ MultiLineResult ProjectorJointCalib::ExecuteMultiLine(const MultiLineInput& inpu
             const double eps = 1e-7;
             HOut.setZero();
             gOut.setZero();
+            const bool rtOnB = mdata.urCtx && mdata.urCtx->on;
+            // 【B3-261114 · 解析雅可比】t 列+C 列逐点解析装配替代 3 次全量差分＋每线
+            // 6 次线内差分（9 FEE → 每线 1 次逐点附加 pass）。Phase B（uR 行含二次
+            // 求根/门控分支）自动回差分。默认 false＝旧差分路径逐位不变。
+            const bool analytic = params_.analyticJacobians && !rtOnB;
             const auto tTA = tNow();
             std::array<Eigen::VectorXd, 3> r1t;
-            for (int j = 0; j < 3; ++j) {      // t 列：3 次全量差分（按线切片消费）
-                cv::Vec3d tp = tCur;
-                tp[j] += eps;
-                double c1;
-                computeMultiResiduals(mdata, tp, CsCur, r1t[static_cast<size_t>(j)], c1);
+            if (!analytic) {
+                for (int j = 0; j < 3; ++j) {      // t 列：3 次全量差分（按线切片消费）
+                    cv::Vec3d tp = tCur;
+                    tp[j] += eps;
+                    double c1;
+                    evalResiduals(tp, CsCur, r1t[static_cast<size_t>(j)], c1);
+                }
             }
             msJac += tMs(tTA);
             Eigen::VectorXd lineBuf(static_cast<Eigen::Index>(
                 mdata.urCtx && mdata.urCtx->on ? 2 * nTotal : nTotal));
-            for (size_t l = 0; l < L; ++l) {
+            // 【F8 雅可比缺口补丁 2026-11-08】uR 行进梯度（块路径）：
+            // ① t 列的全量差分 r1t 本就含 uR 行（computeMultiResiduals 写
+            //    [nTotal,2·nTotal)）——此前按线切片只取 Sampson 段，uR 段被丢弃；
+            // ② C_l 列的线内差分 lineBuf 此前不含 uR 行（computeMultiResidualsLine
+            //    未算）——补丁后逐字镜像全量版算术；
+            // ③ 正则行落位：rtOn 时全量残差布局＝Sampson[nTotal)+uR[nTotal)+reg[3L)，
+            //    原 regOff=nTotal+3l 在 rtOn 时错指 uR 行——按布局修正。
+            const Eigen::Index urBase = static_cast<Eigen::Index>(
+                mdata.urCtx ? mdata.urCtx->nTotal : nTotal);
+            // R2-261114 逐线并行（jacT>1 且 L>=2）：每线装配 Jl 并算局部 Hl/gl(9×9/9×1)；
+            // lineBuf 各线写 [offL,offL+nL)/[urBase+offL,…) 不相交段——线程安全；
+            // H/g 归约放在循环后按 l 升序合并（与串行 += 加法链同序 → 逐位一致）。
+            int jacT = params_.jacThreads;
+#if defined(_OPENMP)
+            if (jacT <= 0) jacT = omp_get_max_threads();
+#else
+            if (jacT <= 0) jacT = 1;
+#endif
+            const bool parL = (jacT > 1 && L >= 2);
+            std::vector<Eigen::Matrix<double, 9, 9>> Hl(L);
+            std::vector<Eigen::Matrix<double, 9, 1>> gl(L);
+#if defined(_OPENMP)
+            #pragma omp parallel for num_threads(parL ? jacT : 1) schedule(dynamic) if(parL)
+#endif
+            for (int li = 0; li < static_cast<int>(L); ++li) {
+                const size_t l = static_cast<size_t>(li);
                 const Eigen::Index offL = lineOff[l];
                 const Eigen::Index nL = static_cast<Eigen::Index>(linePts[l].size());
-                const Eigen::Index regOff = static_cast<Eigen::Index>(nTotal) + 3 * static_cast<Eigen::Index>(l);
+                const Eigen::Index nUr = rtOnB ? nL : 0;
+                const Eigen::Index regOff =
+                    (rtOnB ? 2 : 1) * static_cast<Eigen::Index>(nTotal)
+                    + 3 * static_cast<Eigen::Index>(l);
                 const auto tTB = tNow();
-                Eigen::MatrixXd Jl(nL + 3, 9);
+                Eigen::MatrixXd Jl(nL + nUr + 3, 9);
                 Jl.setZero();
-                for (int j = 0; j < 3; ++j)
+                if (analytic) {
+                    // —— 解析雅可比（B3-261114 交叉验证修正版）——
+                    // 残差 r=√(Ws·w·w_rob)·dd, dd=F/den, den=max(√(Fu²+Fv²),1e-12), w=max(Zp/f,1e-6)
+                    // α=√wt + dd·Ws·w·w_rob'/(2√wt)；γ=dd·Ws·w_rob/(2√wt)（仅 t_z 列, w clamp 区取 0）
+                    // w_rob'：L2/IRLS 外部权=0；Cauchy=−(2dd/c²)·w_rob²；Huber 尾=−w_rob/|dd|
+                    // t 列（P−t 约定, B3 抓出 A3 反号并修正）：u_x=−f/Zp, u_z=+(u−cx)/Zp,
+                    //   v_y=−f/Zp, v_z=+(v−cy)/Zp；∂dd/∂t_j=(F_j−dd·(Fu·Fu_j+Fv·Fv_j)/den)/den
+                    // C 列：∂dd/∂C_k=(φ_k−dd·G_k/den)/den, φ=[up²,up·vp,vp²,up,vp,1],
+                    //   G=[2up·Fu, vp·Fu+up·Fv, 2vp·Fv, Fu, Fv, 0]（A2 因式分解, B3 验证通过）
+                    const auto& ptsA = linePts[l];
+                    const NormParams& npA = nps[l];
+                    const double cA = CsCur[l][0], cB = CsCur[l][1], cCc = CsCur[l][2];
+                    const double Cf[6] = {CsCur[l][0], CsCur[l][1], CsCur[l][2],
+                                          CsCur[l][3], CsCur[l][4], CsCur[l][5]};
+                    const size_t nPosesA = !ptsPerPose.empty()
+                        ? ptsPerPose[l].size() : 0;
+                    const double slA = std::sqrt(mdata.lambdaReg);
+                    for (int k = 0; k < 3; ++k)          // 正则行: ∂(√λ·C_k)/∂C_k=√λ（其余恒 0）
+                        Jl(nL + k, 3 + k) = slA;
+                    size_t ptIdxA = 0;
+                    Eigen::Index rowA = 0;
+                    auto fillPointJac = [&](const cv::Vec3d& P, double Ws, bool useRobust) {
+                        const double Xp = P[0] - tCur[0];
+                        const double Yp = P[1] - tCur[1];
+                        const double Zp = P[2] - tCur[2];
+                        const double u = f * Xp / Zp + pp.x;
+                        const double v = f * Yp / Zp + pp.y;
+                        const double up = (u - npA.mu_u) / npA.su;
+                        const double vp = (v - npA.mu_v) / npA.sv;
+                        double F, Fu, Fv;
+                        evalCurve(Cf, up, vp, F, Fu, Fv);
+                        double den = std::sqrt(Fu * Fu + Fv * Fv);
+                        if (den < 1e-12) den = 1e-12;
+                        const double dd = F / den;
+                        const double wUn = Zp / f;
+                        const bool wClamped = wUn < 1e-6;
+                        const double w = wClamped ? 1e-6 : wUn;
+                        double wrob = 1.0, wrobD = 0.0;
+                        if (useRobust) {                 // 分支序镜像 robustWeight(:675-679)
+                            if (mdata.robustW) {
+                                wrob = (*mdata.robustW)[static_cast<size_t>(offL + rowA)];
+                            } else if (mdata.cauchyC > 0.0) {
+                                wrob = 1.0 / (1.0 + (dd / mdata.cauchyC) * (dd / mdata.cauchyC));
+                                wrobD = -(2.0 * dd / (mdata.cauchyC * mdata.cauchyC)) * wrob * wrob;
+                            } else if (mdata.huberDelta > 0.0 && std::fabs(dd) > mdata.huberDelta) {
+                                wrob = mdata.huberDelta / std::fabs(dd);
+                                wrobD = -wrob / std::fabs(dd);
+                            }
+                        }
+                        const double wt = Ws * w * wrob;
+                        const double sq = std::sqrt(wt);
+                        const double alpha = sq + dd * Ws * w * wrobD / (2.0 * sq);
+                        const double gamma = dd * Ws * wrob / (2.0 * sq);
+                        // t 列
+                        const double uj[3] = {-f / Zp, 0.0, (u - pp.x) / Zp};
+                        const double vj[3] = {0.0, -f / Zp, (v - pp.y) / Zp};
+                        for (int j = 0; j < 3; ++j) {
+                            const double upj = uj[j] / npA.su;
+                            const double vpj = vj[j] / npA.sv;
+                            const double Fj = Fu * upj + Fv * vpj;
+                            const double Fuj = 2.0 * cA * upj + cB * vpj;
+                            const double Fvj = cB * upj + 2.0 * cCc * vpj;
+                            const double dddt = (Fj - dd * (Fu * Fuj + Fv * Fvj) / den) / den;
+                            Jl(rowA, j) = alpha * dddt
+                                          + (j == 2 && !wClamped ? -gamma / f : 0.0);
+                        }
+                        // C 列
+                        const double phi[6] = {up * up, up * vp, vp * vp, up, vp, 1.0};
+                        const double G[6] = {2.0 * up * Fu, vp * Fu + up * Fv,
+                                             2.0 * vp * Fv, Fu, Fv, 0.0};
+                        for (int ci = 0; ci < 6; ++ci)
+                            Jl(rowA, 3 + ci) = alpha * (phi[ci] - dd * G[ci] / den) / den;
+                        ++rowA;
+                    };
+                    if (nPosesA > 0) {
+                        for (size_t pi = 0; pi < nPosesA; ++pi) {
+                            const double Ws = !poseW.empty()
+                                ? poseW[l][pi] : 1.0;
+                            const int nP = ptsPerPose[l][pi];
+                            for (int k = 0; k < nP; ++k, ++ptIdxA)
+                                fillPointJac(ptsA[ptIdxA], Ws, true);
+                        }
+                    } else {
+                        // 兜底（无姿态分组）: r=√w·dd（无 Ws、无核权, 镜像 :884-894）
+                        for (; ptIdxA < ptsA.size(); ++ptIdxA)
+                            fillPointJac(ptsA[ptIdxA], 1.0, false);
+                    }
+                } else {
+                for (int j = 0; j < 3; ++j) {
                     Jl.col(j).head(nL) = (r1t[static_cast<size_t>(j)].segment(offL, nL)
                                           - r0Cur.segment(offL, nL)) / eps;
+                    if (nUr > 0)
+                        Jl.col(j).segment(nL, nUr) =
+                            (r1t[static_cast<size_t>(j)].segment(urBase + offL, nUr)
+                             - r0Cur.segment(urBase + offL, nUr)) / eps;
+                }
                 for (int ci = 0; ci < 6; ++ci) {   // C_l 列：线内差分（A·computeMultiResidualsLine）
                     std::vector<std::array<double, 6>> Cp = CsCur;
                     Cp[l][static_cast<size_t>(ci)] += eps;
@@ -1153,25 +1523,56 @@ MultiLineResult ProjectorJointCalib::ExecuteMultiLine(const MultiLineInput& inpu
                     computeMultiResidualsLine(mdata, l, tCur, Cp, lineBuf, c1, offL, reg1);
                     Jl.col(3 + ci).head(nL) = (lineBuf.segment(offL, nL)
                                                - r0Cur.segment(offL, nL)) / eps;
+                    if (nUr > 0)
+                        Jl.col(3 + ci).segment(nL, nUr) =
+                            (lineBuf.segment(urBase + offL, nUr)
+                             - r0Cur.segment(urBase + offL, nUr)) / eps;
                     for (int k = 0; k < 3; ++k)    // 正则行导数（同差分口径；k∈{3,4,5} 恒 0 不写）
-                        Jl(nL + k, 3 + ci) = (reg1[k] - r0Cur(regOff + k)) / eps;
+                        Jl(nL + nUr + k, 3 + ci) = (reg1[k] - r0Cur(regOff + k)) / eps;
+                }
                 }
                 msJac += tMs(tTB);
                 const auto tTC = tNow();
-                Eigen::VectorXd r0l(nL + 3);
+                Eigen::VectorXd r0l(nL + nUr + 3);
                 r0l.head(nL) = r0Cur.segment(offL, nL);
+                if (nUr > 0) r0l.segment(nL, nUr) = r0Cur.segment(urBase + offL, nUr);
                 r0l.tail(3) = r0Cur.segment(regOff, 3);
                 const int c0 = 3 + 6 * static_cast<int>(l);
                 const int cols[9] = {0, 1, 2, c0, c0 + 1, c0 + 2, c0 + 3, c0 + 4, c0 + 5};
+                auto& Hk = Hl[l];
+                auto& gk = gl[l];
                 for (int a = 0; a < 9; ++a) {
-                    gOut(cols[a]) += Jl.col(a).dot(r0l);
+                    gk(a) = Jl.col(a).dot(r0l);
                     for (int b = a; b < 9; ++b) {
                         const double v = Jl.col(a).dot(Jl.col(b));
-                        HOut(cols[a], cols[b]) += v;
-                        if (b != a) HOut(cols[b], cols[a]) += v;
+                        Hk(a, b) = v;
+                        if (b != a) Hk(b, a) = v;
                     }
                 }
-                msJtJ += tMs(tTC);
+                if (!parL) {
+                    for (int a = 0; a < 9; ++a) {
+                        gOut(cols[a]) += gk(a);
+                        for (int b = a; b < 9; ++b) {
+                            HOut(cols[a], cols[b]) += Hk(a, b);
+                            if (b != a) HOut(cols[b], cols[a]) += Hk(b, a);
+                        }
+                    }
+                }
+            }
+            if (parL) {
+                const auto tTC2 = tNow();
+                for (size_t l = 0; l < L; ++l) {
+                    const int c0 = 3 + 6 * static_cast<int>(l);
+                    const int cols[9] = {0, 1, 2, c0, c0 + 1, c0 + 2, c0 + 3, c0 + 4, c0 + 5};
+                    for (int a = 0; a < 9; ++a) {
+                        gOut(cols[a]) += gl[l](a);
+                        for (int b = a; b < 9; ++b) {
+                            HOut(cols[a], cols[b]) += Hl[l](a, b);
+                            if (b != a) HOut(cols[b], cols[a]) += Hl[l](b, a);
+                        }
+                    }
+                }
+                msJtJ += tMs(tTC2);
             }
         };
 
@@ -1189,7 +1590,7 @@ MultiLineResult ProjectorJointCalib::ExecuteMultiLine(const MultiLineInput& inpu
                     tp[j] += eps;
                     Eigen::VectorXd r1;
                     double c1;
-                    computeMultiResiduals(mdata, tp, Cp, r1, c1);
+                    evalResiduals(tp, Cp, r1, c1);
                     J.col(j) = (r1 - r0Cur) / eps;
                 } else {
                     const int li = (j - 3) / 6, ci = (j - 3) % 6;
@@ -1204,7 +1605,20 @@ MultiLineResult ProjectorJointCalib::ExecuteMultiLine(const MultiLineInput& inpu
                     computeMultiResidualsLine(mdata, ls, t, Cp, r1, c1, offL, reg1);
                     for (Eigen::Index k = 0; k < nL; ++k)
                         J(offL + k, j) = (r1(offL + k) - r0Cur(offL + k)) / eps;
-                    const Eigen::Index regOff = static_cast<Eigen::Index>(nTotal) + 3 * static_cast<Eigen::Index>(li);
+                    // 【F8 雅可比缺口补丁 2026-11-08】C_l 列的 uR 行：线内差分
+                    // 此前不含 uR 行（该列 uR 段恒零填充）——补丁后 line 版已写。
+                    if (mdata.urCtx && mdata.urCtx->on) {
+                        const Eigen::Index urBase =
+                            static_cast<Eigen::Index>(mdata.urCtx->nTotal);
+                        for (Eigen::Index k = 0; k < nL; ++k)
+                            J(urBase + offL + k, j) =
+                                (r1(urBase + offL + k) - r0Cur(urBase + offL + k)) / eps;
+                    }
+                    // 【同补丁】正则行落位：rtOn 时 reg 段在 2·nTotal 之后
+                    const Eigen::Index regOff =
+                        (mdata.urCtx && mdata.urCtx->on ? 2 : 1)
+                            * static_cast<Eigen::Index>(nTotal)
+                        + 3 * static_cast<Eigen::Index>(li);
                     J(regOff, j) = (reg1[0] - r0Cur(regOff)) / eps;
                     J(regOff + 1, j) = (reg1[1] - r0Cur(regOff + 1)) / eps;
                     J(regOff + 2, j) = (reg1[2] - r0Cur(regOff + 2)) / eps;
@@ -1216,6 +1630,7 @@ MultiLineResult ProjectorJointCalib::ExecuteMultiLine(const MultiLineInput& inpu
 
         double lambda = 1e-3;
         double lastCond = 0.0;
+        Eigen::MatrixXd lastH;   // 末轮 H 快照（H 建成后至迭代结束不被修改）
         std::vector<double> costHist;
         for (int iter = 0; iter < params_.maxIterations; ++iter) {
             ++iterCount;
@@ -1224,7 +1639,7 @@ MultiLineResult ProjectorJointCalib::ExecuteMultiLine(const MultiLineInput& inpu
             if (params_.robustEnabled && iter == l2Iters) {
                 mdata.huberDelta = huberDelta;
                 mdata.cauchyC = 0.0;
-                computeMultiResiduals(mdata, t, Cs, r0, cost0);   // 重算带核残差
+                evalResiduals(t, Cs, r0, cost0, &costS0);   // 重算带核残差（核切换→权重变所有行, 全量必须保留）
                 ++evalCount;
                 lambda = 1e-3;                                    // 换代价函数后重置 LM 阻尼
             }
@@ -1244,16 +1659,7 @@ MultiLineResult ProjectorJointCalib::ExecuteMultiLine(const MultiLineInput& inpu
                 msJtJ += tMs(tJtJ0);
             }
             const Eigen::MatrixXd IP = Eigen::MatrixXd::Identity(P, P);
-            {
-                const auto tJtJ0 = tNow();
-                Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(H);
-                if (es.info() == Eigen::Success) {
-                    const double lmax = std::max(es.eigenvalues()(P - 1), 1e-15);
-                    const double lmin = std::max(es.eigenvalues()(0), 1e-15);
-                    lastCond = lmax / lmin;
-                }
-                msJtJ += tMs(tJtJ0);
-            }
+            lastH = H;   // 只存末轮: 条件数出循环后一次分解（见循环后）
 
             cv::Vec3d tBest = t;
             std::vector<std::array<double, 6>> Cbest = Cs;
@@ -1261,6 +1667,11 @@ MultiLineResult ProjectorJointCalib::ExecuteMultiLine(const MultiLineInput& inpu
             bool improved = false;
 
             const auto tTrials0 = tNow();
+            // P0-2（R2 报告）: rn/costSn 提升到 trial 循环外——被接受试探的残差与点部分
+            // 代价供循环后复用（λReg 不进点行算术, (tBest,Cbest) 处点段与全量重算位级同一份）。
+            Eigen::VectorXd rn;
+            double cn = 0.0;
+            double costSn = 0.0;
             for (int trial = 0; trial < 8; ++trial) {
                 Eigen::VectorXd delta = (H + lambda * IP).ldlt().solve(-g);
                 if (!delta.allFinite()) { lambda = std::min(lambda * 3.0, 1e8); continue; }
@@ -1281,9 +1692,7 @@ MultiLineResult ProjectorJointCalib::ExecuteMultiLine(const MultiLineInput& inpu
                 }
                 if (badCurve) { lambda = std::min(lambda * 3.0, 1e8); continue; }
 
-                Eigen::VectorXd rn;
-                double cn;
-                computeMultiResiduals(mdata, tn, Cn, rn, cn);
+                evalResiduals(tn, Cn, rn, cn, &costSn);
                 ++evalCount;
                 if (cn < cost0) {
                     improved = true;
@@ -1310,9 +1719,39 @@ MultiLineResult ProjectorJointCalib::ExecuteMultiLine(const MultiLineInput& inpu
             t = tBest;
             Cs = Cbest;
             mdata.lambdaReg = std::max(mdata.lambdaReg * params_.lambdaDecay, lambdaRegMin);
-            computeMultiResiduals(mdata, t, Cs, r0, cost0);
-            ++evalCount;
-            costHist.push_back(cost0);
+            // 【P0-2 · R2 分析报告】消除接受步后的全量残差重算（产线数据集 ≈224k 点扫描）:
+            // λReg 只进入 3L 正则行与 cost 正则项——点行（Sampson＋uR）与点部分代价 costS
+            // 均与 λReg 无关。接受步: 点行直接换入被接受试探的残差 rn（同参数同函数输出,
+            // 位级同一份浮点数）; 拒绝步: r0 点行本就不变。正则行与 cost 尾段按新 λReg
+            // 重写——公式/求值序逐字镜像 computeMultiResiduals 尾段（sl 同式, l 升序
+            // k=0..2, quad 同序累加）→ 数值与全量重算逐位一致。核切换（Huber→Cauchy）
+            // 与 IRLS 权刷新的重算不受影响（权重影响所有行, 必须全量）。
+            if (improved) {
+                r0.swap(rn);      // r0 ← 被接受试探残差（点行段; 正则行随下方重写覆盖）
+                costS0 = costSn;  // 点部分代价（与 λReg 无关）
+            }
+            {
+                const double sl = std::sqrt(mdata.lambdaReg);
+                Eigen::Index rr = (mdata.urCtx && mdata.urCtx->on ? 2 : 1)
+                                  * static_cast<Eigen::Index>(nTotal);
+                for (size_t l = 0; l < L; ++l) {
+                    r0(rr++) = sl * Cs[l][0];
+                    r0(rr++) = sl * Cs[l][1];
+                    r0(rr++) = sl * Cs[l][2];
+                }
+                const double quad = [&]{
+                    double s = 0.0;
+                    for (size_t l = 0; l < L; ++l)
+                        s += Cs[l][0]*Cs[l][0] + Cs[l][1]*Cs[l][1] + Cs[l][2]*Cs[l][2];
+                    return s;
+                }();
+                cost0 = costS0 + mdata.lambdaReg * quad;
+            }
+            // 【A3-261114 · relDrop30 数据项口径】cost0 含 λReg·quad 尾项, λReg 每迭代 ×0.95
+            // 衰减使正则项持续缩小 → 数据零改善时 relDrop30 仍可 >5% (喂饱假下降)。
+            // 改推数据项 costS0 (与 λReg 无关, :1487/:1515 与 cost0 同步维护) —— 判据语义
+            // 恢复为"拟合是否停止改善"。优化路径逐位不变, 仅终止时机变。
+            costHist.push_back(costS0);
             // Cauchy 切换: 残差中位数（归一化坐标）低于阈值后收紧核
             if (params_.robustEnabled && mdata.huberDelta > 0.0) {
                 Eigen::VectorXd absR = r0.head(static_cast<Eigen::Index>(nTotal)).cwiseAbs();
@@ -1321,7 +1760,7 @@ MultiLineResult ProjectorJointCalib::ExecuteMultiLine(const MultiLineInput& inpu
                 if (medR < params_.cauchyToL2Thresh * 0.5) {
                     mdata.huberDelta = 0.0;
                     mdata.cauchyC = std::max(0.2, medR * 2.0);
-                    computeMultiResiduals(mdata, t, Cs, r0, cost0);
+                    evalResiduals(t, Cs, r0, cost0, &costS0);   // 核切换→全量重算（权重变所有行）
                     ++evalCount;
                     lambda = 1e-3;
                 }
@@ -1330,13 +1769,26 @@ MultiLineResult ProjectorJointCalib::ExecuteMultiLine(const MultiLineInput& inpu
             if (stepNorm < params_.convergenceThreshold) break;
             if (iter >= 30) {
                 const double ref = costHist[static_cast<size_t>(iter - 30)];
-                const double relDrop30 = (ref > 1e-15) ? (ref - cost0) / ref : 0.0;
+                const double relDrop30 = (ref > 1e-15) ? (ref - costS0) / ref : 0.0;   // A3: 数据项口径（与 push_back 同轨）
                 if (relDrop30 < 0.05) break;
             }
             if (!improved && lambda >= 1e8) break;
         }
 
+        // —— 条件数: 末轮 H 出循环后一次分解（原逐轮分解仅末值被消费, 数值逐位一致）——
+        if (lastH.size() == P * P) {
+            const auto tJtJ0 = tNow();
+            Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(lastH);
+            if (es.info() == Eigen::Success) {
+                const double lmax = std::max(es.eigenvalues()(P - 1), 1e-15);
+                const double lmin = std::max(es.eigenvalues()(0), 1e-15);
+                lastCond = lmax / lmin;
+            }
+            msJtJ += tMs(tJtJ0);
+        }
+
         // —— F6 IRLS: 残差驱动的权刷新再优化（初权错判的帧由数据自证修正）——
+        std::vector<double> wLastRound;   // 上一轮 IRLS 权（跨轮存活, 供轮首稳定度比较）
         for (int round = 0; round < params_.irlsMaxRounds; ++round) {
             const auto tMisc2 = tNow();
             // 用当前残差生成 Cauchy 型外部权
@@ -1352,16 +1804,24 @@ MultiLineResult ProjectorJointCalib::ExecuteMultiLine(const MultiLineInput& inpu
                 for (size_t i = 0; i < nTotalR; ++i)
                     wNew[i] = 1.0 / (1.0 + (absR[i] / c) * (absR[i] / c));
             }
-            // 权变化检查（<5% 停）
-            double maxChange = 0.0;
-            if (mdata.robustW) {
+            // 权变化检查（<5% 停）——【A3-261114 · 前移修复】原检查在轮体末尾执行, 且比较
+            // 对象 mdata.robustW 已被上一轮末尾置 nullptr → wPrev 恒空, break 永不触发
+            // （maxRounds=2 下两轮必跑, 双重死代码）。前移到轮体开头并与上一轮保留权
+            // wLastRound 比较: 权重已稳定（<5%）→ 本轮整轮跳过——从已收敛点出发的再
+            // 优化只能移动 O(‖Δw‖) 量级, 信息增量为零。
+            if (!wLastRound.empty()) {
+                double maxChange = 0.0;
                 for (size_t i = 0; i < nTotalR; ++i)
                     maxChange = std::max(maxChange,
-                        std::fabs(wNew[i] - (*mdata.robustW)[i]));
+                        std::fabs(wNew[i] - wLastRound[i]));
+                if (maxChange < 0.05) {
+                    spdlog::debug("PJC IRLS round {} skipped: weight stable (maxChange<0.05)", round);
+                    break;
+                }
             }
-            std::vector<double> wPrev = mdata.robustW ? *mdata.robustW : std::vector<double>();
+            wLastRound = wNew;
             mdata.robustW = &wNew;
-            computeMultiResiduals(mdata, t, Cs, r0, cost0);
+            evalResiduals(t, Cs, r0, cost0);
             ++evalCount;
             msMisc += tMs(tMisc2);
             // 短程再优化（30 iter 上限）
@@ -1383,6 +1843,7 @@ MultiLineResult ProjectorJointCalib::ExecuteMultiLine(const MultiLineInput& inpu
                 }
                 const Eigen::MatrixXd IP = Eigen::MatrixXd::Identity(P, P);
                 bool improvedI = false;
+                double stepNormI = 0.0;   // 本迭代接受步长范数（与主循环 stepNorm 同式）
                 const auto tTrials0 = tNow();
                 for (int trial = 0; trial < 8; ++trial) {
                     Eigen::VectorXd delta = (H + lambdaI * IP).ldlt().solve(-g);
@@ -1404,9 +1865,17 @@ MultiLineResult ProjectorJointCalib::ExecuteMultiLine(const MultiLineInput& inpu
                     if (badCurve) { lambdaI = std::min(lambdaI * 3.0, 1e8); continue; }
                     Eigen::VectorXd rn;
                     double cn;
-                    computeMultiResiduals(mdata, tn, Cn, rn, cn);
+                    evalResiduals(tn, Cn, rn, cn);
                     ++evalCount;
                     if (cn < cost0) {
+                        // 接受步的实际范数（曲线归一化后），与主循环 F5 stepNorm 同式
+                        for (int k = 0; k < 3; ++k) { const double d = tn[k] - t[k]; stepNormI += d * d; }
+                        for (size_t l = 0; l < L; ++l)
+                            for (int k = 0; k < 6; ++k) {
+                                const double d = Cn[l][static_cast<size_t>(k)] - Cs[l][static_cast<size_t>(k)];
+                                stepNormI += d * d;
+                            }
+                        stepNormI = std::sqrt(stepNormI);
                         t = tn; Cs = Cn; cost0 = cn; r0 = rn;
                         lambdaI = std::max(lambdaI * 0.3, 1e-12);
                         improvedI = true;
@@ -1416,17 +1885,17 @@ MultiLineResult ProjectorJointCalib::ExecuteMultiLine(const MultiLineInput& inpu
                 }
                 msTrials += tMs(tTrials0);
                 if (!improvedI || lambdaI >= 1e8) break;
+                if (stepNormI < params_.convergenceThreshold) break;   // 收敛判据：与主循环一致，接受步长低于阈值即停
             }
             ++result.irlsRounds;
-            mdata.robustW = nullptr;   // 本轮权消耗完, 下轮由新残差再生成
-            (void)maxChange; (void)wPrev;
-            if (maxChange < 0.05 && !wPrev.empty()) break;
+            mdata.robustW = nullptr;   // 本轮权消耗完, 下轮由新残差再生成（wLastRound 保留供下轮比较）
         }
 
         // ====================================================================
         // F8 Phase B：右目重投影残差——在 Sampson 收敛后 ramp-in uR 项
         // 直接优化 CMTT 表消费量（uR 预测精度），消法向度量盲区
         // ====================================================================
+        result.phaseAT = t;   // Phase-A 收敛 t（Phase B 不跑/不动 t 时与终态相等）
         if (input.enableRightTerm && input.baseline > 1e-6 && nTotal > 0) {
             const auto tPB0 = std::chrono::steady_clock::now();
             // 冻结门控 mask ＋ pre 诊断
@@ -1441,7 +1910,7 @@ MultiLineResult ProjectorJointCalib::ExecuteMultiLine(const MultiLineInput& inpu
 
             // 重算残差（行数扩 2*nTotal + 3L）
             double costPB0 = 0.0;
-            computeMultiResiduals(mdata, t, Cs, r0, costPB0);
+            evalResiduals(t, Cs, r0, costPB0);
             ++evalCount;
 
             double lambdaPB = 1e-3;  // 换代价函数重置 λ（既有先例 :1293/:1363）
@@ -1454,7 +1923,7 @@ MultiLineResult ProjectorJointCalib::ExecuteMultiLine(const MultiLineInput& inpu
                 uctx.ramp = params_.rightTermRampIters > 0
                     ? std::min(1.0, (k + 1.0) / params_.rightTermRampIters) : 1.0;
                 if (uctx.ramp != rampPrev) {
-                    computeMultiResiduals(mdata, t, Cs, r0, costPB0);
+                    evalResiduals(t, Cs, r0, costPB0);
                     ++evalCount;
                 }
                 // GN 正规方程（复用既有块稀疏/稠密路径）
@@ -1482,7 +1951,7 @@ MultiLineResult ProjectorJointCalib::ExecuteMultiLine(const MultiLineInput& inpu
                             CsN[l][ci] += step[3 + l * 6 + ci];
                     double cN = 0.0;
                     Eigen::VectorXd rN;
-                    computeMultiResiduals(mdata, tN, CsN, rN, cN);
+                    evalResiduals(tN, CsN, rN, cN);
                     ++evalCount;
                     if (cN < costPB0) {
                         t = tN; Cs = CsN; r0 = rN; costPB0 = cN;

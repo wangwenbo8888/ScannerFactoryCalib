@@ -4,13 +4,19 @@
 //   参考档(CUDA, 零插值路径) → blob 头直解冻结基准 → FNV gridHash →
 //   温度网格逐档(at()插值 → rescaleCurve 重标 → CUDA 生成 → cmttTierGridMatches
 //   冻结断言) → CmttBuilder 拼装 sidecar。
-// 档级串行（原版 omp 档级并行；GPU 单档内部已并行，串行编排足够吃满 GPU）。
+// 档级双执行流流水线（2026-11-14，原串行循环）: 单档 ~340ms = GPU 求交/排序
+// ~200ms + CPU 打包/序列化 ~140ms, 串行时 GPU/CPU 交替空转；原子领档双流
+// （一线程 CPU 打包时另一线程喂 GPU）总时间趋近 GPU-only。逐档独立实例 +
+// 默认流全局串行 + 档间零依赖 → sidecar 与串行版逐字节一致。
 
 #include "cmtt_cuda.h"
 #include "common/calib_logging.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
+#include <thread>
 
 using namespace calib;
 
@@ -78,7 +84,7 @@ CurveMapTempTableResult CmttCudaGenerator::Generate(
 
         CurveMapParams cmp;
         cmp.epipolarRowStep = params_.rowStep;
-        CurveMapCuda gen(cmp);
+        CurveMapCuda gen(cmp);   // 参考档专用（非参考档见 runTier 内每档独立实例）
         // 基线景深窗显式接线（2026-10-09）：语义别名——与直写 depthMin/Max 同一
         // 真相源，行为逐位不变；概念定义见 curve_map_cuda.h / 设计文档 §2
         gen.SetBaselineDepthWindow(params_.depthMin, params_.depthMax);
@@ -118,7 +124,14 @@ CurveMapTempTableResult CmttCudaGenerator::Generate(
         fnvMix(gridHash, &hdr.depthMin, sizeof(hdr.depthMin));
         fnvMix(gridHash, &hdr.depthMax, sizeof(hdr.depthMax));
 
-        // ---- 温度网格逐档 ----
+        // ---- 温度网格逐档（2026-11-14: 档级双执行流流水线, 原子领档动态自调度）----
+        // 单档 ~340ms = GPU 求交/排序 ~200ms + CPU 打包/序列化 ~140ms, 原串行循环
+        // 中 GPU 与 CPU 交替空转。双执行流: 一线程做某档 CPU 打包时另一线程提交
+        // 下一档 GPU 工作 → 总时间趋近 GPU-only。安全性:
+        //   ① 每档独立 CurveMapCuda 实例（GPU 资源零共享, 见 runTier）;
+        //   ② CUDA 默认流全局串行——多线程提交自动排队, 无需显式同步;
+        //   ③ 档间零数据依赖, 各档只写自己的 tiers[idx]/tierBlobs[idx] 槽位
+        //      → 结果与完成序无关, sidecar 与串行版逐字节一致。
         const int nHalf = static_cast<int>(std::lround(
             static_cast<double>(params_.tempHalfRange) / static_cast<double>(params_.tempStep)));
         // 非对称档位（2026-10-13）: tiersBelow/tiersAbove 双正时覆盖对称半范围路径
@@ -128,34 +141,55 @@ CurveMapTempTableResult CmttCudaGenerator::Generate(
         result.tiers.resize(total);
         std::vector<std::vector<uint8_t>> tierBlobs(total);
 
-        for (int k = kLow; k <= kHigh; ++k) {
-            const size_t idx = static_cast<size_t>(k - kLow);
-            const double temp = params_.referenceTemp + k * static_cast<double>(params_.tempStep);
-            const bool isRef = (k == 0);
+        // 参考档（k==0）主线程先行直填: 复用循环前参考档产物（与 CPU 版
+        // curve_map_temp_table.cpp 同型——冻结基准即由 refR 解析而来, 网格断言
+        // 对其平凡成立 → 省一次冗余生成）; 线程体跳过该档。
+        const size_t refIdx = static_cast<size_t>(-kLow);
+        {
+            const InterpParams prm = interp.atReference();
+            CurveMapTempTierResult tier;
+            tier.temperature = params_.referenceTemp;
+            uint8_t flags = kCmttFlagReference;
+            if (prm.clamped) flags |= kCmttFlagClamped;
+            tier.entryCount = refR.entryCount;
+            tier.rowCountWithData = refR.rowCountWithData;
+            tier.ok = true;
+            tier.flags = flags;
+            result.tiers[refIdx] = std::move(tier);
+            tierBlobs[refIdx] = std::move(refR.tableBytes);
+        }
 
+        // 单档生成体（原串行循环体提取, 仅非参考档; 各档独立 idx 槽位写入）
+        auto runTier = [&](size_t idx) {
+            const double temp = params_.referenceTemp
+                              + static_cast<double>(static_cast<int>(idx) + kLow)
+                                * static_cast<double>(params_.tempStep);
             CurveMapTempTierResult tier;
             tier.temperature = temp;
-            uint8_t flags = isRef ? kCmttFlagReference : uint8_t{0};
+            uint8_t flags = uint8_t{0};
 
             std::vector<uint8_t> blob;
             bool ok = false;
             try {
-                const InterpParams prm = isRef ? interp.atReference() : interp.at(temp);
+                const InterpParams prm = interp.at(temp);   // 查询纯 const, 线程安全
                 if (prm.clamped) flags |= kCmttFlagClamped;
 
+                // Task 0 像素坐标契约: s = f'/f_ref, m = pp' − s·pp_ref
+                const double s = prm.f / refP.f;
+                const double mx = prm.principalPoint.x - s * refP.principalPoint.x;
+                const double my = prm.principalPoint.y - s * refP.principalPoint.y;
                 std::vector<ImplicitCurve> useCurves;
-                if (isRef) {
-                    useCurves = curves;               // 参考档原始曲线
-                } else {
-                    // Task 0 像素坐标契约: s = f'/f_ref, m = pp' − s·pp_ref
-                    const double s = prm.f / refP.f;
-                    const double mx = prm.principalPoint.x - s * refP.principalPoint.x;
-                    const double my = prm.principalPoint.y - s * refP.principalPoint.y;
-                    useCurves.reserve(curves.size());
-                    for (const auto& c : curves)
-                        useCurves.push_back(rescaleCurve(c, s, mx, my));
-                }
-                CurveMapResult r = gen.Generate(
+                useCurves.reserve(curves.size());
+                for (const auto& c : curves)
+                    useCurves.push_back(rescaleCurve(c, s, mx, my));
+                // 每档独立 CurveMapCuda 实例（GPU 资源零共享; 与参考档实例及
+                // 其他档实例互不可见 → 并发安全性仅依赖 CUDA 运行时与默认流）
+                CurveMapParams cmpT;
+                cmpT.epipolarRowStep = params_.rowStep;
+                CurveMapCuda genT(cmpT);
+                // 基线景深窗接线口径同参考档（语义别名, 行为逐位不变）
+                genT.SetBaselineDepthWindow(params_.depthMin, params_.depthMax);
+                CurveMapResult r = genT.Generate(
                     makeTierInput(useCurves, prm, imageSize, frozen.roi));
                 if (!r.success) {
                     CALIB_LOG_WARN("tier {}C generate failed: {}", temp, r.message);
@@ -176,12 +210,50 @@ CurveMapTempTableResult CmttCudaGenerator::Generate(
                 CALIB_LOG_WARN("tier {}C exception, degrade to missing: {}", temp, e.what());
                 ok = false; blob.clear();
                 tier.entryCount = 0; tier.rowCountWithData = 0;
+            } catch (...) {   // 线程体兜底: 非标准异常不外逸（计该档缺失, 防 terminate）
+                CALIB_LOG_WARN("tier {}C unknown exception, degrade to missing", temp);
+                ok = false; blob.clear();
+                tier.entryCount = 0; tier.rowCountWithData = 0;
             }
             if (!ok) flags |= kCmttFlagMissing;
             tier.ok = ok;
             tier.flags = flags;
             result.tiers[idx] = std::move(tier);
             tierBlobs[idx] = std::move(blob);
+        };
+
+        // 线程数: tierThreads 1=串行回退; 0/负=自动→2（默认流全局串行天花板下
+        // 2 执行流即饱和: 一流喂 GPU、一流 CPU 打包, 更多只增默认流争用——与
+        // CPU 版"0=min(硬件线程-2,16)"语义不同, GPU 编排按物理上限取值）;
+        // >=2=精确值（仍受 total 封顶）。主线程参与领档（主+worker 双执行流）。
+        int wantT = params_.tierThreads;
+        if (wantT <= 0) wantT = 2;
+        const size_t T = std::min<size_t>(static_cast<size_t>(wantT), total);
+        if (T <= 1) {
+            // 纯串行路径（tierThreads=1）: 与改前串行循环同构
+            for (size_t idx = 0; idx < total; ++idx) {
+                if (idx == refIdx) continue;
+                runTier(idx);
+            }
+        } else {
+            CALIB_LOG_INFO("CMTT(CUDA) tier pipeline: {} tiers on {} streams "
+                           "(dynamic self-scheduling)",
+                           static_cast<int>(total), static_cast<int>(T));
+            std::atomic<size_t> next{0};
+            auto worker = [&] {
+                for (;;) {
+                    const size_t idx = next.fetch_add(1);
+                    if (idx >= total) break;
+                    if (idx == refIdx) continue;
+                    runTier(idx);
+                }
+            };
+            std::vector<std::thread> pool;
+            pool.reserve(T - 1);
+            for (size_t w = 0; w + 1 < T; ++w)
+                pool.emplace_back(worker);
+            worker();   // 主线程也是执行流之一
+            for (auto& th : pool) th.join();
         }
 
         // ---- 拼装 sidecar ----
